@@ -3,23 +3,3 @@ version = 1
 gdbServerPort = 3333
 elf = "target/xtensa-esp32-espidf/debug/pup"
 firmware = "target/xtensa-esp32-espidf/debug/pup"
-
-[[wokwi.parts]]
-type = "esp32"
-id = "esp"
-
-[[wokwi.parts]]
-type = "wokwi-led"
-id = "led1"
-pins = ["cathode:esp:2", "anode:vcc"]
-attrs = { color = "red" }
-
-[[wokwi.parts]]
-type = "wokwi-pushbutton"
-id = "btn1"
-pins = ["1:esp:0", "2:gnd"]
-attrs = { color = "red" }
-
-[wokwi.parts.esp.attrs]
-psramSize = "0"
-flashSize = "4"
