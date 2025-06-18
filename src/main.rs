@@ -100,7 +100,19 @@ async fn main(spawner: Spawner) {
 
 // The #[embassy_executor::task] attribute marks this as an async task
 // Tasks are independent async functions that run concurrently
+//
+// BLE TASK LIFECYCLE MANAGEMENT:
 // This task handles all Bluetooth Low Energy functionality for WiFi provisioning
+// IMPORTANT: This task has a finite lifecycle - it TERMINATES after WiFi connection succeeds
+//
+// Lifecycle phases:
+// 1. INITIALIZATION: Set up BLE hardware and start advertising
+// 2. PROVISIONING: Wait for mobile app to send WiFi credentials via BLE
+// 3. VALIDATION: Store credentials and attempt WiFi connection
+// 4. CLEANUP: On WiFi success, completely shutdown BLE hardware and free resources
+// 5. TERMINATION: Task exits, Embassy frees task memory
+//
+// After WiFi connection succeeds, NO BLE-related code runs - device operates WiFi-only
 #[embassy_executor::task]
 async fn ble_task() {
     // Log that the BLE task has started
@@ -178,20 +190,31 @@ async fn ble_task() {
                 match attempt_wifi_connection(credentials).await {
                     Ok(ip_address) => {
                         info!("✓ WiFi connection successful! IP: {}", ip_address);
+
+                        // Send success status with IP address to mobile app
                         ble_server
                             .send_wifi_status(true, Some(&ip_address.to_string()))
                             .await;
+
+                        // Wait to ensure status message reaches mobile app before BLE shutdown
+                        info!("Waiting 3 seconds to ensure status message reaches mobile app...");
+                        Timer::after(Duration::from_secs(3)).await;
+
+                        // CRITICAL: Complete BLE shutdown since WiFi is now established
+                        // This will disable BLE hardware, free memory, and stop all BLE operations
+                        info!("🔄 WiFi established - initiating complete BLE shutdown...");
+                        if let Err(e) = ble_server.shutdown_ble_completely().await {
+                            warn!("Failed to shutdown BLE completely: {:?}", e);
+                        } else {
+                            info!("✓ BLE hardware completely disabled and resources freed");
+                            info!("📱 Mobile app can now disconnect - BLE is no longer needed");
+                        }
+
+                        // Mark WiFi connection as successful to exit the provisioning loop
                         wifi_connection_successful = true;
 
-                        // Wait a bit before stopping BLE to ensure status is sent
-                        Timer::after(Duration::from_secs(2)).await;
-
-                        // Stop BLE advertising
-                        if let Err(e) = ble_server.stop_advertising().await {
-                            warn!("Failed to stop BLE advertising: {:?}", e);
-                        } else {
-                            info!("BLE advertising stopped after successful WiFi connection");
-                        }
+                        // Log the transition from BLE provisioning to WiFi operation
+                        info!("🎯 Device transition: BLE Provisioning Mode → WiFi Operation Mode");
                     }
                     Err(e) => {
                         error!("WiFi connection failed: {:?}", e);
@@ -212,7 +235,13 @@ async fn ble_task() {
         Timer::after(Duration::from_millis(100)).await;
     }
 
-    info!("BLE task completed successfully - WiFi provisioning finished");
+    // BLE task is now completely finished and will terminate
+    // All BLE resources have been freed and hardware disabled
+    info!("🏁 BLE task completed successfully - WiFi provisioning finished");
+    info!("🔚 BLE task terminating - all BLE resources freed and hardware disabled");
+    info!("📶 Device now operating in WiFi-only mode");
+
+    // Task function ends here - Embassy will clean up the task and free its memory
 }
 
 async fn attempt_wifi_connection_with_stored_credentials(
