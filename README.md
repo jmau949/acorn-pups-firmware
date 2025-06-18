@@ -1,100 +1,245 @@
-# ESP32 LED Flashing Demo - Wokwi Simulation
+# ESP32 WiFi Provisioning with BLE - Beginner's Guide
 
-This project demonstrates a multi-pattern LED flashing system on an ESP32 using the Wokwi simulator. It's designed to test that your ESP-IDF Rust environment and Wokwi simulator are working correctly.
+This project demonstrates a complete WiFi provisioning system for ESP32 microcontrollers using Bluetooth Low Energy (BLE). It's designed to be educational for developers new to Rust and embedded programming.
 
-## Hardware Setup (Simulated)
+## 🎯 What This Project Does
 
-The Wokwi diagram includes:
-- **ESP32 DevKit-C V4** board
-- **3 LEDs**: Red (GPIO2), Green (GPIO4), Blue (GPIO5)
-- **3 Resistors**: 220Ω current limiting resistors for each LED
+The ESP32 device starts up and checks if it knows how to connect to WiFi. If not, it becomes a Bluetooth device that mobile apps can connect to. The mobile app sends WiFi network credentials via Bluetooth, the ESP32 stores them permanently, connects to WiFi, and then turns off Bluetooth since it's no longer needed.
 
-## LED Patterns
+## 🏗️ System Architecture
 
-The program cycles through 4 different LED patterns:
-
-1. **Sequential Flashing**: Red → Green → Blue (repeats 3 times)
-2. **All LEDs Together**: All three LEDs flash simultaneously (5 times)
-3. **Alternating Pairs**: Red+Blue together, then Green alone (4 cycles)
-4. **Fast Individual Blinks**: Each LED blinks rapidly in sequence (6 blinks each)
-
-## How to Run
-
-### Option 1: Using the PowerShell Script (Recommended)
-
-```powershell
-# Run the convenient PowerShell script
-.\run_wokwi.ps1
+```
+Mobile App (phone/tablet)
+    ↓ (Bluetooth LE)
+ESP32 BLE Server → WiFi Storage (NVS Flash) → WiFi Connection → Internet
+    ↑                                              ↓
+LED Controller ←―――――――――――――――――――――――――――――――――――――┘
 ```
 
-### Option 2: Manual Commands
+## 📁 Project Structure
 
-```powershell
+```
+src/
+├── main.rs          # Main application with Embassy async runtime
+├── ble_server.rs    # Bluetooth Low Energy advertising and communication
+└── wifi_storage.rs  # Persistent storage in flash memory (NVS)
+```
+
+## 🔧 Core Technologies
+
+### Embassy Async Runtime
+- **What it is**: Like Node.js or Python asyncio, but for microcontrollers
+- **Why we use it**: Allows multiple tasks to run "simultaneously" without blocking each other
+- **Key concept**: `async`/`await` lets the processor work on other tasks while waiting for I/O
+
+### ESP-IDF (ESP32 Development Framework)
+- **What it is**: The official development framework for ESP32 chips
+- **Language**: Written in C, but we use Rust bindings
+- **Provides**: WiFi drivers, Bluetooth stack, hardware access, flash storage
+
+### NVS (Non-Volatile Storage)
+- **What it is**: Key-value database stored in flash memory
+- **Survives**: Power loss, reboots, firmware updates
+- **Use case**: Storing WiFi credentials permanently
+
+## 📋 Detailed Code Explanation
+
+### Main Application Flow (`main.rs`)
+
+1. **System Initialization**
+   ```rust
+   esp_idf_svc::sys::link_patches();  // Connect Rust to ESP-IDF C libraries
+   esp_idf_svc::log::EspLogger::initialize_default();  // Enable logging
+   ```
+
+2. **Hardware Setup**
+   ```rust
+   let peripherals = Peripherals::take().unwrap();  // Get exclusive hardware access
+   let led_red = PinDriver::output(peripherals.pins.gpio2)?;  // Configure GPIO pin
+   ```
+
+3. **Task Spawning**
+   ```rust
+   spawner.spawn(ble_task())?;  // Start BLE provisioning task
+   spawner.spawn(led_task(...))?;  // Start LED pattern task
+   ```
+
+### BLE Server (`ble_server.rs`)
+
+#### Key Concepts:
+- **UUID (Universally Unique Identifier)**: 128-bit numbers that identify BLE services
+- **GATT (Generic Attribute Profile)**: How BLE devices expose data to clients
+- **Characteristics**: Individual data points that mobile apps can read/write
+
+#### Process Flow:
+1. **Advertising**: Make device discoverable as "AcornPups-XXXX"
+2. **Service Creation**: Set up WiFi provisioning service with UUIDs
+3. **Data Reception**: Receive SSID and password from mobile app
+4. **Validation**: Check that credentials are properly formatted
+5. **Storage**: Save credentials to flash memory for future use
+
+### WiFi Storage (`wifi_storage.rs`)
+
+#### NVS Operations:
+- **Namespace**: Groups related data (like "wifi_config")
+- **Keys**: Individual data identifiers ("ssid", "password")
+- **Serialization**: Convert Rust structs to JSON for storage
+
+#### Data Persistence:
+```rust
+// Store credentials
+self.nvs.set_str(SSID_KEY, &credentials.ssid)?;
+
+// Load credentials
+let ssid = self.nvs.get_str(SSID_KEY, &mut buffer)?;
+```
+
+### WiFi Connection (in `main.rs`)
+
+#### Connection Process:
+1. **Configuration**: Use stored network name (SSID) and password from NVS
+2. **Authentication**: Simulated connection for demonstration purposes
+3. **Association**: In production, would connect to actual access point using ESP-IDF
+4. **DHCP**: Would get IP address from router in real implementation
+5. **Verification**: Send test message to verify connectivity
+
+## 🔄 Complete Workflow
+
+### First Boot (No Stored WiFi)
+1. Device starts up
+2. Checks NVS for stored WiFi credentials → None found
+3. Starts BLE advertising as "AcornPups-1234"
+4. Mobile app connects via Bluetooth
+5. App sends WiFi network name and password
+6. Device validates and stores credentials in flash
+7. Device connects to WiFi network
+8. Device gets IP address (e.g., 192.168.1.100)
+9. Device sends test message to verify internet
+10. Device notifies mobile app of success
+11. Device stops BLE advertising (no longer needed)
+
+### Subsequent Boots (WiFi Stored)
+1. Device starts up
+2. Checks NVS for stored WiFi credentials → Found!
+3. Automatically connects to stored WiFi network
+4. Skips BLE provisioning entirely
+5. Ready for normal operation
+
+## 🎨 LED Patterns
+
+The LED task demonstrates concurrent execution:
+
+1. **Pattern 1**: Sequential (Red → Green → Blue)
+2. **Pattern 2**: All LEDs together (white)
+3. **Pattern 3**: Alternating pairs (purple ↔ green)
+4. **Pattern 4**: Fast individual blinks
+
+These patterns run independently of WiFi/BLE operations.
+
+## 🔍 Key Rust Concepts for Beginners
+
+### Ownership
+```rust
+let led_red = PinDriver::output(peripherals.pins.gpio2)?;
+spawner.spawn(led_task(led_red, led_green, led_blue))?;
+// led_red is "moved" into the task - main() can't use it anymore
+```
+
+### Error Handling
+```rust
+match PinDriver::output(peripherals.pins.gpio2) {
+    Ok(pin) => pin,      // Success case
+    Err(e) => {          // Error case
+        warn!("Failed: {:?}", e);
+        return;          // Exit early
+    }
+}
+```
+
+### Async/Await
+```rust
+Timer::after(Duration::from_millis(300)).await;  // Non-blocking delay
+// Other tasks can run during this delay
+```
+
+### Pattern Matching
+```rust
+match pattern {
+    0 => { /* Pattern 1 logic */ }
+    1 => { /* Pattern 2 logic */ }
+    _ => { /* Default case */ }
+}
+```
+
+## 🛠️ Building and Running
+
+### Prerequisites
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install ESP-IDF and Rust ESP toolchain
+cargo install espup
+espup install
+```
+
+### Build Commands
+```bash
+# Check for compilation errors
+cargo check
+
 # Build the project
 cargo build
 
-# Run in Wokwi (requires Wokwi CLI)
-wokwi-cli diagram.json
+# Build and flash to ESP32
+cargo run
 ```
 
-## Prerequisites
+## 📱 Mobile App Integration
 
-1. **Rust ESP Environment**: Ensure you have the ESP-IDF Rust toolchain installed
-2. **Wokwi CLI**: Install the Wokwi command-line interface:
-   ```powershell
-   npm install -g wokwi-cli
-   ```
+Your mobile app needs to:
 
-## What to Expect
+1. **Scan for BLE devices** with name "AcornPups-XXXX"
+2. **Connect to device** and discover services
+3. **Find WiFi service** using UUID: `12345678-1234-1234-1234-123456789abc`
+4. **Write SSID** to characteristic: `12345678-1234-1234-1234-123456789abd`
+5. **Write password** to characteristic: `12345678-1234-1234-1234-123456789abe`
+6. **Read status** from characteristic: `12345678-1234-1234-1234-123456789abf`
 
-When you run the simulation:
+## 🚀 Next Steps for Production
 
-1. **Browser Opens**: Wokwi will open in your default browser
-2. **Visual Feedback**: You'll see the ESP32 board with three LEDs that light up according to the patterns
-3. **Serial Monitor**: Check the serial monitor output for pattern change notifications
-4. **Continuous Loop**: The patterns repeat indefinitely until you stop the simulation
+This is a learning framework. For production use, you'd need to:
 
-## Serial Output
+1. **Real BLE Stack**: Replace placeholder BLE code with actual ESP-IDF Bluetooth
+2. **Security**: Encrypt credentials during BLE transmission
+3. **Error Recovery**: Handle network failures, credential corruption, etc.
+4. **Power Management**: Optimize for battery life
+5. **OTA Updates**: Over-the-air firmware updates via WiFi
+6. **Device Management**: Cloud integration for monitoring and control
 
-The program logs information to help you understand what's happening:
+## 🐛 Common Issues for Beginners
 
-```
-I (XXX) pup: Starting LED Flashing Demo!
-I (XXX) pup: LEDs initialized on GPIO2 (Red), GPIO4 (Green), GPIO5 (Blue)
-I (XXX) pup: Pattern 1: Sequential flashing
-I (XXX) pup: Pattern 2: All LEDs flashing together
-I (XXX) pup: Pattern 3: Alternating pairs
-I (XXX) pup: Pattern 4: Fast individual blinks
-```
+### Compilation Errors
+- **"use of moved value"**: Rust ownership - you can only use a value once unless you clone it
+- **"cannot borrow as mutable"**: Need `mut` keyword for modifiable variables
+- **"async function"**: Remember to use `.await` when calling async functions
 
-## Troubleshooting
+### Runtime Issues
+- **Serial output**: Use `info!()`, `warn!()`, `error!()` for debugging
+- **Panic on unwrap()**: Use `match` or `if let` for better error handling
+- **Task not running**: Make sure you `spawn()` the task and the main loop doesn't exit
 
-### Build Issues
-- Ensure ESP-IDF and Rust toolchain are properly installed
-- Check that you're in the correct directory (`C:\esp\pup`)
+## 📚 Learning Resources
 
-### Wokwi Issues
-- Install Wokwi CLI: `npm install -g wokwi-cli`
-- Check that Node.js is installed for npm commands
+- [Rust Book](https://doc.rust-lang.org/book/) - Learn Rust fundamentals
+- [Embassy Book](https://embassy.dev/book/) - Async embedded programming
+- [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/) - ESP32 hardware
+- [Bluetooth Low Energy Guide](https://learn.adafruit.com/introduction-to-bluetooth-low-energy) - BLE concepts
 
-### Simulation Not Starting
-- Verify the build completed successfully (`cargo build`)
-- Check that `diagram.json` exists in the project root
-- Ensure your browser allows pop-ups from localhost
+## 🤝 Contributing
 
-## Files Overview
+This is an educational project! If you find ways to make the code clearer for beginners or have suggestions for better comments, please contribute.
 
-- **`src/main.rs`**: Main program with LED control logic
-- **`diagram.json`**: Wokwi hardware configuration (ESP32 + LEDs + resistors)
-- **`wokwi.toml`**: Wokwi simulation settings
-- **`run_wokwi.ps1`**: Convenience script to build and run
-- **`Cargo.toml`**: Rust project configuration with ESP-IDF dependencies
+---
 
-## Customization
-
-You can modify the LED patterns by editing `src/main.rs`:
-- Change timing by adjusting `Duration::from_millis()` values
-- Add new patterns in the match statement
-- Use different GPIO pins (update both code and `diagram.json`)
-
-Enjoy your ESP32 LED flashing demo! 🎉 
+**Happy coding! 🦀⚡** 

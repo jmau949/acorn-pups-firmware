@@ -28,7 +28,6 @@ use log::{error, info, warn};
 // Declare our custom modules (separate files in src/ directory)
 // Each mod statement tells Rust to include code from src/module_name.rs
 mod ble_server; // Bluetooth Low Energy server functionality
-mod wifi_client; // WiFi connection and management
 mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
