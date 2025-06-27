@@ -173,7 +173,160 @@ match pattern {
 
 ## 🛠️ Building and Running
 
-### Prerequisites
+### Option 1: Development Container (Recommended)
+
+Development containers provide a consistent, pre-configured environment that includes all necessary tools and dependencies. This is the easiest way to get started.
+
+#### Prerequisites
+- **Docker Desktop**: [Download and install](https://www.docker.com/products/docker-desktop/)
+- **Visual Studio Code**: [Download here](https://code.visualstudio.com/)
+- **Dev Containers Extension**: Install from VS Code marketplace
+
+#### Setup Steps
+
+1. **Clone the Repository**
+   ```bash
+   git clone <your-repo-url>
+   cd esp32-wifi-provisioning
+   ```
+
+2. **Open in Dev Container**
+   - Open the project folder in VS Code
+   - VS Code should automatically detect the `.devcontainer` configuration
+   - Click "Reopen in Container" when prompted, or:
+     - Press `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (Mac)
+     - Type "Dev Containers: Reopen in Container"
+     - Select the command
+
+3. **Wait for Container Build**
+   - First time setup takes 5-10 minutes (downloads and configures ESP-IDF)
+   - Subsequent opens are much faster (30-60 seconds)
+   - You'll see progress in the VS Code terminal
+
+4. **Verify Setup**
+   ```bash
+   # Check Rust toolchain
+   rustc --version
+   
+   # Check ESP-IDF
+   idf.py --version
+   
+   # Check target is installed
+   rustup target list --installed | grep xtensa
+   ```
+
+#### Building in Dev Container
+
+```bash
+# Set ESP-IDF environment (run once per terminal session)
+. $HOME/export-esp.sh
+
+# Check for compilation errors
+cargo check
+
+# Build the project
+cargo build
+
+# Build optimized release version
+cargo build --release
+```
+
+#### Flashing to ESP32
+
+1. **Connect ESP32 via USB**
+   - Plug ESP32 into your computer
+   - The dev container automatically forwards USB devices
+
+2. **Find the Device**
+   ```bash
+   # List available serial ports
+   ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null || echo "No devices found"
+   
+   # On Windows (WSL2), you might need:
+   ls /dev/tty* | grep -E "(USB|ACM)"
+   ```
+
+3. **Flash and Monitor**
+   ```bash
+   # Build and flash (replace /dev/ttyUSB0 with your device)
+   cargo espflash flash --port /dev/ttyUSB0 --monitor
+   
+   # Or using idf.py
+   idf.py -p /dev/ttyUSB0 flash monitor
+   ```
+
+4. **Monitor Serial Output**
+   ```bash
+   # Just monitor (after flashing)
+   cargo espflash monitor --port /dev/ttyUSB0
+   
+   # Or with idf.py
+   idf.py -p /dev/ttyUSB0 monitor
+   ```
+
+#### Troubleshooting Dev Container
+
+**Container won't start:**
+- Ensure Docker Desktop is running
+- Check you have sufficient disk space (2GB+ free)
+- Try: `Docker: Rebuild Container` from VS Code command palette
+
+**USB device not found:**
+- On Windows: Install [USB/Serial drivers](https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers)
+- On Linux: Add user to dialout group: `sudo usermod -a -G dialout $USER`
+- Restart Docker Desktop and VS Code
+
+**Permission denied on /dev/ttyUSB0:**
+```bash
+# Check device permissions
+ls -la /dev/ttyUSB0
+
+# Fix permissions (temporary)
+sudo chmod 666 /dev/ttyUSB0
+
+# Or add to dialout group (permanent)
+sudo usermod -a -G dialout $(whoami)
+# Then restart container
+```
+
+**ESP-IDF not found:**
+```bash
+# Manually source ESP-IDF
+. $HOME/esp/esp-idf/export.sh
+
+# Or reinstall
+cd $HOME/esp/esp-idf
+./install.sh esp32
+```
+
+#### Dev Container Configuration
+
+The `.devcontainer/devcontainer.json` file configures:
+- **Base Image**: Ubuntu with Rust and ESP-IDF pre-installed
+- **Extensions**: Rust Analyzer, ESP-IDF extension
+- **Port Forwarding**: For web-based monitoring
+- **USB Device Access**: Automatically forwards USB devices
+- **Environment Variables**: ESP-IDF paths and targets
+
+#### Advanced Dev Container Usage
+
+```bash
+# Clean build
+cargo clean && cargo build
+
+# Check specific target
+cargo check --target xtensa-esp32-espidf
+
+# View build logs
+RUST_LOG=debug cargo build
+
+# Generate documentation
+cargo doc --open
+```
+
+### Option 2: Local Installation
+
+#### Prerequisites
 ```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -183,7 +336,7 @@ cargo install espup
 espup install
 ```
 
-### Build Commands
+#### Build Commands
 ```bash
 # Check for compilation errors
 cargo check
