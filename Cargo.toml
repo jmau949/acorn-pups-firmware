@@ -18,9 +18,9 @@ debug = true    # Symbols are nice and they don't increase the size on Flash
 opt-level = "z"
 
 [features]
-default = []
+default = ["experimental"]
 
-experimental = ["esp-idf-svc/experimental"]
+experimental = ["esp-idf-svc/experimental", "esp-idf-svc/alloc"]
 
 [dependencies]
 log = "0.4"
@@ -35,4 +35,4 @@ serde_json = "1.0"
 uuid = "1.0"
 
 [build-dependencies]
-embuild = "0.33"
+embuild = { version = "0.33", features = ["espidf"] }
