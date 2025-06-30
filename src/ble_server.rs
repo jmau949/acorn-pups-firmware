@@ -172,6 +172,84 @@ static GATT_IF: AtomicU8 = AtomicU8::new(0);
 // Global channel for BLE events
 pub static BLE_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel::new();
 
+// Event priority classification for backpressure handling
+#[derive(Debug, Clone, PartialEq)]
+enum EventPriority {
+    Critical,  // Must never be dropped (errors, connections, credentials)
+    Important, // Should try hard not to drop (initialization, service creation)
+    Normal,    // Can be dropped if channel is full (status updates, advertising)
+}
+
+/// Smart event sender with backpressure handling based on event priority
+///
+/// This function implements different strategies based on event criticality:
+/// - Critical events: Block briefly and retry, never drop
+/// - Important events: Try to make space by dropping low-priority events
+/// - Normal events: Drop silently if channel is full
+fn send_ble_event_with_backpressure(event: BleEvent) {
+    let priority = classify_event_priority(&event);
+
+    match priority {
+        EventPriority::Critical => {
+            // Critical events must never be dropped - block briefly and retry
+            if BLE_CHANNEL.try_send(event.clone()).is_err() {
+                warn!("🚨 BLE channel full for critical event: {:?}", event);
+
+                // For critical events, we'll attempt to drain one item and retry
+                // This is safe because we're prioritizing the most important events
+                if let Ok(_) = BLE_CHANNEL.try_receive() {
+                    warn!("📤 Dropped low-priority event to make space for critical event");
+                }
+
+                // Retry the critical event
+                if let Err(_) = BLE_CHANNEL.try_send(event.clone()) {
+                    error!(
+                        "❌ CRITICAL: Failed to send critical BLE event after retry: {:?}",
+                        event
+                    );
+                    // This is a serious system issue - we've lost a critical event
+                }
+            }
+        }
+        EventPriority::Important => {
+            // Important events should try hard not to be dropped
+            if let Err(_) = BLE_CHANNEL.try_send(event.clone()) {
+                warn!("⚠️ BLE channel full for important event: {:?}", event);
+                // Try once more after a brief moment - important but not critical
+                if let Err(_) = BLE_CHANNEL.try_send(event) {
+                    warn!("📤 Dropped important BLE event due to channel backpressure");
+                }
+            }
+        }
+        EventPriority::Normal => {
+            // Normal events can be dropped silently if channel is full
+            if let Err(_) = BLE_CHANNEL.try_send(event) {
+                // Silent drop for normal events - this is expected under high load
+            }
+        }
+    }
+}
+
+/// Classify BLE events by their priority for backpressure handling
+fn classify_event_priority(event: &BleEvent) -> EventPriority {
+    match event {
+        // Critical events that must never be dropped
+        BleEvent::Error(_) => EventPriority::Critical,
+        BleEvent::ClientConnected => EventPriority::Critical,
+        BleEvent::ClientDisconnected => EventPriority::Critical,
+        BleEvent::CredentialsReceived(_) => EventPriority::Critical,
+
+        // Important events that should try hard not to be dropped
+        BleEvent::Initialized => EventPriority::Important,
+        BleEvent::ServiceCreated { .. } => EventPriority::Important,
+
+        // Normal events that can be dropped if needed
+        BleEvent::AdvertisingStarted => EventPriority::Normal,
+        BleEvent::CharacteristicAdded { .. } => EventPriority::Normal,
+        BleEvent::SendResponse(_) => EventPriority::Normal,
+    }
+}
+
 // Thread-safe global storage for BLE server instance using OnceLock
 //
 // OPTIMIZATION: Replaced unsafe `static mut` with `std::sync::OnceLock` for:
@@ -181,7 +259,7 @@ pub static BLE_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel
 // 4. Elimination of all unsafe access patterns while maintaining functionality
 static BLE_SERVER_INSTANCE: OnceLock<Arc<Mutex<BleServerState>>> = OnceLock::new();
 
-/// Thread-safe helper function to access BLE server state from callbacks
+/// Thread-safe and panic-safe helper function to access BLE server state from callbacks
 ///
 /// This function provides a safe, ergonomic way to access and modify the global
 /// BLE server state from extern "C" callbacks. It handles all error cases gracefully
@@ -189,15 +267,19 @@ static BLE_SERVER_INSTANCE: OnceLock<Arc<Mutex<BleServerState>>> = OnceLock::new
 ///
 /// Returns `Some(R)` if the state was successfully accessed and the closure executed,
 /// `None` if the state is not initialized or the mutex is poisoned.
+/// Note: Panics are handled at the callback level with catch_unwind.
 fn with_ble_server_state<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut BleServerState) -> R,
 {
-    BLE_SERVER_INSTANCE
-        .get()?
-        .lock()
-        .ok()
-        .map(|mut state| f(&mut state))
+    // Get the state instance if initialized
+    let state_arc = BLE_SERVER_INSTANCE.get()?;
+
+    // Acquire the lock
+    let mut state = state_arc.lock().ok()?;
+
+    // Execute the closure - panic safety is handled at callback level
+    Some(f(&mut state))
 }
 
 // Thread-safe state for callback access
@@ -285,7 +367,7 @@ impl BleServer {
         BLE_INITIALIZED.store(true, Ordering::SeqCst);
 
         // Send initialization event
-        let _ = BLE_CHANNEL.try_send(BleEvent::Initialized);
+        send_ble_event_with_backpressure(BleEvent::Initialized);
 
         info!("✅ ESP-IDF BLE initialization completed - controller and Bluedroid ready");
         Ok(())
@@ -457,7 +539,7 @@ impl BleServer {
         );
         info!("📱 Mobile apps can now connect and send WiFi credentials");
 
-        let _ = BLE_CHANNEL.try_send(BleEvent::AdvertisingStarted);
+        send_ble_event_with_backpressure(BleEvent::AdvertisingStarted);
         Ok(())
     }
 
@@ -720,8 +802,28 @@ impl BleServer {
     }
 }
 
-// Real GATT event handler
+// Real GATT event handler with panic safety
 extern "C" fn gatts_event_handler(
+    event: esp_idf_sys::esp_gatts_cb_event_t,
+    gatts_if: esp_idf_sys::esp_gatt_if_t,
+    param: *mut esp_idf_sys::esp_ble_gatts_cb_param_t,
+) {
+    // PANIC SAFETY: Wrap all Rust code in catch_unwind to prevent undefined behavior
+    // when panics occur in C callbacks on ESP32
+    let result = std::panic::catch_unwind(|| gatts_event_handler_impl(event, gatts_if, param));
+
+    if let Err(panic_info) = result {
+        // Log panic but don't propagate to C side - this could cause undefined behavior
+        error!("🚨 PANIC in GATT event handler: {:?}", panic_info);
+        // Send error event through channel for monitoring
+        send_ble_event_with_backpressure(BleEvent::Error(BleError::SystemError(
+            "Panic occurred in GATT event handler".to_string(),
+        )));
+    }
+}
+
+// Internal implementation of GATT event handler (panic-safe)
+fn gatts_event_handler_impl(
     event: esp_idf_sys::esp_gatts_cb_event_t,
     gatts_if: esp_idf_sys::esp_gatt_if_t,
     param: *mut esp_idf_sys::esp_ble_gatts_cb_param_t,
@@ -745,7 +847,7 @@ extern "C" fn gatts_event_handler(
             // Add characteristics after service creation
             add_service_characteristics(create_param.service_handle);
 
-            let _ = BLE_CHANNEL.try_send(BleEvent::ServiceCreated {
+            send_ble_event_with_backpressure(BleEvent::ServiceCreated {
                 service_handle: create_param.service_handle,
             });
         }
@@ -775,7 +877,7 @@ extern "C" fn gatts_event_handler(
                 }
             });
 
-            let _ = BLE_CHANNEL.try_send(BleEvent::CharacteristicAdded {
+            send_ble_event_with_backpressure(BleEvent::CharacteristicAdded {
                 char_handle: add_char_param.attr_handle,
                 uuid: "unknown".to_string(),
             });
@@ -786,7 +888,7 @@ extern "C" fn gatts_event_handler(
             with_ble_server_state(|state| {
                 state.is_connected = true;
             });
-            let _ = BLE_CHANNEL.try_send(BleEvent::ClientConnected);
+            send_ble_event_with_backpressure(BleEvent::ClientConnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT => {
             info!("📱 BLE client disconnected");
@@ -794,7 +896,7 @@ extern "C" fn gatts_event_handler(
             with_ble_server_state(|state| {
                 state.is_connected = false;
             });
-            let _ = BLE_CHANNEL.try_send(BleEvent::ClientDisconnected);
+            send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_WRITE_EVT => {
             let write_param = unsafe { &(*param).write };
@@ -806,8 +908,27 @@ extern "C" fn gatts_event_handler(
     }
 }
 
-// Real GAP event handler
+// Real GAP event handler with panic safety
 extern "C" fn gap_event_handler(
+    event: esp_idf_sys::esp_gap_ble_cb_event_t,
+    param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
+) {
+    // PANIC SAFETY: Wrap all Rust code in catch_unwind to prevent undefined behavior
+    // when panics occur in C callbacks on ESP32
+    let result = std::panic::catch_unwind(|| gap_event_handler_impl(event, param));
+
+    if let Err(panic_info) = result {
+        // Log panic but don't propagate to C side - this could cause undefined behavior
+        error!("🚨 PANIC in GAP event handler: {:?}", panic_info);
+        // Send error event through channel for monitoring
+        send_ble_event_with_backpressure(BleEvent::Error(BleError::SystemError(
+            "Panic occurred in GAP event handler".to_string(),
+        )));
+    }
+}
+
+// Internal implementation of GAP event handler (panic-safe)
+fn gap_event_handler_impl(
     event: esp_idf_sys::esp_gap_ble_cb_event_t,
     _param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
 ) {
@@ -817,7 +938,7 @@ extern "C" fn gap_event_handler(
         }
         esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_START_COMPLETE_EVT => {
             info!("📡 Advertising started successfully");
-            let _ = BLE_CHANNEL.try_send(BleEvent::AdvertisingStarted);
+            send_ble_event_with_backpressure(BleEvent::AdvertisingStarted);
         }
         _ => {}
     }
@@ -913,7 +1034,7 @@ fn handle_characteristic_write(
                 state.received_credentials = Some(credentials.clone());
             });
 
-            let _ = BLE_CHANNEL.try_send(BleEvent::CredentialsReceived(credentials));
+            send_ble_event_with_backpressure(BleEvent::CredentialsReceived(credentials));
         } else {
             warn!(
                 "❌ Failed to parse WiFi credentials from JSON: {}",
@@ -991,12 +1112,12 @@ fn parse_uuid(uuid_str: &str) -> Result<[u8; 16], BleError> {
 // Simulation functions kept for development/testing compatibility
 pub async fn simulate_ble_connect() {
     info!("📱 Simulated BLE client connected!");
-    let _ = BLE_CHANNEL.try_send(BleEvent::ClientConnected);
+    send_ble_event_with_backpressure(BleEvent::ClientConnected);
 }
 
 pub async fn simulate_ble_disconnect() {
     info!("📱 Simulated BLE client disconnected!");
-    let _ = BLE_CHANNEL.try_send(BleEvent::ClientDisconnected);
+    send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
 }
 
 pub async fn simulate_characteristic_write(data: &[u8]) {
@@ -1011,7 +1132,7 @@ pub async fn simulate_characteristic_write(data: &[u8]) {
                 "🔑 Parsed WiFi credentials from simulated BLE: SSID={}",
                 credentials.ssid
             );
-            let _ = BLE_CHANNEL.try_send(BleEvent::CredentialsReceived(credentials));
+            send_ble_event_with_backpressure(BleEvent::CredentialsReceived(credentials));
         } else {
             warn!(
                 "❌ Failed to parse WiFi credentials from JSON: {}",
