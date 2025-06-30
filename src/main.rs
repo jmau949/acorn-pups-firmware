@@ -329,11 +329,8 @@ async fn ble_provisioning_task() {
 
     // Start BLE advertising and update system state
     if let Err(e) = ble_server.start_advertising().await {
-        error!("Failed to start BLE advertising: {:?}", e);
-        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
-            "BLE start failed: {:?}",
-            e
-        )));
+        error!("Failed to start BLE advertising: {}", e);
+        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!("BLE start failed: {}", e)));
         return;
     }
 
@@ -363,7 +360,7 @@ async fn ble_provisioning_task() {
 
                 // Complete BLE shutdown
                 if let Err(e) = ble_server.shutdown_ble_completely().await {
-                    warn!("Failed to shutdown BLE completely: {:?}", e);
+                    warn!("Failed to shutdown BLE completely: {}", e);
                 } else {
                     info!("✅ BLE hardware completely disabled and resources freed");
 
