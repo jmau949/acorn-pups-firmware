@@ -382,17 +382,3 @@ This is a learning framework. For production use, you'd need to:
 - **Panic on unwrap()**: Use `match` or `if let` for better error handling
 - **Task not running**: Make sure you `spawn()` the task and the main loop doesn't exit
 
-## 📚 Learning Resources
-
-- [Rust Book](https://doc.rust-lang.org/book/) - Learn Rust fundamentals
-- [Embassy Book](https://embassy.dev/book/) - Async embedded programming
-- [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/) - ESP32 hardware
-- [Bluetooth Low Energy Guide](https://learn.adafruit.com/introduction-to-bluetooth-low-energy) - BLE concepts
-
-## 🤝 Contributing
-
-This is an educational project! If you find ways to make the code clearer for beginners or have suggestions for better comments, please contribute.
-
----
-
-**Happy coding! 🦀⚡** 

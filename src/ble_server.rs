@@ -19,6 +19,9 @@ use log::{info, warn};
 // This allows us to convert Rust structs to/from JSON format
 use serde::{Deserialize, Serialize};
 
+// Import system state for BLE connection status updates
+use crate::SYSTEM_STATE;
+
 // WiFi credentials structure to hold network name and password
 // The derive attributes automatically implement useful traits:
 // - Debug: allows printing with {:?}
@@ -121,42 +124,11 @@ impl BleServer {
         info!("BLE server started, waiting for connections...");
 
         loop {
-            // Simulate receiving events
-            self.simulate_ble_events().await;
+            // Wait for real BLE events from the channel
+            let event = BLE_CHANNEL.receive().await;
+            self.process_event(event).await;
 
-            // Handle real events when they come in
-            if let Ok(event) = BLE_CHANNEL.try_receive() {
-                self.process_event(event).await;
-            }
-
-            Timer::after(Duration::from_millis(100)).await;
-        }
-    }
-
-    async fn simulate_ble_events(&mut self) {
-        // This is a placeholder simulation - in real implementation,
-        // events would come from actual BLE stack callbacks
-
-        static mut SIMULATION_COUNTER: u32 = 0;
-        unsafe {
-            SIMULATION_COUNTER += 1;
-
-            match SIMULATION_COUNTER {
-                50 => {
-                    info!("Simulating client connection...");
-                    self.is_connected = true;
-                    let _ = BLE_CHANNEL.try_send(BleEvent::ConnectionEstablished);
-                }
-                100 => {
-                    info!("Simulating WiFi credentials received...");
-                    let credentials = WiFiCredentials {
-                        ssid: "TestNetwork".to_string(),
-                        password: "TestPassword123".to_string(),
-                    };
-                    let _ = BLE_CHANNEL.try_send(BleEvent::CredentialsReceived(credentials));
-                }
-                _ => {}
-            }
+            Timer::after(Duration::from_millis(10)).await;
         }
     }
 
@@ -165,11 +137,23 @@ impl BleServer {
             BleEvent::ConnectionEstablished => {
                 info!("BLE client connected");
                 self.is_connected = true;
+
+                // Update system state to reflect BLE client connection
+                {
+                    let mut state = SYSTEM_STATE.lock().await;
+                    state.ble_client_connected = true;
+                }
             }
 
             BleEvent::ConnectionLost => {
                 info!("BLE client disconnected");
                 self.is_connected = false;
+
+                // Update system state to reflect BLE client disconnection
+                {
+                    let mut state = SYSTEM_STATE.lock().await;
+                    state.ble_client_connected = false;
+                }
             }
 
             BleEvent::CredentialsReceived(credentials) => {
@@ -371,11 +355,13 @@ pub fn generate_device_id() -> String {
 pub async fn on_ble_connect() {
     info!("BLE connection callback triggered");
     // Send connection event to the channel
+    let _ = BLE_CHANNEL.try_send(BleEvent::ConnectionEstablished);
 }
 
 pub async fn on_ble_disconnect() {
     info!("BLE disconnection callback triggered");
     // Send disconnection event to the channel
+    let _ = BLE_CHANNEL.try_send(BleEvent::ConnectionLost);
 }
 
 pub async fn on_characteristic_write(char_uuid: &str, data: &[u8]) {

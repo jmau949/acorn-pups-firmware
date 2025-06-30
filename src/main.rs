@@ -73,6 +73,7 @@ pub struct SystemState {
     pub wifi_connected: bool,
     pub wifi_ip: Option<std::net::Ipv4Addr>,
     pub ble_active: bool,
+    pub ble_client_connected: bool,
     pub provisioning_complete: bool,
     pub ble_shutdown_requested: bool,
 }
@@ -83,6 +84,7 @@ impl SystemState {
             wifi_connected: false,
             wifi_ip: None,
             ble_active: false,
+            ble_client_connected: false,
             provisioning_complete: false,
             ble_shutdown_requested: false,
         }
@@ -103,7 +105,7 @@ async fn main(spawner: Spawner) {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     // Log a startup message - this will appear in the serial monitor
-    info!("Starting Embassy-based Application with BLE and LED control!");
+    info!("Starting Embassy-based Application with BLE status LED indicator!");
 
     // Take ownership of all ESP32 peripherals (GPIO, SPI, I2C, etc.)
     // .unwrap() panics if peripherals are already taken (only one instance allowed)
@@ -152,7 +154,7 @@ async fn main(spawner: Spawner) {
         return;
     }
 
-    // Spawn the LED control task - provides visual feedback
+    // Spawn the LED status task - provides BLE connection status visual feedback
     if let Err(_) = spawner.spawn(led_task(led_red, led_green, led_blue)) {
         error!("Failed to spawn LED task");
         return;
@@ -533,103 +535,80 @@ async fn led_task(
     >,
     mut led_blue: PinDriver<'static, esp_idf_svc::hal::gpio::Gpio5, esp_idf_svc::hal::gpio::Output>,
 ) {
-    info!("LED Task started");
+    info!("LED Task started - BLE status indicator");
 
-    let mut pattern = 0;
+    // Start with all LEDs red (default/startup state)
+    led_red.set_high().ok();
+    led_green.set_low().ok();
+    led_blue.set_low().ok();
+    info!("🔴 LEDs set to RED - System startup/default state");
+
+    let mut previous_state = "startup".to_string();
 
     loop {
-        match pattern {
-            // Pattern 0: Sequential flashing (Red -> Green -> Blue)
-            0 => {
-                info!("LED Pattern 1: Sequential flashing");
-                for _ in 0..3 {
-                    // Red LED
-                    led_red.set_high().ok();
-                    Timer::after(Duration::from_millis(300)).await;
-                    led_red.set_low().ok();
-                    Timer::after(Duration::from_millis(100)).await;
+        // Check current system state
+        let current_state = {
+            let state = SYSTEM_STATE.lock().await;
 
-                    // Green LED
-                    led_green.set_high().ok();
-                    Timer::after(Duration::from_millis(300)).await;
-                    led_green.set_low().ok();
-                    Timer::after(Duration::from_millis(100)).await;
-
-                    // Blue LED
-                    led_blue.set_high().ok();
-                    Timer::after(Duration::from_millis(300)).await;
-                    led_blue.set_low().ok();
-                    Timer::after(Duration::from_millis(100)).await;
-                }
+            if state.wifi_connected {
+                "wifi_connected".to_string()
+            } else if state.ble_client_connected {
+                "ble_connected".to_string()
+            } else if state.ble_active {
+                "ble_broadcasting".to_string()
+            } else {
+                "startup".to_string()
             }
+        };
 
-            // Pattern 1: All LEDs flashing together
-            1 => {
-                info!("LED Pattern 2: All LEDs flashing together");
-                for _ in 0..5 {
+        // Only update LEDs if state has changed
+        if current_state != previous_state {
+            match current_state.as_str() {
+                "startup" => {
+                    // All red - system startup/default state
                     led_red.set_high().ok();
-                    led_green.set_high().ok();
-                    led_blue.set_high().ok();
-                    Timer::after(Duration::from_millis(500)).await;
-
-                    led_red.set_low().ok();
                     led_green.set_low().ok();
                     led_blue.set_low().ok();
-                    Timer::after(Duration::from_millis(500)).await;
+                    info!("🔴 LEDs set to RED - System startup/default state");
                 }
-            }
 
-            // Pattern 2: Alternating pairs
-            2 => {
-                info!("LED Pattern 3: Alternating pairs");
-                for _ in 0..4 {
-                    // Red and Blue on, Green off
-                    led_red.set_high().ok();
+                "ble_broadcasting" => {
+                    // All blue - BLE is broadcasting/advertising
+                    led_red.set_low().ok();
                     led_green.set_low().ok();
                     led_blue.set_high().ok();
-                    Timer::after(Duration::from_millis(400)).await;
+                    info!("🔵 LEDs set to BLUE - BLE broadcasting/advertising");
+                }
 
-                    // Green on, Red and Blue off
+                "ble_connected" => {
+                    // All green - BLE client connected
                     led_red.set_low().ok();
                     led_green.set_high().ok();
                     led_blue.set_low().ok();
-                    Timer::after(Duration::from_millis(400)).await;
+                    info!("🟢 LEDs set to GREEN - BLE client connected");
                 }
-            }
 
-            // Pattern 3: Fast blink individual LEDs
-            _ => {
-                info!("LED Pattern 4: Fast individual blinks");
-                // Fast red blinks
-                for _ in 0..6 {
-                    led_red.set_high().ok();
-                    Timer::after(Duration::from_millis(100)).await;
+                "wifi_connected" => {
+                    // All green - WiFi connected (provisioning complete)
                     led_red.set_low().ok();
-                    Timer::after(Duration::from_millis(100)).await;
-                }
-
-                // Fast green blinks
-                for _ in 0..6 {
                     led_green.set_high().ok();
-                    Timer::after(Duration::from_millis(100)).await;
-                    led_green.set_low().ok();
-                    Timer::after(Duration::from_millis(100)).await;
+                    led_blue.set_low().ok();
+                    info!("🟢 LEDs set to GREEN - WiFi connected");
                 }
 
-                // Fast blue blinks
-                for _ in 0..6 {
-                    led_blue.set_high().ok();
-                    Timer::after(Duration::from_millis(100)).await;
+                _ => {
+                    // Fallback to red for unknown states
+                    led_red.set_high().ok();
+                    led_green.set_low().ok();
                     led_blue.set_low().ok();
-                    Timer::after(Duration::from_millis(100)).await;
+                    warn!("🔴 LEDs set to RED - Unknown state: {}", current_state);
                 }
             }
+
+            previous_state = current_state;
         }
 
-        // Move to next pattern, cycle back to 0 after pattern 3
-        pattern = (pattern + 1) % 4;
-
-        // Brief pause between patterns
-        Timer::after(Duration::from_millis(1000)).await;
+        // Check system state every 250ms (responsive but not excessive)
+        Timer::after(Duration::from_millis(250)).await;
     }
 }
