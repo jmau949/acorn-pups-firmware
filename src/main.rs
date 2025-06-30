@@ -21,6 +21,9 @@ use esp_idf_svc::hal::gpio::PinDriver;
 // Peripherals contains references to GPIO pins, SPI, I2C, WiFi, etc.
 use esp_idf_svc::hal::peripherals::Peripherals;
 
+// Import modem for BLE functionality
+use esp_idf_svc::hal::modem::Modem;
+
 // Import logging macros for debug output over serial/UART
 // error! = critical errors, info! = general information, warn! = warnings
 use log::{error, info, warn};
@@ -149,7 +152,7 @@ async fn main(spawner: Spawner) {
     }
 
     // Spawn the BLE provisioning task - handles WiFi credential setup and BLE lifecycle
-    if let Err(_) = spawner.spawn(ble_provisioning_task()) {
+    if let Err(_) = spawner.spawn(ble_provisioning_task(peripherals.modem)) {
         error!("Failed to spawn BLE provisioning task");
         return;
     }
@@ -282,7 +285,7 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
 // ✅ Integrated BLE lifecycle management (no separate coordinator needed)
 // ✅ Direct system state updates for efficient coordination
 #[embassy_executor::task]
-async fn ble_provisioning_task() {
+async fn ble_provisioning_task(modem: Modem) {
     info!("📻 BLE Provisioning Task started - Event-driven WiFi setup");
 
     // Initialize WiFi storage using ESP32's NVS (Non-Volatile Storage)
@@ -323,9 +326,16 @@ async fn ble_provisioning_task() {
         }
     }
 
-    // Generate device ID and start BLE server
+    // Generate device ID and create BLE server
     let device_id = generate_device_id();
     let mut ble_server = BleServer::new(&device_id);
+
+    // Initialize BLE server with modem
+    if let Err(e) = ble_server.initialize_with_modem(modem).await {
+        error!("Failed to initialize BLE server: {}", e);
+        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!("BLE init failed: {}", e)));
+        return;
+    }
 
     // Start BLE advertising and update system state
     if let Err(e) = ble_server.start_advertising().await {

@@ -23,7 +23,7 @@ use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Production-grade BLE error types
+// Production-grade BLE error types with specific ESP error codes
 #[derive(Debug, Clone, PartialEq)]
 pub enum BleError {
     // Initialization errors
@@ -67,6 +67,11 @@ pub enum BleError {
     // General errors
     Unknown(String),
     SystemError(String),
+
+    // New specific ESP-IDF error types
+    EspError(esp_idf_sys::esp_err_t, String),
+    NotInitialized(String),
+    AlreadyInitialized(String),
 }
 
 impl std::fmt::Display for BleError {
@@ -114,6 +119,9 @@ impl std::fmt::Display for BleError {
             BleError::CleanupFailed(msg) => write!(f, "BLE cleanup failed: {}", msg),
             BleError::Unknown(msg) => write!(f, "Unknown BLE error: {}", msg),
             BleError::SystemError(msg) => write!(f, "BLE system error: {}", msg),
+            BleError::EspError(code, msg) => write!(f, "ESP-IDF error {}: {}", code, msg),
+            BleError::NotInitialized(msg) => write!(f, "BLE not initialized: {}", msg),
+            BleError::AlreadyInitialized(msg) => write!(f, "BLE already initialized: {}", msg),
         }
     }
 }
@@ -186,11 +194,25 @@ impl BleServerState {
     }
 }
 
+// BLE initialization state tracking
+#[derive(Debug, Clone, PartialEq)]
+enum BleInitState {
+    Uninitialized,
+    ControllerInitialized,
+    ControllerEnabled,
+    BluedroidInitialized,
+    BluedroidEnabled,
+    CallbacksRegistered,
+    ServiceCreated,
+    AdvertisingStarted,
+}
+
 // Production BLE Server using real ESP-IDF APIs
 pub struct BleServer {
     device_name: String,
     bt_driver: Option<BtDriver<'static, Ble>>,
     state: Arc<Mutex<BleServerState>>,
+    init_state: BleInitState,
 }
 
 impl BleServer {
@@ -207,73 +229,100 @@ impl BleServer {
             device_name,
             bt_driver: None,
             state,
+            init_state: BleInitState::Uninitialized,
         }
     }
 
-    // Initialize BLE with real modem hardware
+    // Initialize BLE with real modem hardware following proper ESP-IDF sequence
     pub async fn initialize_with_modem(&mut self, modem: Modem) -> BleResult<()> {
-        info!("🔧 Initializing BLE with real ESP32 modem hardware");
+        info!("🔧 Starting ESP-IDF BLE initialization sequence");
 
-        // Initialize BLE driver with modem
+        // Initialize BLE driver (this automatically does controller init, enable, Bluedroid init, enable)
+        info!("📡 Initializing BLE driver with modem - this handles all low-level initialization");
         let bt_driver = BtDriver::new(modem, None).map_err(|e| {
             BleError::ControllerInitFailed(format!("BtDriver creation failed: {:?}", e))
         })?;
 
         self.bt_driver = Some(bt_driver);
-        BLE_INITIALIZED.store(true, Ordering::SeqCst);
 
-        info!("✅ BLE driver initialized with real modem");
+        // BtDriver::new() already completed:
+        // - BLE controller initialization
+        // - BLE controller enable
+        // - Bluedroid stack initialization
+        // - Bluedroid stack enable
+        // So we can skip directly to BluedroidEnabled state
+        self.init_state = BleInitState::BluedroidEnabled;
+
+        // Small delay to ensure everything is stable
+        Timer::after(Duration::from_millis(200)).await;
+
+        BLE_INITIALIZED.store(true, Ordering::SeqCst);
 
         // Send initialization event
         let _ = BLE_CHANNEL.try_send(BleEvent::Initialized);
 
+        info!("✅ ESP-IDF BLE initialization completed - controller and Bluedroid ready");
         Ok(())
     }
 
-    // Start BLE provisioning service with real GATT implementation
+    // Start BLE provisioning service with proper initialization order
     pub async fn start_provisioning_service(&mut self) -> BleResult<()> {
-        info!("🔧 Starting real BLE WiFi provisioning service");
+        info!("🔧 Starting BLE WiFi provisioning service with proper initialization");
 
-        // 1. Setup BLE callbacks
+        // Verify BLE stack is properly initialized
+        if self.init_state != BleInitState::BluedroidEnabled {
+            return Err(BleError::NotInitialized(
+                "BLE stack must be initialized before starting services".to_string(),
+            ));
+        }
+
+        // Step 6: Register callbacks
         self.setup_ble_callbacks().await?;
 
-        // 2. Create real GATT service
+        // Step 7: Create GATT service
         self.create_provisioning_service().await?;
 
-        // 3. Start real advertising
+        // Step 8: Start advertising
         self.start_ble_advertising().await?;
 
-        info!("✅ Real BLE provisioning service started and advertising");
+        info!("✅ BLE WiFi provisioning service started successfully");
         Ok(())
     }
 
-    // 1. Setup real BLE callbacks
+    // Setup BLE callbacks after stack is enabled
     async fn setup_ble_callbacks(&mut self) -> BleResult<()> {
-        info!("🔧 Setting up real BLE GATT callbacks");
+        info!("🔧 Step 6: Registering BLE GATT and GAP callbacks");
 
         // Register GATT server callback
-        let _ret = call_esp_api(|| unsafe {
-            esp_idf_sys::esp_ble_gatts_register_callback(Some(gatts_event_handler))
-        })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gatts_register_callback(Some(gatts_event_handler)) },
+            "GATT server callback registration",
+        )?;
 
         // Register GAP callback for advertising events
-        let _ret = call_esp_api(|| unsafe {
-            esp_idf_sys::esp_ble_gap_register_callback(Some(gap_event_handler))
-        })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gap_register_callback(Some(gap_event_handler)) },
+            "GAP callback registration",
+        )?;
 
         // Register GATT application
-        let _ret = call_esp_api(|| unsafe { esp_idf_sys::esp_ble_gatts_app_register(0) })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gatts_app_register(0) },
+            "GATT application registration",
+        )?;
 
-        info!("✅ Real BLE callbacks registered");
+        self.init_state = BleInitState::CallbacksRegistered;
+        Timer::after(Duration::from_millis(100)).await;
+        info!("✅ Step 6 complete: BLE callbacks registered");
         Ok(())
     }
 
-    // 2. Create real GATT provisioning service
+    // Create GATT provisioning service
     async fn create_provisioning_service(&mut self) -> BleResult<()> {
-        info!("🛜 Creating real WiFi provisioning GATT service");
+        info!("🔧 Step 7: Creating WiFi provisioning GATT service");
 
         // Wait for GATT app registration event
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(200)).await;
 
         // Create WiFi provisioning service
         let service_uuid = parse_uuid(WIFI_SERVICE_UUID)?;
@@ -291,39 +340,50 @@ impl BleServer {
         };
 
         let gatts_if = GATT_IF.load(Ordering::SeqCst);
-        let _ret = call_esp_api(|| unsafe {
-            esp_idf_sys::esp_ble_gatts_create_service(
-                gatts_if,
-                &service_id as *const _ as *mut _,
-                8,
-            )
-        })?;
+        if gatts_if == 0 {
+            return Err(BleError::NotInitialized(
+                "GATT interface not registered".to_string(),
+            ));
+        }
+
+        call_esp_api_with_context(
+            || unsafe {
+                esp_idf_sys::esp_ble_gatts_create_service(
+                    gatts_if,
+                    &service_id as *const _ as *mut _,
+                    8,
+                )
+            },
+            "GATT service creation",
+        )?;
 
         // Wait for service creation
-        Timer::after(Duration::from_millis(100)).await;
-
-        info!("✅ Real GATT service created");
+        Timer::after(Duration::from_millis(200)).await;
+        self.init_state = BleInitState::ServiceCreated;
+        info!("✅ Step 7 complete: GATT service created");
         Ok(())
     }
 
-    // 3. Start real BLE advertising
+    // Start BLE advertising
     async fn start_ble_advertising(&mut self) -> BleResult<()> {
-        info!("📡 Starting real BLE advertising");
+        info!("🔧 Step 8: Starting BLE advertising");
 
         // Set device name
         let device_name_cstr = CString::new(self.device_name.clone())
             .map_err(|_| BleError::DeviceNameSetFailed("Invalid device name".to_string()))?;
 
-        let _ret = call_esp_api(|| unsafe {
-            esp_idf_sys::esp_ble_gap_set_device_name(device_name_cstr.as_ptr())
-        })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gap_set_device_name(device_name_cstr.as_ptr()) },
+            "Device name setting",
+        )?;
 
-        // Configure advertising data with service UUID
-        let service_uuid = parse_uuid(WIFI_SERVICE_UUID)?;
+        Timer::after(Duration::from_millis(100)).await;
+
+        // Configure advertising data (keep it minimal to avoid 31-byte limit issues)
         let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
             set_scan_rsp: false,
-            include_name: true,
-            include_txpower: true,
+            include_name: true,     // Include device name
+            include_txpower: false, // Disable to save space
             min_interval: 0x0006,
             max_interval: 0x0010,
             appearance: 0x00,
@@ -331,22 +391,25 @@ impl BleServer {
             p_manufacturer_data: std::ptr::null_mut(),
             service_data_len: 0,
             p_service_data: std::ptr::null_mut(),
-            service_uuid_len: 16,
-            p_service_uuid: service_uuid.as_ptr() as *mut u8,
+            service_uuid_len: 0, // Remove service UUID to save space
+            p_service_uuid: std::ptr::null_mut(), // Service UUID not in advertising data
             flag: (esp_idf_sys::ESP_BLE_ADV_FLAG_GEN_DISC
                 | esp_idf_sys::ESP_BLE_ADV_FLAG_BREDR_NOT_SPT) as u8,
         };
 
-        let _ret =
-            call_esp_api(|| unsafe { esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data) })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gap_config_adv_data(&mut adv_data) },
+            "Advertising data configuration",
+        )?;
+        info!("📡 Advertising data set complete");
 
-        // Start advertising
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(200)).await;
 
+        // Start advertising with correct parameters
         let mut adv_params = esp_idf_sys::esp_ble_adv_params_t {
-            adv_int_min: 0x20,
-            adv_int_max: 0x40,
-            adv_type: esp_idf_sys::ESP_BLE_LEGACY_ADV_TYPE_IND,
+            adv_int_min: 0x20, // 32 * 0.625ms = 20ms min interval
+            adv_int_max: 0x40, // 64 * 0.625ms = 40ms max interval
+            adv_type: esp_idf_sys::esp_ble_adv_type_t_ADV_TYPE_IND, // Fixed constant
             own_addr_type: esp_idf_sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_PUBLIC,
             peer_addr: [0; 6],
             peer_addr_type: esp_idf_sys::esp_ble_addr_type_t_BLE_ADDR_TYPE_PUBLIC,
@@ -354,14 +417,16 @@ impl BleServer {
             adv_filter_policy: esp_idf_sys::esp_ble_adv_filter_t_ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
         };
 
-        let _ret = call_esp_api(|| unsafe {
-            esp_idf_sys::esp_ble_gap_start_advertising(&mut adv_params)
-        })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gap_start_advertising(&mut adv_params) },
+            "Advertising start",
+        )?;
 
         BLE_ADVERTISING.store(true, Ordering::SeqCst);
+        self.init_state = BleInitState::AdvertisingStarted;
 
         info!(
-            "📡 ✅ Real BLE advertising started - Device discoverable as: {}",
+            "📡 ✅ Step 8 complete: BLE advertising started - Device discoverable as: {}",
             self.device_name
         );
         info!("📱 Mobile apps can now connect and send WiFi credentials");
@@ -480,16 +545,19 @@ impl BleServer {
 
         if status_handle != 0 {
             let data = message.as_bytes();
-            let ret = call_esp_api(|| unsafe {
-                esp_idf_sys::esp_ble_gatts_send_indicate(
-                    GATT_IF.load(Ordering::SeqCst),
-                    0, // conn_id - would need to track this
-                    status_handle,
-                    data.len() as u16,
-                    data.as_ptr() as *mut u8,
-                    false, // need_confirm
-                )
-            });
+            let ret = call_esp_api_with_context(
+                || unsafe {
+                    esp_idf_sys::esp_ble_gatts_send_indicate(
+                        GATT_IF.load(Ordering::SeqCst),
+                        0, // conn_id - would need to track this
+                        status_handle,
+                        data.len() as u16,
+                        data.as_ptr() as *mut u8,
+                        false, // need_confirm
+                    )
+                },
+                "Status notification send",
+            );
 
             match ret {
                 Ok(_) => info!("📤 Status notification sent: {}", message),
@@ -505,7 +573,10 @@ impl BleServer {
             return Ok(());
         }
 
-        let _ret = call_esp_api(|| unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() })?;
+        call_esp_api_with_context(
+            || unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() },
+            "Advertising stop",
+        )?;
 
         BLE_ADVERTISING.store(false, Ordering::SeqCst);
         info!("✅ BLE advertising stopped");
@@ -530,6 +601,7 @@ impl BleServer {
 
         BLE_INITIALIZED.store(false, Ordering::SeqCst);
         GATT_IF.store(0, Ordering::SeqCst);
+        self.init_state = BleInitState::Uninitialized;
 
         // Drop BT driver
         self.bt_driver.take();
@@ -634,7 +706,7 @@ extern "C" fn gatts_event_handler(
 
     match event {
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_REG_EVT => {
-            info!("📋 GATT server registered");
+            info!("📋 GATT server registered with interface: {}", gatts_if);
             GATT_IF.store(gatts_if, Ordering::SeqCst);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CREATE_EVT => {
@@ -727,7 +799,7 @@ extern "C" fn gap_event_handler(
             info!("📡 Advertising data set complete");
         }
         esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_START_COMPLETE_EVT => {
-            info!("📡 Advertising started");
+            info!("📡 Advertising started successfully");
             let _ = BLE_CHANNEL.try_send(BleEvent::AdvertisingStarted);
         }
         _ => {}
@@ -742,16 +814,19 @@ fn add_service_characteristics(service_handle: u16) {
         len: esp_idf_sys::ESP_UUID_LEN_128 as u16,
         uuid: esp_idf_sys::esp_bt_uuid_t__bindgen_ty_1 { uuid128: ssid_uuid },
     };
-    let _ = call_esp_api(|| unsafe {
-        esp_idf_sys::esp_ble_gatts_add_char(
-            service_handle,
-            &ssid_uuid_struct as *const _ as *mut _,
-            esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
-            esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    });
+    let _ = call_esp_api_with_context(
+        || unsafe {
+            esp_idf_sys::esp_ble_gatts_add_char(
+                service_handle,
+                &ssid_uuid_struct as *const _ as *mut _,
+                esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
+                esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        "SSID characteristic creation",
+    );
 
     // Add Password characteristic (writable)
     let password_uuid = parse_uuid(PASSWORD_CHAR_UUID).unwrap();
@@ -761,16 +836,19 @@ fn add_service_characteristics(service_handle: u16) {
             uuid128: password_uuid,
         },
     };
-    let _ = call_esp_api(|| unsafe {
-        esp_idf_sys::esp_ble_gatts_add_char(
-            service_handle,
-            &password_uuid_struct as *const _ as *mut _,
-            esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
-            esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    });
+    let _ = call_esp_api_with_context(
+        || unsafe {
+            esp_idf_sys::esp_ble_gatts_add_char(
+                service_handle,
+                &password_uuid_struct as *const _ as *mut _,
+                esp_idf_sys::ESP_GATT_PERM_WRITE as u16,
+                esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_WRITE as u8,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        "Password characteristic creation",
+    );
 
     // Add Status characteristic (readable + notifiable)
     let status_uuid = parse_uuid(STATUS_CHAR_UUID).unwrap();
@@ -780,17 +858,20 @@ fn add_service_characteristics(service_handle: u16) {
             uuid128: status_uuid,
         },
     };
-    let _ = call_esp_api(|| unsafe {
-        esp_idf_sys::esp_ble_gatts_add_char(
-            service_handle,
-            &status_uuid_struct as *const _ as *mut _,
-            esp_idf_sys::ESP_GATT_PERM_READ as u16,
-            (esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_READ | esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_NOTIFY)
-                as u8,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    });
+    let _ = call_esp_api_with_context(
+        || unsafe {
+            esp_idf_sys::esp_ble_gatts_add_char(
+                service_handle,
+                &status_uuid_struct as *const _ as *mut _,
+                esp_idf_sys::ESP_GATT_PERM_READ as u16,
+                (esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_READ
+                    | esp_idf_sys::ESP_GATT_CHAR_PROP_BIT_NOTIFY) as u8,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        "Status characteristic creation",
+    );
 }
 
 // Handle characteristic write events
@@ -841,8 +922,8 @@ pub fn generate_device_id() -> String {
     format!("{:04X}", hasher.finish() & 0xFFFF)
 }
 
-// Safe wrapper for ESP-IDF API calls
-fn call_esp_api<F>(f: F) -> BleResult<()>
+// Enhanced ESP API wrapper with better error handling and context
+fn call_esp_api_with_context<F>(f: F, context: &str) -> BleResult<()>
 where
     F: FnOnce() -> esp_idf_sys::esp_err_t,
 {
@@ -850,11 +931,26 @@ where
     if result == esp_idf_sys::ESP_OK {
         Ok(())
     } else {
-        Err(BleError::SystemError(format!(
-            "ESP-IDF API call failed with code: {}",
-            result
-        )))
+        let error_msg = match result {
+            esp_idf_sys::ESP_ERR_INVALID_STATE => {
+                format!("{}: Invalid state - BLE stack not ready", context)
+            }
+            esp_idf_sys::ESP_ERR_INVALID_ARG => format!("{}: Invalid argument", context),
+            esp_idf_sys::ESP_ERR_NO_MEM => format!("{}: Out of memory", context),
+            esp_idf_sys::ESP_ERR_NOT_FOUND => format!("{}: Resource not found", context),
+            esp_idf_sys::ESP_ERR_TIMEOUT => format!("{}: Operation timeout", context),
+            _ => format!("{}: Unknown error", context),
+        };
+        Err(BleError::EspError(result, error_msg))
     }
+}
+
+// Safe wrapper for ESP-IDF API calls (backward compatibility)
+fn call_esp_api<F>(f: F) -> BleResult<()>
+where
+    F: FnOnce() -> esp_idf_sys::esp_err_t,
+{
+    call_esp_api_with_context(f, "ESP API call")
 }
 
 // Parse UUID string to ESP-IDF format
