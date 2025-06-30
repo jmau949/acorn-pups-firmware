@@ -314,12 +314,30 @@ enum BleInitState {
     AdvertisingStarted,
 }
 
-// Production BLE Server using real ESP-IDF APIs
+// Production BLE Server using real ESP-IDF APIs with RAII cleanup
 pub struct BleServer {
     device_name: String,
     bt_driver: Option<BtDriver<'static, Ble>>,
     state: Arc<Mutex<BleServerState>>,
     init_state: BleInitState,
+    // Track registered callbacks for cleanup
+    callbacks_registered: bool,
+    // Track GATT application registration
+    gatt_app_registered: bool,
+}
+
+// RAII cleanup implementation for BleServer
+impl Drop for BleServer {
+    fn drop(&mut self) {
+        info!("🧹 BleServer dropping - performing RAII cleanup");
+
+        // Perform synchronous cleanup in reverse initialization order
+        if let Err(e) = self.cleanup_resources_sync() {
+            error!("❌ Error during BleServer drop cleanup: {:?}", e);
+        }
+
+        info!("✅ BleServer RAII cleanup completed");
+    }
 }
 
 impl BleServer {
@@ -338,19 +356,24 @@ impl BleServer {
             bt_driver: None,
             state,
             init_state: BleInitState::Uninitialized,
+            callbacks_registered: false,
+            gatt_app_registered: false,
         }
     }
 
     // Initialize BLE with real modem hardware following proper ESP-IDF sequence
+    // Includes RAII cleanup on failure
     pub async fn initialize_with_modem(&mut self, modem: Modem) -> BleResult<()> {
-        info!("🔧 Starting ESP-IDF BLE initialization sequence");
+        info!("🔧 Starting ESP-IDF BLE initialization sequence with RAII cleanup");
 
         // Initialize BLE driver (this automatically does controller init, enable, Bluedroid init, enable)
         info!("📡 Initializing BLE driver with modem - this handles all low-level initialization");
         let bt_driver = BtDriver::new(modem, None).map_err(|e| {
+            error!("❌ BtDriver creation failed - no cleanup needed: {:?}", e);
             BleError::ControllerInitFailed(format!("BtDriver creation failed: {:?}", e))
         })?;
 
+        // Store the driver - if anything fails after this, Drop will clean it up
         self.bt_driver = Some(bt_driver);
 
         // BtDriver::new() already completed:
@@ -364,6 +387,7 @@ impl BleServer {
         // Small delay to ensure everything is stable
         Timer::after(Duration::from_millis(200)).await;
 
+        // If we reach here, initialization was successful
         BLE_INITIALIZED.store(true, Ordering::SeqCst);
 
         // Send initialization event
@@ -373,9 +397,9 @@ impl BleServer {
         Ok(())
     }
 
-    // Start BLE provisioning service with proper initialization order
+    // Start BLE provisioning service with proper initialization order and RAII cleanup
     pub async fn start_provisioning_service(&mut self) -> BleResult<()> {
-        info!("🔧 Starting BLE WiFi provisioning service with proper initialization");
+        info!("🔧 Starting BLE WiFi provisioning service with RAII cleanup on failure");
 
         // Verify BLE stack is properly initialized
         if self.init_state != BleInitState::BluedroidEnabled {
@@ -384,22 +408,52 @@ impl BleServer {
             ));
         }
 
-        // Step 6: Register callbacks
-        self.setup_ble_callbacks().await?;
+        // Step 6: Register callbacks - track success for cleanup
+        if let Err(e) = self.setup_ble_callbacks().await {
+            error!("❌ Callback setup failed, performing cleanup: {:?}", e);
+            if let Err(cleanup_err) = self.cleanup_resources_async().await {
+                error!(
+                    "❌ Cleanup after callback setup failure failed: {:?}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
 
-        // Step 7: Create GATT service
-        self.create_provisioning_service().await?;
+        // Step 7: Create GATT service - if this fails, callbacks need cleanup
+        if let Err(e) = self.create_provisioning_service().await {
+            error!(
+                "❌ GATT service creation failed, performing cleanup: {:?}",
+                e
+            );
+            if let Err(cleanup_err) = self.cleanup_resources_async().await {
+                error!(
+                    "❌ Cleanup after service creation failure failed: {:?}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
 
-        // Step 8: Start advertising
-        self.start_ble_advertising().await?;
+        // Step 8: Start advertising - if this fails, service and callbacks need cleanup
+        if let Err(e) = self.start_ble_advertising().await {
+            error!("❌ Advertising start failed, performing cleanup: {:?}", e);
+            if let Err(cleanup_err) = self.cleanup_resources_async().await {
+                error!(
+                    "❌ Cleanup after advertising failure failed: {:?}",
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
 
-        info!("✅ BLE WiFi provisioning service started successfully");
+        info!("✅ BLE WiFi provisioning service started successfully with RAII protection");
         Ok(())
     }
 
-    // Setup BLE callbacks after stack is enabled
+    // Setup BLE callbacks after stack is enabled - tracks registration for cleanup
     async fn setup_ble_callbacks(&mut self) -> BleResult<()> {
-        info!("🔧 Step 6: Registering BLE GATT and GAP callbacks");
+        info!("🔧 Step 6: Registering BLE GATT and GAP callbacks with tracking");
 
         // Register GATT server callback
         call_esp_api_with_context(
@@ -413,15 +467,21 @@ impl BleServer {
             "GAP callback registration",
         )?;
 
+        // Mark callbacks as registered for cleanup tracking
+        self.callbacks_registered = true;
+
         // Register GATT application
         call_esp_api_with_context(
             || unsafe { esp_idf_sys::esp_ble_gatts_app_register(0) },
             "GATT application registration",
         )?;
 
+        // Mark GATT app as registered for cleanup tracking
+        self.gatt_app_registered = true;
+
         self.init_state = BleInitState::CallbacksRegistered;
         Timer::after(Duration::from_millis(100)).await;
-        info!("✅ Step 6 complete: BLE callbacks registered");
+        info!("✅ Step 6 complete: BLE callbacks registered and tracked");
         Ok(())
     }
 
@@ -692,30 +752,20 @@ impl BleServer {
     }
 
     pub async fn shutdown_ble_completely(&mut self) -> BleResult<()> {
-        info!("🔄 Initiating complete BLE shutdown");
+        info!("🔄 Initiating complete BLE shutdown using RAII cleanup");
 
-        if BLE_ADVERTISING.load(Ordering::SeqCst) {
-            self.stop_advertising().await?;
-        }
+        // Use the comprehensive async cleanup method
+        self.cleanup_resources_async().await?;
 
-        // Reset state
-        {
-            let mut state = self.state.lock().unwrap();
-            state.is_connected = false;
-            state.received_credentials = None;
-            state.service_handle = 0;
-            state.char_handles.clear();
-        }
-
-        BLE_INITIALIZED.store(false, Ordering::SeqCst);
-        GATT_IF.store(0, Ordering::SeqCst);
-        self.init_state = BleInitState::Uninitialized;
-
-        // Drop BT driver
-        self.bt_driver.take();
-
-        info!("✅ Complete BLE shutdown successful");
+        info!("✅ Complete BLE shutdown successful using RAII");
         Ok(())
+    }
+
+    /// Public method for explicit resource cleanup
+    /// Useful when you want to cleanup resources before Drop is called
+    pub async fn cleanup_and_reset(&mut self) -> BleResult<()> {
+        info!("🧹 Explicit cleanup and reset requested");
+        self.cleanup_resources_async().await
     }
 
     // Required methods for main.rs compatibility
@@ -739,6 +789,116 @@ impl BleServer {
             self.process_event(event).await;
             Timer::after(Duration::from_millis(10)).await;
         }
+    }
+
+    // RAII cleanup methods for resource management
+
+    /// Synchronous cleanup method for Drop implementation
+    /// Cleans up resources in reverse initialization order
+    fn cleanup_resources_sync(&mut self) -> BleResult<()> {
+        info!("🧹 Starting synchronous BLE resource cleanup");
+
+        // Step 1: Stop advertising if active
+        if BLE_ADVERTISING.load(Ordering::SeqCst) {
+            info!("🛑 Stopping advertising during cleanup");
+            let _ = call_esp_api_with_context(
+                || unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() },
+                "Cleanup: Advertising stop",
+            );
+            BLE_ADVERTISING.store(false, Ordering::SeqCst);
+        }
+
+        // Step 2: Reset GATT interface
+        if GATT_IF.load(Ordering::SeqCst) != 0 {
+            info!("🔄 Resetting GATT interface during cleanup");
+            GATT_IF.store(0, Ordering::SeqCst);
+        }
+
+        // Step 3: Mark callbacks as unregistered
+        if self.callbacks_registered {
+            info!("📋 Marking callbacks as unregistered during cleanup");
+            self.callbacks_registered = false;
+        }
+
+        if self.gatt_app_registered {
+            info!("📱 Marking GATT app as unregistered during cleanup");
+            self.gatt_app_registered = false;
+        }
+
+        // Step 4: Reset global state
+        {
+            let mut state = self.state.lock().unwrap();
+            state.is_connected = false;
+            state.received_credentials = None;
+            state.service_handle = 0;
+            state.char_handles.clear();
+        }
+
+        // Step 5: Reset initialization state
+        BLE_INITIALIZED.store(false, Ordering::SeqCst);
+        self.init_state = BleInitState::Uninitialized;
+
+        // Step 6: Drop BT driver (this automatically cleans up Bluedroid and controller)
+        if self.bt_driver.is_some() {
+            info!("📡 Dropping BT driver during cleanup");
+            self.bt_driver.take();
+        }
+
+        info!("✅ Synchronous BLE resource cleanup completed");
+        Ok(())
+    }
+
+    /// Asynchronous cleanup method for explicit cleanup calls
+    /// Provides more comprehensive cleanup with proper error handling
+    pub async fn cleanup_resources_async(&mut self) -> BleResult<()> {
+        info!("🧹 Starting comprehensive asynchronous BLE resource cleanup");
+
+        // Step 1: Stop advertising with proper error handling
+        if let Err(e) = self.stop_advertising().await {
+            warn!("⚠️ Warning during advertising stop in cleanup: {:?}", e);
+        }
+
+        // Step 2: Unregister callbacks if they were registered
+        if self.callbacks_registered {
+            info!("📋 Unregistering BLE callbacks during cleanup");
+            // Note: ESP-IDF doesn't provide explicit callback unregistration
+            // The callbacks will be cleaned up when the BT driver is dropped
+            self.callbacks_registered = false;
+        }
+
+        if self.gatt_app_registered {
+            info!("📱 Marking GATT application as unregistered during cleanup");
+            self.gatt_app_registered = false;
+        }
+
+        // Step 3: Reset all atomic state
+        BLE_INITIALIZED.store(false, Ordering::SeqCst);
+        BLE_ADVERTISING.store(false, Ordering::SeqCst);
+        GATT_IF.store(0, Ordering::SeqCst);
+
+        // Step 4: Clear server state
+        {
+            let mut state = self.state.lock().unwrap();
+            state.is_connected = false;
+            state.received_credentials = None;
+            state.service_handle = 0;
+            state.char_handles.clear();
+        }
+
+        // Step 5: Reset initialization state
+        self.init_state = BleInitState::Uninitialized;
+
+        // Step 6: Drop BT driver last (this triggers full BLE stack cleanup)
+        if self.bt_driver.is_some() {
+            info!("📡 Dropping BT driver - this will cleanup Bluedroid and controller");
+            self.bt_driver.take();
+
+            // Allow time for cleanup to complete
+            Timer::after(Duration::from_millis(100)).await;
+        }
+
+        info!("✅ Comprehensive asynchronous BLE resource cleanup completed");
+        Ok(())
     }
 
     async fn process_event(&mut self, event: BleEvent) {
