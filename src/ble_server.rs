@@ -21,7 +21,7 @@ use esp_idf_svc::sys as esp_idf_sys;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // Production-grade BLE error types with specific ESP error codes
 #[derive(Debug, Clone, PartialEq)]
@@ -172,8 +172,33 @@ static GATT_IF: AtomicU8 = AtomicU8::new(0);
 // Global channel for BLE events
 pub static BLE_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel::new();
 
-// Global storage for BLE server instance (for callbacks)
-static mut BLE_SERVER_INSTANCE: Option<Arc<Mutex<BleServerState>>> = None;
+// Thread-safe global storage for BLE server instance using OnceLock
+//
+// OPTIMIZATION: Replaced unsafe `static mut` with `std::sync::OnceLock` for:
+// 1. Thread-safe lazy initialization without unsafe code
+// 2. Guaranteed single initialization across the lifetime of the program
+// 3. Safe access from extern "C" callbacks without data races
+// 4. Elimination of all unsafe access patterns while maintaining functionality
+static BLE_SERVER_INSTANCE: OnceLock<Arc<Mutex<BleServerState>>> = OnceLock::new();
+
+/// Thread-safe helper function to access BLE server state from callbacks
+///
+/// This function provides a safe, ergonomic way to access and modify the global
+/// BLE server state from extern "C" callbacks. It handles all error cases gracefully
+/// and eliminates the need for unsafe code blocks.
+///
+/// Returns `Some(R)` if the state was successfully accessed and the closure executed,
+/// `None` if the state is not initialized or the mutex is poisoned.
+fn with_ble_server_state<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&mut BleServerState) -> R,
+{
+    BLE_SERVER_INSTANCE
+        .get()?
+        .lock()
+        .ok()
+        .map(|mut state| f(&mut state))
+}
 
 // Thread-safe state for callback access
 struct BleServerState {
@@ -220,9 +245,10 @@ impl BleServer {
         let device_name = format!("AcornPups-{}", device_id);
         let state = Arc::new(Mutex::new(BleServerState::new()));
 
-        // Store global reference for callbacks
-        unsafe {
-            BLE_SERVER_INSTANCE = Some(state.clone());
+        // Thread-safe initialization using OnceLock
+        if let Err(_) = BLE_SERVER_INSTANCE.set(state.clone()) {
+            // If already set, this is fine - we'll use the existing instance
+            warn!("BLE_SERVER_INSTANCE was already initialized, using existing instance");
         }
 
         Self {
@@ -730,27 +756,24 @@ extern "C" fn gatts_event_handler(
                 add_char_param.attr_handle
             );
 
-            // Store characteristic handle
-            unsafe {
-                if let Some(server_state) = &BLE_SERVER_INSTANCE {
-                    if let Ok(mut state) = server_state.lock() {
-                        // This is a simplified mapping - in production you'd track which char this is
-                        if state.char_handles.len() == 0 {
-                            state
-                                .char_handles
-                                .insert("ssid".to_string(), add_char_param.attr_handle);
-                        } else if state.char_handles.len() == 1 {
-                            state
-                                .char_handles
-                                .insert("password".to_string(), add_char_param.attr_handle);
-                        } else if state.char_handles.len() == 2 {
-                            state
-                                .char_handles
-                                .insert("status".to_string(), add_char_param.attr_handle);
-                        }
-                    }
+            // Store characteristic handle using thread-safe helper function
+            with_ble_server_state(|state| {
+                // This is a simplified mapping - in production you'd track which char this is
+                let char_count = state.char_handles.len();
+                if char_count == 0 {
+                    state
+                        .char_handles
+                        .insert("ssid".to_string(), add_char_param.attr_handle);
+                } else if char_count == 1 {
+                    state
+                        .char_handles
+                        .insert("password".to_string(), add_char_param.attr_handle);
+                } else if char_count == 2 {
+                    state
+                        .char_handles
+                        .insert("status".to_string(), add_char_param.attr_handle);
                 }
-            }
+            });
 
             let _ = BLE_CHANNEL.try_send(BleEvent::CharacteristicAdded {
                 char_handle: add_char_param.attr_handle,
@@ -759,24 +782,18 @@ extern "C" fn gatts_event_handler(
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CONNECT_EVT => {
             info!("📱 BLE client connected");
-            unsafe {
-                if let Some(server_state) = &BLE_SERVER_INSTANCE {
-                    if let Ok(mut state) = server_state.lock() {
-                        state.is_connected = true;
-                    }
-                }
-            }
+            // Update connection state using thread-safe helper function
+            with_ble_server_state(|state| {
+                state.is_connected = true;
+            });
             let _ = BLE_CHANNEL.try_send(BleEvent::ClientConnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT => {
             info!("📱 BLE client disconnected");
-            unsafe {
-                if let Some(server_state) = &BLE_SERVER_INSTANCE {
-                    if let Ok(mut state) = server_state.lock() {
-                        state.is_connected = false;
-                    }
-                }
-            }
+            // Update connection state using thread-safe helper function
+            with_ble_server_state(|state| {
+                state.is_connected = false;
+            });
             let _ = BLE_CHANNEL.try_send(BleEvent::ClientDisconnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_WRITE_EVT => {
@@ -891,14 +908,10 @@ fn handle_characteristic_write(
                 credentials.ssid
             );
 
-            // Store in global state
-            unsafe {
-                if let Some(server_state) = &BLE_SERVER_INSTANCE {
-                    if let Ok(mut state) = server_state.lock() {
-                        state.received_credentials = Some(credentials.clone());
-                    }
-                }
-            }
+            // Store in global state using thread-safe helper function
+            with_ble_server_state(|state| {
+                state.received_credentials = Some(credentials.clone());
+            });
 
             let _ = BLE_CHANNEL.try_send(BleEvent::CredentialsReceived(credentials));
         } else {
