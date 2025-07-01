@@ -527,11 +527,11 @@ async fn ble_provisioning_mode_task(
     info!("🔄 Starting BLE provisioning loop - waiting for mobile app connection");
 
     loop {
-        // Handle BLE events
-        ble_server.handle_events().await;
+        // Handle BLE events (non-blocking - process one event if available)
+        ble_server.handle_events_non_blocking().await;
 
-        // Check for received credentials
-        if let Some(credentials) = ble_server.get_received_credentials() {
+        // Check for received credentials (take to prevent repeated processing)
+        if let Some(credentials) = ble_server.take_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
 
             // Store credentials

@@ -751,8 +751,13 @@ impl BleServer {
 
     // Public interface methods
     pub fn get_received_credentials(&self) -> Option<WiFiCredentials> {
-        let state = self.state.lock().unwrap();
-        state.received_credentials.clone()
+        // Read from the global state where credentials are actually stored by callbacks
+        with_ble_server_state(|state| state.received_credentials.clone()).flatten()
+    }
+
+    /// Take received credentials (get and clear) to prevent repeated processing
+    pub fn take_received_credentials(&self) -> Option<WiFiCredentials> {
+        with_ble_server_state(|state| state.received_credentials.take()).flatten()
     }
 
     pub fn is_client_connected(&self) -> bool {
@@ -862,6 +867,18 @@ impl BleServer {
             let event = BLE_CHANNEL.receive().await;
             self.process_event(event).await;
             Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Process events without blocking forever - for use in main provisioning loop
+    /// Returns true if an event was processed, false if no events are pending
+    pub async fn handle_events_non_blocking(&mut self) -> bool {
+        match BLE_CHANNEL.try_receive() {
+            Ok(event) => {
+                self.process_event(event).await;
+                true
+            }
+            Err(_) => false, // No events pending
         }
     }
 
@@ -1002,10 +1019,30 @@ impl BleServer {
                 }
             }
             BleEvent::ClientDisconnected => {
-                // Already logged in event handler - just update state
+                // Update state and restart advertising for new connections
                 {
                     let mut state = self.state.lock().unwrap();
                     state.is_connected = false;
+                }
+
+                // 🎯 FIX: Automatically restart advertising after disconnection
+                // This ensures the device remains discoverable for future connections
+                info!("🔄 Client disconnected - restarting advertising for new connections");
+                match self.restart_advertising().await {
+                    Ok(_) => {
+                        info!(
+                            "✅ Advertising restarted successfully - device is discoverable again"
+                        );
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to restart advertising after disconnect: {:?}", e);
+                        // Try a full advertising restart as fallback
+                        if let Err(e2) = self.start_advertising().await {
+                            error!("❌ Fallback advertising start also failed: {:?}", e2);
+                        } else {
+                            info!("✅ Fallback advertising start succeeded");
+                        }
+                    }
                 }
             }
             BleEvent::CredentialsReceived(credentials) => {
@@ -1204,9 +1241,24 @@ fn gap_event_handler_impl(
         }
         esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_START_COMPLETE_EVT => {
             info!("📡 Advertising started successfully");
+            BLE_ADVERTISING.store(true, Ordering::SeqCst);
             send_ble_event_with_backpressure(BleEvent::AdvertisingStarted);
         }
-        _ => {}
+        esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT => {
+            info!("📡 Advertising stopped");
+            BLE_ADVERTISING.store(false, Ordering::SeqCst);
+        }
+        // Handle connection update and security events that might cause "Device not found"
+        esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT => {
+            info!("🔄 BLE connection parameters updated");
+        }
+        esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT => {
+            info!("📏 BLE packet length updated");
+        }
+        _ => {
+            // Log unknown events for debugging
+            info!("📡 GAP event: {}", event);
+        }
     }
 }
 
