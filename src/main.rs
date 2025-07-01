@@ -10,7 +10,7 @@ use embassy_time::{Duration, Timer};
 // Signal provides event-driven communication between tasks
 // Mutex provides thread-safe shared state access
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 
@@ -69,26 +69,6 @@ pub enum WiFiConnectionEvent {
     CredentialsInvalid,                       // WiFi credentials validation failed
 }
 
-// WiFi driver commands for reconfiguration without recreation
-#[derive(Clone, Debug)]
-pub enum WiFiCommand {
-    Connect(ble_server::WiFiCredentials),
-    Disconnect,
-    GetStatus,
-}
-
-// WiFi driver responses
-#[derive(Clone, Debug)]
-pub enum WiFiResponse {
-    Connected(Ipv4Addr),
-    Disconnected,
-    Failed(String),
-    Status {
-        connected: bool,
-        ip: Option<Ipv4Addr>,
-    },
-}
-
 // System lifecycle events
 #[derive(Clone, Debug)]
 pub enum SystemEvent {
@@ -104,11 +84,6 @@ pub enum SystemEvent {
 pub static WIFI_STATUS_SIGNAL: Signal<CriticalSectionRawMutex, WiFiConnectionEvent> = Signal::new();
 pub static SYSTEM_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, SystemEvent> = Signal::new();
 
-// WiFi driver communication channels - solves the Peripherals::take() singleton issue
-pub static WIFI_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, WiFiCommand, 5> = Channel::new();
-pub static WIFI_RESPONSE_CHANNEL: Channel<CriticalSectionRawMutex, WiFiResponse, 5> =
-    Channel::new();
-
 // Shared system state - protected by mutex for safe concurrent access
 pub static SYSTEM_STATE: Mutex<CriticalSectionRawMutex, SystemState> =
     Mutex::new(SystemState::new());
@@ -121,7 +96,6 @@ pub struct SystemState {
     pub ble_active: bool,
     pub ble_client_connected: bool,
     pub provisioning_complete: bool,
-    pub ble_shutdown_requested: bool,
 }
 
 impl SystemState {
@@ -132,7 +106,6 @@ impl SystemState {
             ble_active: false,
             ble_client_connected: false,
             provisioning_complete: false,
-            ble_shutdown_requested: false,
         }
     }
 }
@@ -207,7 +180,7 @@ async fn main(spawner: Spawner) {
 
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
-    let wifi_storage = match WiFiStorage::new_with_partition(nvs) {
+    let mut wifi_storage = match WiFiStorage::new_with_partition(nvs) {
         Ok(storage) => {
             info!("✅ WiFi storage initialized successfully with NVS partition");
             storage
@@ -224,66 +197,48 @@ async fn main(spawner: Spawner) {
     // 🎯 PROPER SOLUTION: Initialize BLE first, then WiFi using safe abstractions
     // ESP32 supports BLE/WiFi coexistence when initialized in correct order
 
-    // 🎯 PROPER APPROACH: Initialize both BLE and WiFi drivers in main() for safe coexistence
+    // 🎯 SIMPLE & RELIABLE APPROACH: Check credentials and choose mode
+    // No complex coexistence - just restart-based switching
 
-    // Step 1: Initialize BLE driver first
-    info!("🔧 Step 1: Initializing BLE driver safely");
-    use esp_idf_svc::bt::BtDriver;
+    info!("🔧 Checking WiFi credentials to determine device mode...");
 
-    let bt_driver = match BtDriver::new(peripherals.modem, None) {
-        Ok(driver) => {
-            info!("✅ BLE driver initialized successfully");
-            Some(driver)
-        }
-        Err(e) => {
-            error!("❌ Failed to initialize BLE driver: {:?}", e);
-            warn!("⚠️ Continuing with WiFi-only mode");
-            None
-        }
-    };
+    if wifi_storage.has_stored_credentials() {
+        info!("✅ WiFi credentials found - Starting in WiFi-only mode");
 
-    // Step 2: Initialize WiFi normally
-    info!("🔧 Step 2: Initializing WiFi system");
-
-    // For BLE/WiFi coexistence, we need a more sophisticated approach
-    // For now, let's create a WiFi-only system that can be extended later
-    if bt_driver.is_some() {
-        warn!("⚠️ BLE/WiFi coexistence not yet fully implemented");
-        warn!("⚠️ Will attempt WiFi-only mode for now");
-    }
-
-    // Get a fresh modem reference for WiFi
-    let wifi_modem = match Peripherals::take() {
-        Ok(p) => {
-            info!("✅ Got modem for WiFi");
-            p.modem
-        }
-        Err(_) => {
-            // BLE has the modem, try working without it
-            warn!("⚠️ Cannot get modem for WiFi - BLE may have it");
-            warn!("⚠️ WiFi functionality will be limited");
-
-            // Still spawn BLE task to handle stored credentials
-            if let Err(_) = spawner.spawn(ble_provisioning_task(wifi_storage, bt_driver)) {
-                error!("Failed to spawn BLE provisioning task");
-                return;
-            }
-
-            info!("✅ BLE-only mode initialized - will use stored WiFi credentials only");
+        // WiFi-only mode: Give modem to WiFi
+        if let Err(_) = spawner.spawn(wifi_only_mode_task(
+            peripherals.modem,
+            sys_loop,
+            timer_service,
+            wifi_storage,
+        )) {
+            error!("Failed to spawn WiFi-only mode task");
             return;
         }
-    };
 
-    // Spawn the persistent WiFi task with the modem
-    if let Err(_) = spawner.spawn(persistent_wifi_task(wifi_modem, sys_loop, timer_service)) {
-        error!("Failed to spawn persistent WiFi task");
-        return;
-    }
+        info!("📶 Device operating in WiFi-only mode - BLE disabled");
+    } else {
+        info!("📻 No WiFi credentials found - Starting in BLE provisioning mode");
 
-    // Pass both WiFi storage and BLE driver to BLE task
-    if let Err(_) = spawner.spawn(ble_provisioning_task(wifi_storage, bt_driver)) {
-        error!("Failed to spawn BLE provisioning task");
-        return;
+        // BLE-only mode: Give modem to BLE
+        use esp_idf_svc::bt::BtDriver;
+        let bt_driver = match BtDriver::new(peripherals.modem, None) {
+            Ok(driver) => {
+                info!("✅ BLE driver initialized successfully");
+                driver
+            }
+            Err(e) => {
+                error!("❌ Failed to initialize BLE driver: {:?}", e);
+                return;
+            }
+        };
+
+        if let Err(_) = spawner.spawn(ble_provisioning_mode_task(bt_driver, wifi_storage)) {
+            error!("Failed to spawn BLE provisioning mode task");
+            return;
+        }
+
+        info!("📱 Device operating in BLE provisioning mode - WiFi disabled");
     }
 
     // Spawn the LED status task - provides BLE connection status visual feedback
@@ -375,7 +330,6 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
                 let mut state = SYSTEM_STATE.lock().await;
                 state.wifi_connected = true;
                 state.wifi_ip = Some(ip);
-                state.ble_shutdown_requested = true;
             }
 
             // Signal system transition to WiFi mode
@@ -403,28 +357,24 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
     }
 }
 
-// PERSISTENT WIFI TASK - Solves the Peripherals::take() singleton issue
-// This task owns the WiFi driver for the entire program lifecycle
-// It receives commands via channels and responds accordingly
-// NO MORE Peripherals::take() calls needed - smooth user experience!
+// WIFI-ONLY MODE TASK - Pure WiFi operation when credentials exist
 #[embassy_executor::task]
-async fn persistent_wifi_task(
+async fn wifi_only_mode_task(
     modem: Modem,
     sys_loop: EspSystemEventLoop,
     timer_service: EspTaskTimerService,
+    mut wifi_storage: WiFiStorage,
 ) {
-    info!("🌐 Persistent WiFi Task started - owns WiFi driver for entire program lifecycle");
-    info!("ℹ️ WiFi driver running without NVS - credentials handled by WiFi storage");
+    info!("📶 WiFi-Only Mode Task started - connecting with stored credentials");
 
-    // Initialize WiFi driver once - this is the ONLY place we create it
-    // Note: No NVS partition for WiFi driver since WiFi storage owns it
+    // Initialize WiFi driver with exclusive modem access
     let mut wifi = match AsyncWifi::wrap(
         EspWifi::new(modem, sys_loop.clone(), None).unwrap(),
         sys_loop,
         timer_service,
     ) {
         Ok(wifi) => {
-            info!("✅ WiFi driver initialized successfully - ready for commands");
+            info!("✅ WiFi driver initialized successfully");
             wifi
         }
         Err(e) => {
@@ -433,407 +383,200 @@ async fn persistent_wifi_task(
         }
     };
 
-    let mut is_connected = false;
-    let mut current_ip: Option<Ipv4Addr> = None;
-
-    // 🔧 CRITICAL FIX: Set WiFi to station mode BEFORE starting
-    info!("🔧 Setting WiFi to station mode (not AP mode)");
+    // Set to station mode
     let station_config = Configuration::Client(ClientConfiguration::default());
     if let Err(e) = wifi.set_configuration(&station_config) {
         error!("❌ Failed to set WiFi to station mode: {:?}", e);
         return;
     }
-    info!("✅ WiFi configured in station mode");
 
-    // Start WiFi in station mode
+    // Start WiFi
     if let Err(e) = wifi.start().await {
         error!("❌ Failed to start WiFi: {:?}", e);
         return;
     }
-    info!("🚀 WiFi driver started in station mode and ready for configuration commands");
 
-    // Command processing loop - handles reconfiguration without recreation
-    loop {
-        let command = WIFI_COMMAND_CHANNEL.receive().await;
+    // Load and connect with stored credentials
+    match wifi_storage.load_credentials() {
+        Ok(Some(credentials)) => {
+            info!(
+                "📶 Connecting to WiFi with stored credentials: {}",
+                credentials.ssid
+            );
 
-        match command {
-            WiFiCommand::Connect(credentials) => {
-                info!(
-                    "📶 Received WiFi connect command for SSID: {}",
-                    credentials.ssid
-                );
+            let wifi_config = Configuration::Client(ClientConfiguration {
+                ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
+                password: credentials.password.as_str().try_into().unwrap_or_default(),
+                ..Default::default()
+            });
 
-                // Disconnect if currently connected
-                if is_connected {
-                    info!("🔄 Disconnecting from current network first");
-                    let _ = wifi.disconnect().await;
-                    is_connected = false;
-                    current_ip = None;
-                }
+            if let Err(e) = wifi.set_configuration(&wifi_config) {
+                error!("❌ Failed to configure WiFi: {:?}", e);
+                return;
+            }
 
-                // Configure WiFi for new credentials
-                let wifi_config = Configuration::Client(ClientConfiguration {
-                    ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
-                    password: credentials.password.as_str().try_into().unwrap_or_default(),
-                    ..Default::default()
-                });
+            // Connect to WiFi
+            match with_timeout(Duration::from_secs(30), wifi.connect()).await {
+                Ok(Ok(_)) => {
+                    info!("✅ WiFi connected successfully!");
 
-                match wifi.set_configuration(&wifi_config) {
-                    Ok(_) => info!("✅ WiFi configured for SSID: {}", credentials.ssid),
-                    Err(e) => {
-                        error!("❌ Failed to configure WiFi: {:?}", e);
-                        WIFI_RESPONSE_CHANNEL
-                            .send(WiFiResponse::Failed(format!("Config failed: {:?}", e)))
-                            .await;
-                        continue;
-                    }
-                }
+                    match with_timeout(Duration::from_secs(15), wifi.wait_netif_up()).await {
+                        Ok(Ok(_)) => {
+                            let ip_info = wifi.wifi().sta_netif().get_ip_info().unwrap();
+                            let ip_address = ip_info.ip;
 
-                // Attempt connection with timeout
-                WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionAttempting);
+                            info!("🌐 WiFi connected! IP: {}", ip_address);
+                            WIFI_STATUS_SIGNAL
+                                .signal(WiFiConnectionEvent::ConnectionSuccessful(ip_address));
 
-                match with_timeout(Duration::from_secs(30), wifi.connect()).await {
-                    Ok(Ok(_)) => {
-                        info!("✅ WiFi connected successfully!");
-
-                        // Wait for IP assignment
-                        match with_timeout(Duration::from_secs(15), wifi.wait_netif_up()).await {
-                            Ok(Ok(_)) => {
-                                let ip_info = wifi.wifi().sta_netif().get_ip_info().unwrap();
-                                let ip_address = ip_info.ip;
-
-                                is_connected = true;
-                                current_ip = Some(ip_address);
-
-                                info!("🌐 WiFi connection successful! IP: {}", ip_address);
-
-                                // Send success response
-                                WIFI_RESPONSE_CHANNEL
-                                    .send(WiFiResponse::Connected(ip_address))
-                                    .await;
-                                WIFI_STATUS_SIGNAL
-                                    .signal(WiFiConnectionEvent::ConnectionSuccessful(ip_address));
-
-                                // Test connectivity
-                                if let Err(e) = test_connectivity_and_register(ip_address).await {
-                                    warn!("⚠️ Connectivity test failed: {:?}", e);
-                                }
+                            // Update system state
+                            {
+                                let mut state = SYSTEM_STATE.lock().await;
+                                state.wifi_connected = true;
+                                state.wifi_ip = Some(ip_address);
+                                state.ble_active = false;
+                                state.provisioning_complete = true;
                             }
-                            Ok(Err(e)) => {
-                                error!("❌ Failed to get IP address: {:?}", e);
-                                WIFI_RESPONSE_CHANNEL
-                                    .send(WiFiResponse::Failed(format!(
-                                        "IP assignment failed: {:?}",
-                                        e
-                                    )))
-                                    .await;
-                                WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionFailed(
-                                    format!("IP assignment failed: {:?}", e),
-                                ));
+
+                            // Test connectivity
+                            if let Err(e) = test_connectivity_and_register(ip_address).await {
+                                warn!("⚠️ Connectivity test failed: {:?}", e);
                             }
-                            Err(_) => {
-                                error!("❌ IP assignment timeout");
-                                WIFI_RESPONSE_CHANNEL
-                                    .send(WiFiResponse::Failed("IP assignment timeout".to_string()))
-                                    .await;
-                                WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionFailed(
-                                    "IP assignment timeout".to_string(),
-                                ));
+
+                            // Stay connected forever
+                            loop {
+                                Timer::after(Duration::from_secs(60)).await;
+                                info!("📶 WiFi-only mode running - IP: {}", ip_address);
                             }
                         }
-                    }
-                    Ok(Err(e)) => {
-                        error!("❌ WiFi connection failed: {:?}", e);
-                        WIFI_RESPONSE_CHANNEL
-                            .send(WiFiResponse::Failed(format!("Connection failed: {:?}", e)))
-                            .await;
-                        WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionFailed(format!(
-                            "Connection failed: {:?}",
-                            e
-                        )));
-                    }
-                    Err(_) => {
-                        error!("❌ WiFi connection timeout");
-                        WIFI_RESPONSE_CHANNEL
-                            .send(WiFiResponse::Failed("Connection timeout".to_string()))
-                            .await;
-                        WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionFailed(
-                            "Connection timeout".to_string(),
-                        ));
+                        Ok(Err(e)) => {
+                            error!("❌ Failed to get IP address: {:?}", e);
+                        }
+                        Err(_) => {
+                            error!("❌ IP assignment timeout");
+                        }
                     }
                 }
-            }
+                Ok(Err(e)) => {
+                    error!("❌ WiFi connection failed: {:?}", e);
+                    warn!("🔄 Clearing invalid credentials and restarting for BLE provisioning");
 
-            WiFiCommand::Disconnect => {
-                info!("🔄 Received WiFi disconnect command");
-                if is_connected {
-                    let _ = wifi.disconnect().await;
-                    is_connected = false;
-                    current_ip = None;
-                    WIFI_RESPONSE_CHANNEL.send(WiFiResponse::Disconnected).await;
-                    info!("✅ WiFi disconnected");
-                } else {
-                    WIFI_RESPONSE_CHANNEL.send(WiFiResponse::Disconnected).await;
-                    info!("ℹ️ WiFi already disconnected");
+                    // Clear invalid credentials
+                    if let Err(e) = wifi_storage.clear_credentials() {
+                        error!("Failed to clear credentials: {:?}", e);
+                    }
+
+                    // Restart device to enter BLE provisioning mode
+                    restart_device("Invalid WiFi credentials - entering BLE mode").await;
                 }
-            }
-
-            WiFiCommand::GetStatus => {
-                WIFI_RESPONSE_CHANNEL
-                    .send(WiFiResponse::Status {
-                        connected: is_connected,
-                        ip: current_ip,
-                    })
-                    .await;
+                Err(_) => {
+                    error!("❌ WiFi connection timeout");
+                }
             }
         }
-
-        // Small yield
-        Timer::after(Duration::from_millis(10)).await;
+        Ok(None) => {
+            error!("❌ No WiFi credentials found in storage");
+            restart_device("No credentials found - entering BLE mode").await;
+        }
+        Err(e) => {
+            error!("❌ Failed to load WiFi credentials: {:?}", e);
+            restart_device("Credential load error - entering BLE mode").await;
+        }
     }
 }
 
-// BLE PROVISIONING TASK - Now communicates via channels (no modem ownership)
-// This task handles all Bluetooth Low Energy functionality for WiFi provisioning
-// IMPROVED: Uses channel communication with persistent WiFi task - no Peripherals::take() issues!
-// FIXED: Receives WiFi storage AND BLE driver from main() - safe coexistence!
+// BLE PROVISIONING MODE TASK - Pure BLE operation when no credentials exist
 #[embassy_executor::task]
-async fn ble_provisioning_task(
+async fn ble_provisioning_mode_task(
+    bt_driver: esp_idf_svc::bt::BtDriver<'static, esp_idf_svc::bt::Ble>,
     mut wifi_storage: WiFiStorage,
-    bt_driver: Option<esp_idf_svc::bt::BtDriver<'static, esp_idf_svc::bt::Ble>>,
 ) {
-    info!("📻 BLE Provisioning Task started - Event-driven WiFi setup");
-    info!("✅ WiFi storage and BLE driver passed from main() - safe coexistence!");
-
-    // Check if BLE driver was successfully initialized
-    let available_bt_driver = match bt_driver {
-        Some(driver) => {
-            info!("✅ BLE driver available - full provisioning mode");
-            Some(driver)
-        }
-        None => {
-            warn!("⚠️ No BLE driver available - limited functionality");
-            warn!("⚠️ Device will rely on stored WiFi credentials only");
-
-            // Try to connect with stored credentials only
-            if wifi_storage.has_stored_credentials() {
-                info!("Attempting connection with stored credentials...");
-                if let Ok(Some(credentials)) = wifi_storage.load_credentials() {
-                    WIFI_COMMAND_CHANNEL
-                        .send(WiFiCommand::Connect(credentials))
-                        .await;
-
-                    let response = WIFI_RESPONSE_CHANNEL.receive().await;
-                    match response {
-                        WiFiResponse::Connected(ip_address) => {
-                            info!("✅ Connected with stored credentials - IP: {}", ip_address);
-                            return;
-                        }
-                        _ => {
-                            error!(
-                                "❌ Failed to connect with stored credentials and no BLE available"
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-
-            error!("❌ No BLE driver and no stored credentials - cannot provision WiFi");
-            return;
-        }
-    };
-
-    // Check if we already have stored credentials
-    if wifi_storage.has_stored_credentials() {
-        info!("Found existing WiFi credentials, attempting connection...");
-        if let Ok(Some(credentials)) = wifi_storage.load_credentials() {
-            info!("Loaded credentials for SSID: {}", credentials.ssid);
-
-            // Send WiFi connect command to persistent WiFi task
-            WIFI_COMMAND_CHANNEL
-                .send(WiFiCommand::Connect(credentials))
-                .await;
-
-            // Wait for response
-            let response = WIFI_RESPONSE_CHANNEL.receive().await;
-            match response {
-                WiFiResponse::Connected(ip_address) => {
-                    info!(
-                        "✅ Connected with stored credentials - IP: {} - BLE task terminating",
-                        ip_address
-                    );
-                    SYSTEM_EVENT_SIGNAL
-                        .signal(SystemEvent::TaskTerminating("BLE Provisioning".to_string()));
-                    return; // Task exits successfully
-                }
-                WiFiResponse::Failed(error) => {
-                    warn!("Failed to connect with stored credentials: {}", error);
-                    // Continue with BLE provisioning
-                }
-                _ => {
-                    warn!("Unexpected response from WiFi task");
-                }
-            }
-        }
-    }
+    info!("📻 BLE Provisioning Mode Task started - Device needs WiFi credentials");
+    info!("📱 Pure BLE mode - WiFi disabled until credentials received");
 
     // Generate device ID and create BLE server
     let device_id = generate_device_id();
     let mut ble_server = BleServer::new(&device_id);
 
-    // Check if BLE driver is available for initialization
-    let ble_initialized = if let Some(bt_driver) = available_bt_driver {
-        info!("📻 BLE driver is available - initializing BLE server for WiFi coexistence");
+    // Initialize BLE server with the BT driver we received from main()
+    info!("🔧 Initializing BLE server with provided BT driver");
+    match ble_server.initialize_with_bt_driver(bt_driver).await {
+        Ok(_) => {
+            info!("✅ BLE server initialized successfully!");
+            info!(
+                "📻 BLE advertising started - Device: AcornPups-{}",
+                device_id
+            );
 
-        // Use the initialized BLE driver to set up the BLE server
-        match ble_server.initialize_with_bt_driver(bt_driver).await {
-            Ok(_) => {
-                info!("✅ BLE server initialized successfully with WiFi coexistence");
-                true
+            // Update system state
+            {
+                let mut state = SYSTEM_STATE.lock().await;
+                state.ble_active = true;
             }
-            Err(e) => {
-                error!("❌ Failed to initialize BLE server: {:?}", e);
-                warn!("⚠️ Continuing without BLE - WiFi credentials from storage only");
-                false
-            }
+
+            SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ProvisioningMode);
         }
-    } else {
-        warn!("⚠️ No BLE driver available - BLE initialization skipped");
-        info!("ℹ️ Will attempt to use stored WiFi credentials only");
-        false
-    };
-
-    // BLE advertising status based on initialization success
-    // Note: initialize_with_bt_driver() already starts advertising if successful
-    let ble_active = if ble_initialized {
-        info!(
-            "📻 BLE advertising already started during initialization - Device: AcornPups-{}",
-            device_id
-        );
-        true
-    } else {
-        info!("ℹ️ BLE not available - no advertising");
-        false
-    };
-
-    // Update system state based on BLE availability
-    {
-        let mut state = SYSTEM_STATE.lock().await;
-        state.ble_active = ble_active;
+        Err(e) => {
+            error!("❌ Failed to initialize BLE server: {:?}", e);
+            error!("💥 BLE provisioning not available");
+            return;
+        }
     }
 
-    if ble_active {
-        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ProvisioningMode);
-    } else {
-        info!("📱 No BLE available - checking for stored WiFi credentials");
-    }
+    // Main BLE provisioning loop
+    info!("🔄 Starting BLE provisioning loop - waiting for mobile app connection");
 
-    // EVENT-DRIVEN MAIN LOOP - NO POLLING!
-    // This task waits for events and responds accordingly
     loop {
-        // Check system state to see if BLE shutdown was requested
-        {
-            let state = SYSTEM_STATE.lock().await;
-            if state.ble_shutdown_requested {
-                info!("🔄 BLE shutdown requested - initiating cleanup...");
-
-                // Wait for status message delivery
-                Timer::after(Duration::from_secs(3)).await;
-
-                // Complete BLE shutdown
-                if let Err(e) = ble_server.shutdown_ble_completely().await {
-                    warn!("Failed to shutdown BLE completely: {}", e);
-                } else {
-                    info!("✅ BLE hardware completely disabled and resources freed");
-
-                    // Update system state directly after successful shutdown
-                    {
-                        let mut state = SYSTEM_STATE.lock().await;
-                        state.ble_active = false;
-                        state.provisioning_complete = true;
-                    }
-                }
-
-                break; // Task should terminate
-            }
-        }
-
-        // Handle BLE events in a non-blocking way
+        // Handle BLE events
         ble_server.handle_events().await;
 
-        // Check for received credentials (event-driven)
+        // Check for received credentials
         if let Some(credentials) = ble_server.get_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
 
-            // Store credentials in NVS
+            // Store credentials
             match wifi_storage.store_credentials(&credentials) {
                 Ok(()) => {
                     info!("💾 WiFi credentials stored successfully");
-                    WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::CredentialsStored);
-                    ble_server.send_wifi_status(true, None).await;
+                    ble_server
+                        .send_wifi_status(true, Some("Credentials stored - restarting device"))
+                        .await;
+
+                    // Wait for message delivery
+                    Timer::after(Duration::from_secs(2)).await;
+
+                    // Restart device to switch to WiFi-only mode
+                    info!("🔄 Restarting device to switch to WiFi-only mode");
+                    restart_device("Credentials stored - switching to WiFi mode").await;
                 }
                 Err(e) => {
                     error!("Failed to store WiFi credentials: {:?}", e);
-                    WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::CredentialsInvalid);
-                    ble_server.send_wifi_status(false, None).await;
-                    continue; // Stay in loop for retry
-                }
-            }
-
-            // Signal WiFi connection attempt
-            WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionAttempting);
-
-            // Send WiFi connect command to persistent WiFi task
-            WIFI_COMMAND_CHANNEL
-                .send(WiFiCommand::Connect(credentials.clone()))
-                .await;
-
-            // Wait for response from WiFi task
-            let response = WIFI_RESPONSE_CHANNEL.receive().await;
-            match response {
-                WiFiResponse::Connected(ip_address) => {
-                    info!("✅ WiFi connection successful! IP: {}", ip_address);
-
-                    // Send success status with IP address to mobile app
                     ble_server
-                        .send_wifi_status(true, Some(&ip_address.to_string()))
+                        .send_wifi_status(false, Some("Failed to store credentials"))
                         .await;
-
-                    // The system coordinator will request BLE shutdown via system state
-                    // This task will detect the shutdown request in the next loop iteration
-                }
-                WiFiResponse::Failed(error) => {
-                    error!("WiFi connection failed: {}", error);
-                    ble_server.send_wifi_status(false, None).await;
-
-                    // Clear stored credentials if connection failed
-                    if let Err(e) = wifi_storage.clear_credentials() {
-                        warn!("Failed to clear invalid credentials: {:?}", e);
-                    }
-
-                    // Continue BLE provisioning - stay in loop for retry
-                }
-                _ => {
-                    warn!("Unexpected response from WiFi task");
-                    ble_server.send_wifi_status(false, None).await;
+                    continue;
                 }
             }
         }
 
-        // Small yield to prevent task hogging (much smaller than polling delay)
         Timer::after(Duration::from_millis(10)).await;
     }
+}
 
-    // Clean task termination
-    info!("🏁 BLE Provisioning Task completed successfully");
-    info!("🔚 BLE task terminating cleanly - all resources freed");
-    info!("📶 Device transitioned to WiFi-only operation");
+// Device restart function - cleanly restarts the ESP32
+async fn restart_device(reason: &str) {
+    info!("🔄 Device restart requested: {}", reason);
+    info!("💾 All data should be saved to NVS flash storage");
 
-    // Signal clean task termination
-    SYSTEM_EVENT_SIGNAL.signal(SystemEvent::TaskTerminating("BLE Provisioning".to_string()));
+    // Give time for any final operations
+    Timer::after(Duration::from_secs(1)).await;
 
-    // Task function ends here - Embassy will clean up the task and free its memory
+    info!("🔃 Restarting ESP32...");
+
+    // ESP-IDF restart function
+    unsafe {
+        esp_idf_svc::sys::esp_restart();
+    }
 }
 
 // OLD WiFi FUNCTIONS REMOVED - Now using persistent WiFi task with channel communication
