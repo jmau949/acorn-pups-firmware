@@ -33,7 +33,7 @@ use esp_idf_svc::wifi::{AsyncWifi, ClientConfiguration, Configuration, EspWifi};
 
 // Import HTTP client functionality for connectivity testing
 use embedded_svc::http::client::Client;
-use embedded_svc::io::{Read, Write};
+use embedded_svc::io::Write;
 use esp_idf_svc::http::client::EspHttpConnection;
 
 // Import standard library components
@@ -228,7 +228,7 @@ async fn main(spawner: Spawner) {
 
     // Step 1: Initialize BLE driver first
     info!("🔧 Step 1: Initializing BLE driver safely");
-    use esp_idf_svc::bt::{Ble, BtDriver};
+    use esp_idf_svc::bt::BtDriver;
 
     let bt_driver = match BtDriver::new(peripherals.modem, None) {
         Ok(driver) => {
@@ -704,24 +704,16 @@ async fn ble_provisioning_task(
         false
     };
 
-    // Start BLE advertising only if BLE was successfully initialized
+    // BLE advertising status based on initialization success
+    // Note: initialize_with_bt_driver() already starts advertising if successful
     let ble_active = if ble_initialized {
-        match ble_server.start_advertising().await {
-            Ok(_) => {
-                info!(
-                    "📻 BLE advertising started - Device: AcornPups-{}",
-                    device_id
-                );
-                true
-            }
-            Err(e) => {
-                error!("Failed to start BLE advertising: {}", e);
-                warn!("⚠️ Continuing without BLE advertising");
-                false
-            }
-        }
+        info!(
+            "📻 BLE advertising already started during initialization - Device: AcornPups-{}",
+            device_id
+        );
+        true
     } else {
-        info!("ℹ️ BLE not available - skipping advertising");
+        info!("ℹ️ BLE not available - no advertising");
         false
     };
 
