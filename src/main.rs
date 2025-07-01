@@ -189,7 +189,6 @@ async fn main(spawner: Spawner) {
         return;
     }
 
-    // 🎯 SOLUTION: Initialize ALL shared resources in main() to avoid conflicts
     // Initialize system components
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let timer_service = EspTaskTimerService::new().unwrap();
@@ -229,14 +228,7 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    info!("🔧 Initializing BLE and WiFi coexistence using safe ESP-IDF abstractions");
-
-    // 🎯 PROPER SOLUTION: Initialize BLE first, then WiFi using safe abstractions
-    // ESP32 supports BLE/WiFi coexistence when initialized in correct order
-
-    // 🎯 SIMPLE & RELIABLE APPROACH: Check credentials and choose mode
-    // No complex coexistence - just restart-based switching
-
+    // Check WiFi credentials to determine device mode
     info!("🔧 Checking WiFi credentials to determine device mode...");
 
     if wifi_storage.has_stored_credentials() {
@@ -928,9 +920,6 @@ async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error
         Err(error_msg.into())
     }
 }
-
-// RESTART FUNCTIONS REMOVED - No longer needed with persistent WiFi task approach!
-// The channel-based communication eliminates the need for device restarts.
 
 #[embassy_executor::task]
 async fn led_task(

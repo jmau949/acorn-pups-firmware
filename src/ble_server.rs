@@ -158,19 +158,16 @@ pub const SSID_CHAR_UUID: &str = "12345678-1234-1234-1234-123456789abd";
 pub const PASSWORD_CHAR_UUID: &str = "12345678-1234-1234-1234-123456789abe";
 pub const STATUS_CHAR_UUID: &str = "12345678-1234-1234-1234-123456789abf";
 
-// BLE operation timeouts
-const INIT_TIMEOUT_MS: u64 = 10000;
-const ADVERTISING_TIMEOUT_MS: u64 = 5000;
-const CONNECTION_TIMEOUT_MS: u64 = 30000;
-const DATA_TIMEOUT_MS: u64 = 10000;
+// BLE operation timeout for credential reception
+const CREDENTIALS_TIMEOUT_SECONDS: u64 = 30;
 
 // Global state for BLE operations
 static BLE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static BLE_ADVERTISING: AtomicBool = AtomicBool::new(false);
-static GATT_IF: AtomicU8 = AtomicU8::new(0);
+static GATT_INTERFACE: AtomicU8 = AtomicU8::new(0);
 
 // Global channel for BLE events
-pub static BLE_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel::new();
+pub static BLE_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel::new();
 
 // Event priority classification for backpressure handling
 #[derive(Debug, Clone, PartialEq)]
@@ -192,17 +189,17 @@ fn send_ble_event_with_backpressure(event: BleEvent) {
     match priority {
         EventPriority::Critical => {
             // Critical events must never be dropped - block briefly and retry
-            if BLE_CHANNEL.try_send(event.clone()).is_err() {
+            if BLE_EVENT_CHANNEL.try_send(event.clone()).is_err() {
                 warn!("🚨 BLE channel full for critical event: {:?}", event);
 
                 // For critical events, we'll attempt to drain one item and retry
                 // This is safe because we're prioritizing the most important events
-                if let Ok(_) = BLE_CHANNEL.try_receive() {
+                if let Ok(_) = BLE_EVENT_CHANNEL.try_receive() {
                     warn!("📤 Dropped low-priority event to make space for critical event");
                 }
 
                 // Retry the critical event
-                if let Err(_) = BLE_CHANNEL.try_send(event.clone()) {
+                if let Err(_) = BLE_EVENT_CHANNEL.try_send(event.clone()) {
                     error!(
                         "❌ CRITICAL: Failed to send critical BLE event after retry: {:?}",
                         event
@@ -213,17 +210,17 @@ fn send_ble_event_with_backpressure(event: BleEvent) {
         }
         EventPriority::Important => {
             // Important events should try hard not to be dropped
-            if let Err(_) = BLE_CHANNEL.try_send(event.clone()) {
+            if let Err(_) = BLE_EVENT_CHANNEL.try_send(event.clone()) {
                 warn!("⚠️ BLE channel full for important event: {:?}", event);
                 // Try once more after a brief moment - important but not critical
-                if let Err(_) = BLE_CHANNEL.try_send(event) {
+                if let Err(_) = BLE_EVENT_CHANNEL.try_send(event) {
                     warn!("📤 Dropped important BLE event due to channel backpressure");
                 }
             }
         }
         EventPriority::Normal => {
             // Normal events can be dropped silently if channel is full
-            if let Err(_) = BLE_CHANNEL.try_send(event) {
+            if let Err(_) = BLE_EVENT_CHANNEL.try_send(event) {
                 // Silent drop for normal events - this is expected under high load
             }
         }
@@ -250,14 +247,8 @@ fn classify_event_priority(event: &BleEvent) -> EventPriority {
     }
 }
 
-// Thread-safe global storage for BLE server instance using OnceLock
-//
-// OPTIMIZATION: Replaced unsafe `static mut` with `std::sync::OnceLock` for:
-// 1. Thread-safe lazy initialization without unsafe code
-// 2. Guaranteed single initialization across the lifetime of the program
-// 3. Safe access from extern "C" callbacks without data races
-// 4. Elimination of all unsafe access patterns while maintaining functionality
-static BLE_SERVER_INSTANCE: OnceLock<Arc<Mutex<BleServerState>>> = OnceLock::new();
+// Thread-safe global BLE server state accessible from C callbacks
+static GLOBAL_BLE_SERVER_STATE: OnceLock<Arc<Mutex<BleServerState>>> = OnceLock::new();
 
 /// Thread-safe and panic-safe helper function to access BLE server state from callbacks
 ///
@@ -273,7 +264,7 @@ where
     F: FnOnce(&mut BleServerState) -> R,
 {
     // Get the state instance if initialized
-    let state_arc = BLE_SERVER_INSTANCE.get()?;
+    let state_arc = GLOBAL_BLE_SERVER_STATE.get()?;
 
     // Acquire the lock
     let mut state = state_arc.lock().ok()?;
@@ -300,7 +291,7 @@ impl BleServerState {
             service_handle: 0,
             char_handles: HashMap::new(),
             connection_time: None,
-            credentials_timeout_seconds: 30, // 30 second timeout for credentials
+            credentials_timeout_seconds: CREDENTIALS_TIMEOUT_SECONDS,
         }
     }
 }
@@ -350,9 +341,9 @@ impl BleServer {
         let state = Arc::new(Mutex::new(BleServerState::new()));
 
         // Thread-safe initialization using OnceLock
-        if let Err(_) = BLE_SERVER_INSTANCE.set(state.clone()) {
+        if let Err(_) = GLOBAL_BLE_SERVER_STATE.set(state.clone()) {
             // If already set, this is fine - we'll use the existing instance
-            warn!("BLE_SERVER_INSTANCE was already initialized, using existing instance");
+            warn!("GLOBAL_BLE_SERVER_STATE was already initialized, using existing instance");
         }
 
         Self {
@@ -363,42 +354,6 @@ impl BleServer {
             callbacks_registered: false,
             gatt_app_registered: false,
         }
-    }
-
-    // Initialize BLE with real modem hardware following proper ESP-IDF sequence
-    // Includes RAII cleanup on failure
-    pub async fn initialize_with_modem(&mut self, modem: Modem) -> BleResult<()> {
-        info!("🔧 Starting ESP-IDF BLE initialization sequence with RAII cleanup");
-
-        // Initialize BLE driver (this automatically does controller init, enable, Bluedroid init, enable)
-        info!("📡 Initializing BLE driver with modem - this handles all low-level initialization");
-        let bt_driver = BtDriver::new(modem, None).map_err(|e| {
-            error!("❌ BtDriver creation failed - no cleanup needed: {:?}", e);
-            BleError::ControllerInitFailed(format!("BtDriver creation failed: {:?}", e))
-        })?;
-
-        // Store the driver - if anything fails after this, Drop will clean it up
-        self.bt_driver = Some(bt_driver);
-
-        // BtDriver::new() already completed:
-        // - BLE controller initialization
-        // - BLE controller enable
-        // - Bluedroid stack initialization
-        // - Bluedroid stack enable
-        // So we can skip directly to BluedroidEnabled state
-        self.init_state = BleInitState::BluedroidEnabled;
-
-        // Small delay to ensure everything is stable
-        Timer::after(Duration::from_millis(200)).await;
-
-        // If we reach here, initialization was successful
-        BLE_INITIALIZED.store(true, Ordering::SeqCst);
-
-        // Send initialization event
-        send_ble_event_with_backpressure(BleEvent::Initialized);
-
-        info!("✅ ESP-IDF BLE initialization completed - controller and Bluedroid ready");
-        Ok(())
     }
 
     /// Initialize BLE using provided BT driver - for WiFi coexistence
@@ -443,27 +398,6 @@ impl BleServer {
         self.start_provisioning_service().await?;
 
         Ok(())
-    }
-
-    /// Safe BLE stack initialization using ESP-IDF-SVC abstractions
-    /// This approach uses safe Rust wrappers instead of unsafe ESP-IDF calls
-    async fn initialize_ble_stack_directly(&mut self) -> BleResult<()> {
-        info!("🔧 Initializing BLE stack using safe ESP-IDF-SVC abstractions");
-
-        // For BLE/WiFi coexistence, we need to approach this differently
-        // The ESP32 supports coexistence but requires careful initialization order
-
-        // Since WiFi already has the modem, we need to find an alternative approach
-        // that doesn't require direct modem access for BLE initialization
-
-        warn!("⚠️ BLE initialization requires modem access that's currently used by WiFi");
-        warn!("⚠️ ESP32 BLE/WiFi coexistence needs proper resource sharing implementation");
-
-        // Return an error indicating this needs a different approach
-        Err(BleError::NotInitialized(
-            "BLE initialization requires proper modem sharing with WiFi - not yet implemented"
-                .to_string(),
-        ))
     }
 
     // Start BLE provisioning service with proper initialization order and RAII cleanup
@@ -576,8 +510,8 @@ impl BleServer {
             },
         };
 
-        let gatts_if = GATT_IF.load(Ordering::SeqCst);
-        if gatts_if == 0 {
+        let gatt_interface = GATT_INTERFACE.load(Ordering::SeqCst);
+        if gatt_interface == 0 {
             return Err(BleError::NotInitialized(
                 "GATT interface not registered".to_string(),
             ));
@@ -586,7 +520,7 @@ impl BleServer {
         call_esp_api_with_context(
             || unsafe {
                 esp_idf_sys::esp_ble_gatts_create_service(
-                    gatts_if,
+                    gatt_interface,
                     &service_id as *const _ as *mut _,
                     8,
                 )
@@ -621,7 +555,6 @@ impl BleServer {
 
         Timer::after(Duration::from_millis(100)).await;
 
-        // 🎯 FIXED: Compact advertising data to avoid "Partial data write" warning
         // Configure minimal advertising data to fit in BLE advertising packet
         let mut adv_data = esp_idf_sys::esp_ble_adv_data_t {
             set_scan_rsp: false,
@@ -702,62 +635,7 @@ impl BleServer {
         Ok(())
     }
 
-    // Add real GATT characteristic
-    async fn add_characteristic(
-        &self,
-        uuid_str: &str,
-        char_name: &str,
-        properties: u8,
-        permissions: u16,
-    ) -> BleResult<()> {
-        info!("📝 Adding real {} characteristic", char_name);
-
-        let char_uuid = parse_uuid(uuid_str)?;
-        let service_handle = {
-            let state = self.state.lock().unwrap();
-            state.service_handle
-        };
-
-        let uuid_struct = esp_idf_sys::esp_bt_uuid_t {
-            len: esp_idf_sys::ESP_UUID_LEN_128 as u16,
-            uuid: esp_idf_sys::esp_bt_uuid_t__bindgen_ty_1 { uuid128: char_uuid },
-        };
-
-        let _ret = call_esp_api(|| unsafe {
-            esp_idf_sys::esp_ble_gatts_add_char(
-                service_handle,
-                &uuid_struct as *const _ as *mut _,
-                permissions,
-                properties,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        })?;
-
-        Timer::after(Duration::from_millis(50)).await;
-        info!("✅ Real {} characteristic added", char_name);
-        Ok(())
-    }
-
-    // Validate WiFi credentials
-    pub async fn validate_credentials(&self, credentials: &WiFiCredentials) -> BleResult<()> {
-        info!("🔍 Validating WiFi credentials");
-
-        if credentials.ssid.is_empty() {
-            return Err(BleError::InvalidCredentials(
-                "SSID cannot be empty".to_string(),
-            ));
-        }
-
-        info!("✅ WiFi credentials validation passed");
-        Ok(())
-    }
-
     // Public interface methods
-    pub fn get_received_credentials(&self) -> Option<WiFiCredentials> {
-        // Read from the global state where credentials are actually stored by callbacks
-        with_ble_server_state(|state| state.received_credentials.clone()).flatten()
-    }
 
     /// Take received credentials (get and clear) to prevent repeated processing
     pub fn take_received_credentials(&self) -> Option<WiFiCredentials> {
@@ -800,27 +678,6 @@ impl BleServer {
         state.is_connected
     }
 
-    pub async fn send_wifi_status(&self, success: bool, ip_address: Option<&str>) {
-        let status_message = if success {
-            match ip_address {
-                Some(message) => message.to_string(), // Use custom message if provided
-                None => "WIFI_CONNECTED".to_string(),
-            }
-        } else {
-            match ip_address {
-                Some(error_msg) => error_msg.to_string(), // Use custom error message
-                None => "WIFI_FAILED".to_string(),
-            }
-        };
-
-        info!("📤 WiFi status sent to client: {}", status_message);
-
-        // Send notification to connected client
-        if self.is_client_connected() {
-            self.send_status_notification(&status_message).await;
-        }
-    }
-
     /// Send simple status message to mobile app
     pub async fn send_simple_status(&self, message: &str) {
         info!("📤 Sending simple status to client: {}", message);
@@ -847,7 +704,7 @@ impl BleServer {
             let ret = call_esp_api_with_context(
                 || unsafe {
                     esp_idf_sys::esp_ble_gatts_send_indicate(
-                        GATT_IF.load(Ordering::SeqCst),
+                        GATT_INTERFACE.load(Ordering::SeqCst),
                         0, // conn_id - would need to track this
                         status_handle,
                         data.len() as u16,
@@ -865,67 +722,10 @@ impl BleServer {
         }
     }
 
-    pub async fn stop_advertising(&mut self) -> BleResult<()> {
-        info!("🛑 Stopping BLE advertising");
-
-        if !BLE_ADVERTISING.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        call_esp_api_with_context(
-            || unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() },
-            "Advertising stop",
-        )?;
-
-        BLE_ADVERTISING.store(false, Ordering::SeqCst);
-        info!("✅ BLE advertising stopped");
-        Ok(())
-    }
-
-    pub async fn shutdown_ble_completely(&mut self) -> BleResult<()> {
-        info!("🔄 Initiating complete BLE shutdown using RAII cleanup");
-
-        // Use the comprehensive async cleanup method
-        self.cleanup_resources_async().await?;
-
-        info!("✅ Complete BLE shutdown successful using RAII");
-        Ok(())
-    }
-
-    /// Public method for explicit resource cleanup
-    /// Useful when you want to cleanup resources before Drop is called
-    pub async fn cleanup_and_reset(&mut self) -> BleResult<()> {
-        info!("🧹 Explicit cleanup and reset requested");
-        self.cleanup_resources_async().await
-    }
-
-    // Required methods for main.rs compatibility
-    pub async fn start_advertising(&mut self) -> BleResult<()> {
-        self.start_provisioning_service().await
-    }
-
-    pub async fn restart_advertising(&mut self) -> BleResult<()> {
-        info!("🔄 Restarting BLE advertising");
-        if BLE_ADVERTISING.load(Ordering::SeqCst) {
-            self.stop_advertising().await?;
-        }
-        self.start_ble_advertising().await
-    }
-
-    pub async fn handle_events(&mut self) {
-        info!("📡 BLE server started, waiting for events...");
-
-        loop {
-            let event = BLE_CHANNEL.receive().await;
-            self.process_event(event).await;
-            Timer::after(Duration::from_millis(10)).await;
-        }
-    }
-
     /// Process events without blocking forever - for use in main provisioning loop
     /// Returns true if an event was processed, false if no events are pending
     pub async fn handle_events_non_blocking(&mut self) -> bool {
-        match BLE_CHANNEL.try_receive() {
+        match BLE_EVENT_CHANNEL.try_receive() {
             Ok(event) => {
                 self.process_event(event).await;
                 true
@@ -952,9 +752,9 @@ impl BleServer {
         }
 
         // Step 2: Reset GATT interface
-        if GATT_IF.load(Ordering::SeqCst) != 0 {
+        if GATT_INTERFACE.load(Ordering::SeqCst) != 0 {
             info!("🔄 Resetting GATT interface during cleanup");
-            GATT_IF.store(0, Ordering::SeqCst);
+            GATT_INTERFACE.store(0, Ordering::SeqCst);
         }
 
         // Step 3: Mark callbacks as unregistered
@@ -997,8 +797,15 @@ impl BleServer {
         info!("🧹 Starting comprehensive asynchronous BLE resource cleanup");
 
         // Step 1: Stop advertising with proper error handling
-        if let Err(e) = self.stop_advertising().await {
-            warn!("⚠️ Warning during advertising stop in cleanup: {:?}", e);
+        if BLE_ADVERTISING.load(Ordering::SeqCst) {
+            info!("🛑 Stopping BLE advertising during cleanup");
+            if let Err(e) = call_esp_api_with_context(
+                || unsafe { esp_idf_sys::esp_ble_gap_stop_advertising() },
+                "Cleanup: Advertising stop",
+            ) {
+                warn!("⚠️ Warning during advertising stop in cleanup: {:?}", e);
+            }
+            BLE_ADVERTISING.store(false, Ordering::SeqCst);
         }
 
         // Step 2: Unregister callbacks if they were registered
@@ -1017,7 +824,7 @@ impl BleServer {
         // Step 3: Reset all atomic state
         BLE_INITIALIZED.store(false, Ordering::SeqCst);
         BLE_ADVERTISING.store(false, Ordering::SeqCst);
-        GATT_IF.store(0, Ordering::SeqCst);
+        GATT_INTERFACE.store(0, Ordering::SeqCst);
 
         // Step 4: Clear server state
         {
@@ -1077,10 +884,9 @@ impl BleServer {
                     state.is_connected = false;
                 }
 
-                // 🎯 FIX: Automatically restart advertising after disconnection
-                // This ensures the device remains discoverable for future connections
+                // Automatically restart advertising after disconnection to remain discoverable
                 info!("🔄 Client disconnected - restarting advertising for new connections");
-                match self.restart_advertising().await {
+                match self.start_ble_advertising().await {
                     Ok(_) => {
                         info!(
                             "✅ Advertising restarted successfully - device is discoverable again"
@@ -1088,12 +894,6 @@ impl BleServer {
                     }
                     Err(e) => {
                         error!("❌ Failed to restart advertising after disconnect: {:?}", e);
-                        // Try a full advertising restart as fallback
-                        if let Err(e2) = self.start_advertising().await {
-                            error!("❌ Fallback advertising start also failed: {:?}", e2);
-                        } else {
-                            info!("✅ Fallback advertising start succeeded");
-                        }
                     }
                 }
             }
@@ -1101,16 +901,9 @@ impl BleServer {
                 // This is only logged here since it comes from write handler
                 info!("🔑 Received WiFi credentials - SSID: {}", credentials.ssid);
 
-                match self.validate_credentials(&credentials).await {
-                    Ok(()) => {
-                        let mut state = self.state.lock().unwrap();
-                        state.received_credentials = Some(credentials.clone());
-                        info!("✅ Credentials validated and stored");
-                    }
-                    Err(e) => {
-                        error!("❌ Credential validation failed: {}", e);
-                    }
-                }
+                let mut state = self.state.lock().unwrap();
+                state.received_credentials = Some(credentials.clone());
+                info!("✅ Credentials stored for processing");
             }
             BleEvent::SendResponse(response) => {
                 if self.is_client_connected() {
@@ -1129,12 +922,13 @@ impl BleServer {
 // Real GATT event handler with panic safety
 extern "C" fn gatts_event_handler(
     event: esp_idf_sys::esp_gatts_cb_event_t,
-    gatts_if: esp_idf_sys::esp_gatt_if_t,
-    param: *mut esp_idf_sys::esp_ble_gatts_cb_param_t,
+    gatt_interface: esp_idf_sys::esp_gatt_if_t,
+    event_param: *mut esp_idf_sys::esp_ble_gatts_cb_param_t,
 ) {
     // PANIC SAFETY: Wrap all Rust code in catch_unwind to prevent undefined behavior
     // when panics occur in C callbacks on ESP32
-    let result = std::panic::catch_unwind(|| gatts_event_handler_impl(event, gatts_if, param));
+    let result =
+        std::panic::catch_unwind(|| gatts_event_handler_impl(event, gatt_interface, event_param));
 
     if let Err(panic_info) = result {
         // Log panic but don't propagate to C side - this could cause undefined behavior
@@ -1149,42 +943,45 @@ extern "C" fn gatts_event_handler(
 // Internal implementation of GATT event handler (panic-safe)
 fn gatts_event_handler_impl(
     event: esp_idf_sys::esp_gatts_cb_event_t,
-    gatts_if: esp_idf_sys::esp_gatt_if_t,
-    param: *mut esp_idf_sys::esp_ble_gatts_cb_param_t,
+    gatt_interface: esp_idf_sys::esp_gatt_if_t,
+    event_param: *mut esp_idf_sys::esp_ble_gatts_cb_param_t,
 ) {
-    if param.is_null() {
+    if event_param.is_null() {
         return;
     }
 
     match event {
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_REG_EVT => {
-            info!("📋 GATT server registered with interface: {}", gatts_if);
-            GATT_IF.store(gatts_if, Ordering::SeqCst);
+            info!(
+                "📋 GATT server registered with interface: {}",
+                gatt_interface
+            );
+            GATT_INTERFACE.store(gatt_interface, Ordering::SeqCst);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CREATE_EVT => {
-            let create_param = unsafe { &(*param).create };
+            let create_event = unsafe { &(*event_param).create };
             info!(
                 "📋 GATT service created with handle: {}",
-                create_param.service_handle
+                create_event.service_handle
             );
 
             // Store service handle in state
             with_ble_server_state(|state| {
-                state.service_handle = create_param.service_handle;
+                state.service_handle = create_event.service_handle;
             });
 
             // Add characteristics after service creation
-            add_service_characteristics(create_param.service_handle);
+            add_service_characteristics(create_event.service_handle);
 
             send_ble_event_with_backpressure(BleEvent::ServiceCreated {
-                service_handle: create_param.service_handle,
+                service_handle: create_event.service_handle,
             });
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_ADD_CHAR_EVT => {
-            let add_char_param = unsafe { &(*param).add_char };
+            let add_char_event = unsafe { &(*event_param).add_char };
             info!(
                 "📝 Characteristic added with handle: {}",
-                add_char_param.attr_handle
+                add_char_event.attr_handle
             );
 
             // Store characteristic handle and check if all are added
@@ -1194,15 +991,15 @@ fn gatts_event_handler_impl(
                 if char_count == 0 {
                     state
                         .char_handles
-                        .insert("ssid".to_string(), add_char_param.attr_handle);
+                        .insert("ssid".to_string(), add_char_event.attr_handle);
                 } else if char_count == 1 {
                     state
                         .char_handles
-                        .insert("password".to_string(), add_char_param.attr_handle);
+                        .insert("password".to_string(), add_char_event.attr_handle);
                 } else if char_count == 2 {
                     state
                         .char_handles
-                        .insert("status".to_string(), add_char_param.attr_handle);
+                        .insert("status".to_string(), add_char_event.attr_handle);
                 }
 
                 // Return true if all 3 characteristics are now added
@@ -1232,7 +1029,7 @@ fn gatts_event_handler_impl(
             }
 
             send_ble_event_with_backpressure(BleEvent::CharacteristicAdded {
-                char_handle: add_char_param.attr_handle,
+                char_handle: add_char_event.attr_handle,
                 uuid: "unknown".to_string(),
             });
         }
@@ -1259,8 +1056,8 @@ fn gatts_event_handler_impl(
             send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_WRITE_EVT => {
-            let write_param = unsafe { &(*param).write };
-            handle_characteristic_write(write_param);
+            let write_event = unsafe { &(*event_param).write };
+            handle_characteristic_write(write_event);
         }
         _ => {
             // Handle other events as needed
@@ -1271,11 +1068,11 @@ fn gatts_event_handler_impl(
 // Real GAP event handler with panic safety
 extern "C" fn gap_event_handler(
     event: esp_idf_sys::esp_gap_ble_cb_event_t,
-    param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
+    event_param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
 ) {
     // PANIC SAFETY: Wrap all Rust code in catch_unwind to prevent undefined behavior
     // when panics occur in C callbacks on ESP32
-    let result = std::panic::catch_unwind(|| gap_event_handler_impl(event, param));
+    let result = std::panic::catch_unwind(|| gap_event_handler_impl(event, event_param));
 
     if let Err(panic_info) = result {
         // Log panic but don't propagate to C side - this could cause undefined behavior
@@ -1290,7 +1087,7 @@ extern "C" fn gap_event_handler(
 // Internal implementation of GAP event handler (panic-safe)
 fn gap_event_handler_impl(
     event: esp_idf_sys::esp_gap_ble_cb_event_t,
-    _param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
+    _event_param: *mut esp_idf_sys::esp_ble_gap_cb_param_t,
 ) {
     match event {
         esp_idf_sys::esp_gap_ble_cb_event_t_ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT => {
@@ -1402,7 +1199,7 @@ fn send_immediate_status_notification(message: &str) {
         let result = call_esp_api_with_context(
             || unsafe {
                 esp_idf_sys::esp_ble_gatts_send_indicate(
-                    GATT_IF.load(Ordering::SeqCst),
+                    GATT_INTERFACE.load(Ordering::SeqCst),
                     0, // conn_id - we don't track this, ESP-IDF will find the connection
                     status_handle,
                     data.len() as u16,
@@ -1567,54 +1364,4 @@ fn parse_uuid(uuid_str: &str) -> Result<[u8; 16], BleError> {
     }
 
     Ok(uuid_bytes)
-}
-
-// Simulation functions kept for development/testing compatibility
-pub async fn simulate_ble_connect() {
-    info!("📱 Simulated BLE client connected!");
-    send_ble_event_with_backpressure(BleEvent::ClientConnected);
-}
-
-pub async fn simulate_ble_disconnect() {
-    info!("📱 Simulated BLE client disconnected!");
-    send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
-}
-
-pub async fn simulate_characteristic_write(data: &[u8]) {
-    info!(
-        "📝 Simulated characteristic write received: {} bytes",
-        data.len()
-    );
-
-    if let Ok(json_str) = std::str::from_utf8(data) {
-        if let Ok(credentials) = serde_json::from_str::<WiFiCredentials>(json_str) {
-            info!(
-                "🔑 Parsed WiFi credentials from simulated BLE: SSID={}",
-                credentials.ssid
-            );
-            send_ble_event_with_backpressure(BleEvent::CredentialsReceived(credentials));
-        } else {
-            warn!(
-                "❌ Failed to parse WiFi credentials from JSON: {}",
-                json_str
-            );
-        }
-    }
-}
-
-pub async fn simulate_characteristic_write_by_uuid(char_uuid: &str, data: &[u8]) {
-    info!(
-        "📝 Simulated characteristic {} written with {} bytes",
-        char_uuid,
-        data.len()
-    );
-
-    match char_uuid {
-        "ssid" | "password" => {
-            simulate_characteristic_write(data).await;
-        }
-        _ => {
-            info!("📝 Ignoring write to unknown characteristic: {}", char_uuid);
-        }
-    }
 }
