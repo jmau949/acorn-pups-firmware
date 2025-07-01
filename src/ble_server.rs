@@ -397,6 +397,71 @@ impl BleServer {
         Ok(())
     }
 
+    /// Initialize BLE using provided BT driver - for WiFi coexistence
+    /// Uses safe ESP-IDF-SVC abstractions for BLE/WiFi coexistence
+    pub async fn initialize_with_bt_driver(
+        &mut self,
+        bt_driver: esp_idf_svc::bt::BtDriver<'static, esp_idf_svc::bt::Ble>,
+    ) -> BleResult<()> {
+        info!("🔧 Initializing BLE server with provided BT driver for coexistence");
+
+        // Check if already initialized
+        if BLE_INITIALIZED.load(Ordering::Acquire) {
+            return Err(BleError::AlreadyInitialized(
+                "BLE is already initialized".to_string(),
+            ));
+        }
+
+        // Store the provided BT driver
+        self.bt_driver = Some(bt_driver);
+        info!("✅ BT driver stored - BLE hardware already initialized");
+
+        // BtDriver::new() already completed:
+        // - BLE controller initialization
+        // - BLE controller enable
+        // - Bluedroid stack initialization
+        // - Bluedroid stack enable
+        // So we can skip directly to BluedroidEnabled state
+        self.init_state = BleInitState::BluedroidEnabled;
+
+        // Small delay to ensure everything is stable
+        Timer::after(Duration::from_millis(200)).await;
+
+        // Mark as initialized
+        BLE_INITIALIZED.store(true, Ordering::SeqCst);
+
+        // Send initialization event
+        send_ble_event_with_backpressure(BleEvent::Initialized);
+
+        info!("✅ BLE server initialized successfully with WiFi coexistence");
+
+        // Start the provisioning service
+        self.start_provisioning_service().await?;
+
+        Ok(())
+    }
+
+    /// Safe BLE stack initialization using ESP-IDF-SVC abstractions
+    /// This approach uses safe Rust wrappers instead of unsafe ESP-IDF calls
+    async fn initialize_ble_stack_directly(&mut self) -> BleResult<()> {
+        info!("🔧 Initializing BLE stack using safe ESP-IDF-SVC abstractions");
+
+        // For BLE/WiFi coexistence, we need to approach this differently
+        // The ESP32 supports coexistence but requires careful initialization order
+
+        // Since WiFi already has the modem, we need to find an alternative approach
+        // that doesn't require direct modem access for BLE initialization
+
+        warn!("⚠️ BLE initialization requires modem access that's currently used by WiFi");
+        warn!("⚠️ ESP32 BLE/WiFi coexistence needs proper resource sharing implementation");
+
+        // Return an error indicating this needs a different approach
+        Err(BleError::NotInitialized(
+            "BLE initialization requires proper modem sharing with WiFi - not yet implemented"
+                .to_string(),
+        ))
+    }
+
     // Start BLE provisioning service with proper initialization order and RAII cleanup
     pub async fn start_provisioning_service(&mut self) -> BleResult<()> {
         info!("🔧 Starting BLE WiFi provisioning service with RAII cleanup on failure");

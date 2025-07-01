@@ -40,8 +40,21 @@ pub struct WiFiStorage {
 }
 
 impl WiFiStorage {
+    /// Create WiFi storage using provided NVS partition (avoids singleton conflicts)
+    pub fn new_with_partition(nvs_partition: EspDefaultNvsPartition) -> Result<Self, EspError> {
+        info!("Initializing WiFi storage (NVS) with provided partition");
+
+        // Open the NVS namespace for WiFi configuration using provided partition
+        let nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
+
+        info!("WiFi storage initialized successfully with provided partition");
+
+        Ok(Self { nvs })
+    }
+
+    /// Legacy method - tries to take NVS partition (will fail if already taken)
     pub fn new() -> Result<Self, EspError> {
-        info!("Initializing WiFi storage (NVS)");
+        info!("Initializing WiFi storage (NVS) - attempting to take partition");
 
         // Initialize the default NVS partition
         let nvs_default_partition = EspDefaultNvsPartition::take()?;
