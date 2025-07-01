@@ -1241,14 +1241,55 @@ fn add_service_characteristics(service_handle: u16) {
 fn handle_characteristic_write(
     param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param,
 ) {
+    // Basic input validation
     if param.value.is_null() || param.len == 0 {
+        warn!("❌ BLE write: null or empty data received");
+        return;
+    }
+
+    // Validate data length bounds
+    const MIN_DATA_LEN: u16 = 10; // Minimum for valid JSON: {"ssid":"x"}
+    const MAX_DATA_LEN: u16 = 512; // Reasonable maximum for BLE characteristic
+
+    if param.len < MIN_DATA_LEN {
+        warn!(
+            "❌ BLE write: data too short ({} bytes, min {})",
+            param.len, MIN_DATA_LEN
+        );
+        return;
+    }
+
+    if param.len > MAX_DATA_LEN {
+        warn!(
+            "❌ BLE write: data too long ({} bytes, max {})",
+            param.len, MAX_DATA_LEN
+        );
         return;
     }
 
     let data = unsafe { std::slice::from_raw_parts(param.value, param.len as usize) };
 
-    if let Ok(json_str) = std::str::from_utf8(data) {
-        if let Ok(credentials) = serde_json::from_str::<WiFiCredentials>(json_str) {
+    // Validate UTF-8 first
+    let json_str = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => {
+            warn!(
+                "❌ BLE write: received invalid UTF-8 data ({} bytes)",
+                data.len()
+            );
+            return;
+        }
+    };
+
+    // Basic JSON format validation
+    if !json_str.trim().starts_with('{') || !json_str.trim().ends_with('}') {
+        warn!("❌ BLE write: data doesn't look like JSON: {}", json_str);
+        return;
+    }
+
+    // Parse and validate WiFi credentials
+    match serde_json::from_str::<WiFiCredentials>(json_str) {
+        Ok(credentials) => {
             info!(
                 "🔑 Received WiFi credentials via real BLE: SSID={}",
                 credentials.ssid
@@ -1260,14 +1301,13 @@ fn handle_characteristic_write(
             });
 
             send_ble_event_with_backpressure(BleEvent::CredentialsReceived(credentials));
-        } else {
+        }
+        Err(e) => {
             warn!(
-                "❌ Failed to parse WiFi credentials from JSON: {}",
-                json_str
+                "❌ Failed to parse WiFi credentials from JSON: {} (error: {})",
+                json_str, e
             );
         }
-    } else {
-        warn!("❌ Received invalid UTF-8 data via BLE");
     }
 }
 
