@@ -230,23 +230,7 @@ impl WiFiStorage {
             return false;
         }
 
-        // Password validation - REVIEW. why password length check
-        if credentials.password.len() < 8 {
-            warn!(
-                "Password too short: {} characters (min 8)",
-                credentials.password.len()
-            );
-            return false;
-        }
-
-        // REVIEW should remove
-        if credentials.password.len() > 63 {
-            warn!(
-                "Password too long: {} characters (max 63)",
-                credentials.password.len()
-            );
-            return false;
-        }
+        // Password validation removed to allow open WiFi networks (empty passwords)
 
         // Check for valid UTF-8 (already guaranteed by String type, but good to be explicit)
         if !credentials.ssid.is_ascii() {
