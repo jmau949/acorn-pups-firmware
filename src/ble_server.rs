@@ -288,6 +288,8 @@ struct BleServerState {
     received_credentials: Option<WiFiCredentials>,
     service_handle: u16,
     char_handles: HashMap<String, u16>,
+    connection_time: Option<std::time::Instant>,
+    credentials_timeout_seconds: u64,
 }
 
 impl BleServerState {
@@ -297,6 +299,8 @@ impl BleServerState {
             received_credentials: None,
             service_handle: 0,
             char_handles: HashMap::new(),
+            connection_time: None,
+            credentials_timeout_seconds: 30, // 30 second timeout for credentials
         }
     }
 }
@@ -760,6 +764,37 @@ impl BleServer {
         with_ble_server_state(|state| state.received_credentials.take()).flatten()
     }
 
+    /// Check if current connection has timed out waiting for credentials
+    pub fn is_connection_timed_out(&self) -> bool {
+        with_ble_server_state(|state| {
+            if let Some(connection_time) = state.connection_time {
+                let elapsed = connection_time.elapsed().as_secs();
+                elapsed > state.credentials_timeout_seconds
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Force disconnect current client (for timeout/security)
+    pub async fn force_disconnect_client(&self, reason: &str) -> BleResult<()> {
+        info!("🚫 Force disconnecting client: {}", reason);
+
+        // Update state to mark as disconnected
+        with_ble_server_state(|state| {
+            state.is_connected = false;
+            state.connection_time = None;
+            state.received_credentials = None;
+        });
+
+        // Send disconnection event
+        send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
+
+        info!("✅ Client force disconnected successfully");
+        Ok(())
+    }
+
     pub fn is_client_connected(&self) -> bool {
         let state = self.state.lock().unwrap();
         state.is_connected
@@ -768,11 +803,14 @@ impl BleServer {
     pub async fn send_wifi_status(&self, success: bool, ip_address: Option<&str>) {
         let status_message = if success {
             match ip_address {
-                Some(ip) => format!("WIFI_CONNECTED:{}", ip),
+                Some(message) => message.to_string(), // Use custom message if provided
                 None => "WIFI_CONNECTED".to_string(),
             }
         } else {
-            "WIFI_FAILED".to_string()
+            match ip_address {
+                Some(error_msg) => error_msg.to_string(), // Use custom error message
+                None => "WIFI_FAILED".to_string(),
+            }
         };
 
         info!("📤 WiFi status sent to client: {}", status_message);
@@ -780,6 +818,20 @@ impl BleServer {
         // Send notification to connected client
         if self.is_client_connected() {
             self.send_status_notification(&status_message).await;
+        }
+    }
+
+    /// Send simple status message to mobile app
+    pub async fn send_simple_status(&self, message: &str) {
+        info!("📤 Sending simple status to client: {}", message);
+
+        if self.is_client_connected() {
+            self.send_status_notification(message).await;
+
+            // Brief delay to ensure notification is processed
+            Timer::after(Duration::from_millis(50)).await;
+        } else {
+            warn!("⚠️ Cannot send status - no client connected");
         }
     }
 
@@ -1186,17 +1238,23 @@ fn gatts_event_handler_impl(
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CONNECT_EVT => {
             info!("📱 BLE client connected");
-            // Update connection state using thread-safe helper function
+            // Update connection state and start timeout tracking
             with_ble_server_state(|state| {
                 state.is_connected = true;
+                state.connection_time = Some(std::time::Instant::now());
+                // Clear any previous credentials
+                state.received_credentials = None;
             });
+            info!("⏰ Starting 30-second timeout for WiFi credentials");
             send_ble_event_with_backpressure(BleEvent::ClientConnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT => {
             info!("📱 BLE client disconnected");
-            // Update connection state using thread-safe helper function
+            // Update connection state and clear timeout tracking
             with_ble_server_state(|state| {
                 state.is_connected = false;
+                state.connection_time = None;
+                // Keep credentials if they were received
             });
             send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
         }
@@ -1330,6 +1388,40 @@ fn add_service_characteristics(service_handle: u16) {
     );
 }
 
+// Send immediate status notification (synchronous - for use in callbacks)
+fn send_immediate_status_notification(message: &str) {
+    info!("📤 Sending immediate status to mobile app: {}", message);
+
+    // Get status characteristic handle from global state
+    let status_handle =
+        with_ble_server_state(|state| state.char_handles.get("status").copied().unwrap_or(0))
+            .unwrap_or(0);
+
+    if status_handle != 0 {
+        let data = message.as_bytes();
+        let result = call_esp_api_with_context(
+            || unsafe {
+                esp_idf_sys::esp_ble_gatts_send_indicate(
+                    GATT_IF.load(Ordering::SeqCst),
+                    0, // conn_id - we don't track this, ESP-IDF will find the connection
+                    status_handle,
+                    data.len() as u16,
+                    data.as_ptr() as *mut u8,
+                    false, // need_confirm = false for notification
+                )
+            },
+            "Immediate status notification",
+        );
+
+        match result {
+            Ok(_) => info!("✅ Immediate status notification sent: {}", message),
+            Err(e) => warn!("⚠️ Failed to send immediate status notification: {:?}", e),
+        }
+    } else {
+        warn!("⚠️ Cannot send status notification - no status characteristic handle");
+    }
+}
+
 // Handle characteristic write events
 fn handle_characteristic_write(
     param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param,
@@ -1388,11 +1480,18 @@ fn handle_characteristic_write(
                 credentials.ssid
             );
 
-            // Store in global state using thread-safe helper function
+            // 🎯 STAGE 1: Send immediate acknowledgment to mobile app
+            send_immediate_status_notification("RECEIVED");
+
+            // Store in global state and clear timeout (credentials received!)
             with_ble_server_state(|state| {
                 state.received_credentials = Some(credentials.clone());
+                state.connection_time = None; // Clear timeout - credentials received
             });
 
+            info!("✅ Credentials received - timeout cleared");
+
+            // Send credentials received event for async processing
             send_ble_event_with_backpressure(BleEvent::CredentialsReceived(credentials));
         }
         Err(e) => {
@@ -1400,6 +1499,9 @@ fn handle_characteristic_write(
                 "❌ Failed to parse WiFi credentials from JSON: {} (error: {})",
                 json_str, e
             );
+
+            // Send error response to mobile app
+            send_immediate_status_notification("ERROR_INVALID_JSON");
         }
     }
 }

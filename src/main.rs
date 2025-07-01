@@ -123,6 +123,25 @@ async fn main(spawner: Spawner) {
     // After this, info!(), warn!(), error!() macros will output to the serial console
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // ========================================================================
+    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
+    // This section clears stored WiFi credentials to force BLE provisioning mode
+    // for testing purposes. This allows repeated testing of the BLE provisioning
+    // flow without manually clearing NVS storage.
+    //
+    // ⚠️  WARNING: REMOVE THIS ENTIRE SECTION BEFORE PRODUCTION DEPLOYMENT!
+    // ⚠️  This will erase user's WiFi settings on every boot!
+    // ========================================================================
+
+    info!("🧪 TESTING MODE: Will clear WiFi credentials after NVS initialization");
+
+    // Note: Actual clearing happens after NVS partition is initialized below
+
+    // ========================================================================
+    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
+
     // Log a startup message - this will appear in the serial monitor
     info!("Starting Embassy-based Application with BLE status LED indicator!");
 
@@ -177,6 +196,24 @@ async fn main(spawner: Spawner) {
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
     info!("🔧 Initializing shared resources in main() to avoid NVS conflicts");
+
+    // ========================================================================
+    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
+    // Clear WiFi credentials BEFORE creating WiFi storage to force BLE mode
+    info!("🧪 TESTING: Clearing WiFi credentials with cloned NVS partition...");
+    match clear_wifi_credentials_for_testing(nvs.clone()) {
+        Ok(_) => {
+            info!("✅ TESTING: WiFi credentials cleared - device will enter BLE mode");
+        }
+        Err(e) => {
+            warn!("⚠️ TESTING: Failed to clear credentials: {:?}", e);
+            info!("🔄 TESTING: Continuing with normal startup...");
+        }
+    }
+    // ========================================================================
+    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
 
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
@@ -530,20 +567,60 @@ async fn ble_provisioning_mode_task(
         // Handle BLE events (non-blocking - process one event if available)
         ble_server.handle_events_non_blocking().await;
 
+        // 🔒 Security: Check for connection timeout (prevents rogue clients from blocking)
+        if ble_server.is_client_connected() && ble_server.is_connection_timed_out() {
+            warn!("⏰ Client connected but no credentials received within timeout");
+            warn!("🚫 Disconnecting client and restarting advertising for security");
+
+            match ble_server
+                .force_disconnect_client("Credential timeout")
+                .await
+            {
+                Ok(_) => {
+                    info!("✅ Timeout client disconnected successfully");
+                    // Restart advertising will happen automatically via disconnect event
+                }
+                Err(e) => {
+                    error!("❌ Failed to disconnect timeout client: {:?}", e);
+                }
+            }
+
+            continue; // Skip credential check this iteration
+        }
+
         // Check for received credentials (take to prevent repeated processing)
         if let Some(credentials) = ble_server.take_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
 
-            // Store credentials
+            // 🎯 STAGE 2: Send processing status (if still connected)
+            if ble_server.is_client_connected() {
+                ble_server.send_simple_status("PROCESSING").await;
+            } else {
+                info!("⚠️ Client disconnected after receiving credentials - continuing anyway");
+            }
+
+            // 🎯 STAGE 3: Store credentials and send storage confirmation
             match wifi_storage.store_credentials(&credentials) {
                 Ok(()) => {
                     info!("💾 WiFi credentials stored successfully");
-                    ble_server
-                        .send_wifi_status(true, Some("Credentials stored - restarting device"))
-                        .await;
 
-                    // Wait for message delivery
-                    Timer::after(Duration::from_secs(2)).await;
+                    // Send storage success notification (if still connected)
+                    if ble_server.is_client_connected() {
+                        ble_server.send_simple_status("STORED").await;
+                        Timer::after(Duration::from_millis(200)).await;
+
+                        // 🎯 STAGE 4: Send final success status
+                        ble_server.send_simple_status("SUCCESS").await;
+
+                        // 🎯 CRITICAL: Wait for mobile app to receive final response
+                        info!("⏳ Waiting for mobile app to receive success confirmation...");
+                        info!("📱 Mobile app should display 'Provisioning successful!' message");
+                        Timer::after(Duration::from_secs(5)).await;
+                    } else {
+                        info!("⚠️ Client disconnected - credentials stored successfully anyway");
+                        info!("🎯 Proceeding with device restart despite disconnection");
+                        Timer::after(Duration::from_secs(1)).await;
+                    }
 
                     // Restart device to switch to WiFi-only mode
                     info!("🔄 Restarting device to switch to WiFi-only mode");
@@ -551,9 +628,14 @@ async fn ble_provisioning_mode_task(
                 }
                 Err(e) => {
                     error!("Failed to store WiFi credentials: {:?}", e);
-                    ble_server
-                        .send_wifi_status(false, Some("Failed to store credentials"))
-                        .await;
+
+                    // Send storage failure notification (if still connected)
+                    if ble_server.is_client_connected() {
+                        ble_server.send_simple_status("STORAGE_FAILED").await;
+                        Timer::after(Duration::from_secs(1)).await;
+                    } else {
+                        info!("⚠️ Client disconnected - cannot send error notification");
+                    }
                     continue;
                 }
             }
@@ -578,6 +660,57 @@ async fn restart_device(reason: &str) {
         esp_idf_svc::sys::esp_restart();
     }
 }
+
+// ========================================================================
+// 🚨🚨🚨 TESTING ONLY FUNCTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
+// This function clears stored WiFi credentials from NVS storage to force
+// the device into BLE provisioning mode for testing purposes.
+//
+// ⚠️  WARNING: REMOVE THIS FUNCTION BEFORE PRODUCTION DEPLOYMENT!
+// ⚠️  This will erase user's WiFi settings!
+// ========================================================================
+
+/// Clear WiFi credentials from NVS storage for testing purposes
+///
+/// # Parameters
+/// - `nvs_partition`: Cloned NVS partition to use for credential clearing
+///
+/// # Returns
+/// - `Ok(())` if credentials were cleared successfully or didn't exist
+/// - `Err(e)` if there was an error accessing NVS storage
+fn clear_wifi_credentials_for_testing(
+    nvs_partition: EspDefaultNvsPartition,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("🧪 TESTING: Creating temporary WiFi storage for credential clearing...");
+
+    // Create a temporary WiFi storage instance using the cloned NVS partition
+    // This is safe because we're only using it to clear credentials
+    let mut wifi_storage = wifi_storage::WiFiStorage::new_with_partition(nvs_partition)
+        .map_err(|e| format!("Failed to create WiFi storage: {:?}", e))?;
+
+    // Clear stored credentials
+    match wifi_storage.clear_credentials() {
+        Ok(_) => {
+            info!("✅ TESTING: WiFi credentials cleared from NVS storage");
+            info!("🔄 TESTING: Device will now enter BLE provisioning mode");
+            Ok(())
+        }
+        Err(e) => {
+            // This is OK - credentials might not exist yet
+            info!(
+                "ℹ️ TESTING: No credentials to clear or clear failed: {:?}",
+                e
+            );
+            info!("🔄 TESTING: Device will enter BLE provisioning mode anyway");
+            Ok(()) // Return OK since this is expected during first boot
+        }
+    }
+}
+
+// ========================================================================
+// 🚨🚨🚨 END OF TESTING FUNCTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
 
 // OLD WiFi FUNCTIONS REMOVED - Now using persistent WiFi task with channel communication
 // This eliminates the Peripherals::take() singleton issue entirely!
