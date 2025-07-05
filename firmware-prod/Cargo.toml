@@ -1,0 +1,40 @@
+[package]
+name = "pup-prod"
+version = "0.1.0"
+authors = ["jmau949 <44676775+jmau949@users.noreply.github.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "pup-prod"
+harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+
+
+
+[features]
+default = ["experimental"]
+
+experimental = ["esp-idf-svc/experimental", "esp-idf-svc/alloc"]
+
+[dependencies]
+# Shared types
+pup-shared = { path = "../shared" }
+
+# ESP32 dependencies
+log = { workspace = true }
+esp-idf-svc = { workspace = true }
+esp-idf-hal = { workspace = true }
+esp-idf-sys = { workspace = true }
+critical-section = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+embassy-sync = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+embedded-svc = { workspace = true }
+
+[build-dependencies]
+embuild = { workspace = true } 

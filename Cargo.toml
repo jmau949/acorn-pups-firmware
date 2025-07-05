@@ -1,14 +1,10 @@
-[package]
-name = "pup"
-version = "0.1.0"
-authors = ["jmau949 <44676775+jmau949@users.noreply.github.com>"]
-edition = "2021"
+[workspace]
 resolver = "2"
-rust-version = "1.77"
-
-[[bin]]
-name = "pup"
-harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+members = [
+    "firmware-prod",
+    "firmware-dev", 
+    "shared"
+]
 
 [profile.release]
 opt-level = "s"
@@ -17,12 +13,7 @@ opt-level = "s"
 debug = true    # Symbols are nice and they don't increase the size on Flash
 opt-level = "z"
 
-[features]
-default = ["experimental"]
-
-experimental = ["esp-idf-svc/experimental", "esp-idf-svc/alloc"]
-
-[dependencies]
+[workspace.dependencies]
 log = "0.4"
 esp-idf-svc = { version = "0.51", features = ["embassy-time-driver", "embassy-sync", "experimental", "alloc"] }
 esp-idf-hal = "0.45"
@@ -37,5 +28,6 @@ serde_json = "1.0"
 uuid = "1.0"
 embedded-svc = { version = "0.28", features = ["std"] }
 
-[build-dependencies]
-embuild = { version = "0.33", features = ["espidf"] }
+[workspace.dependencies.embuild]
+version = "0.33"
+features = ["espidf"]

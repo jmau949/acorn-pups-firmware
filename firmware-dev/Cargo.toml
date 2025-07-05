@@ -1,0 +1,46 @@
+[package]
+name = "pup-dev"
+version = "0.1.0"
+authors = ["jmau949 <44676775+jmau949@users.noreply.github.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "pup-dev"
+harness = false
+
+
+
+[features]
+default = ["experimental"]
+
+experimental = ["esp-idf-svc/experimental", "esp-idf-svc/alloc"]
+
+[dependencies]
+# Shared types
+pup-shared = { path = "../shared" }
+
+# ESP32 dependencies for Wokwi simulation
+log = { workspace = true }
+esp-idf-svc = { workspace = true }
+esp-idf-hal = { workspace = true }
+esp-idf-sys = { workspace = true }
+critical-section = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+embassy-sync = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+embedded-svc = { workspace = true }
+
+# Simulation dependencies
+rand = "0.8"
+futures = "0.3"
+
+# Note: Using Embassy executor for ESP32 simulation
+
+[build-dependencies]
+embuild = { workspace = true } 

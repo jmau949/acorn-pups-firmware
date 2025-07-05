@@ -1,0 +1,10 @@
+[package]
+name = "pup-shared"
+version = "0.1.0"
+authors = ["jmau949 <44676775+jmau949@users.noreply.github.com>"]
+edition = "2021"
+rust-version = "1.77"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+log = { workspace = true } 

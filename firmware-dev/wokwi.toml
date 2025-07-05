@@ -1,0 +1,50 @@
+[wokwi]
+version = 1
+elf = "../target/xtensa-esp32-espidf/debug/pup-dev"
+firmware = "../target/xtensa-esp32-espidf/debug/pup-dev"
+
+# Wokwi project configuration for development/simulation mode
+[[wokwi.parts]]
+type = "esp32"
+id = "esp"
+
+# LED connections for visual status feedback
+[[wokwi.parts]]
+type = "led"
+id = "led_red"
+color = "red"
+
+[[wokwi.parts]]
+type = "led"
+id = "led_green"  
+color = "green"
+
+[[wokwi.parts]]
+type = "led"
+id = "led_blue"
+color = "blue"
+
+# Wire connections
+[[wokwi.connections]]
+from = "esp:2"
+to = "led_red:+"
+
+[[wokwi.connections]]
+from = "esp:4"  
+to = "led_green:+"
+
+[[wokwi.connections]]
+from = "esp:5"
+to = "led_blue:+"
+
+[[wokwi.connections]]
+from = "led_red:-"
+to = "esp:GND"
+
+[[wokwi.connections]]
+from = "led_green:-"
+to = "esp:GND"
+
+[[wokwi.connections]]
+from = "led_blue:-"
+to = "esp:GND" 
