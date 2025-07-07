@@ -4,14 +4,12 @@
 use std::env;
 
 fn main() {
-    // Set ESP_IDF_SYS_ROOT_CRATE to help esp-idf-sys find the root crate
-    if env::var("ESP_IDF_SYS_ROOT_CRATE").is_err() {
-        println!("cargo:rustc-env=ESP_IDF_SYS_ROOT_CRATE=pup-dev");
-    }
+    // Set the root crate for esp-idf-sys in workspace context
+    std::env::set_var("ESP_IDF_SYS_ROOT_CRATE", "pup-dev");
 
     // Set other helpful environment variables
     if env::var("ESP_IDF_VERSION").is_err() {
-        println!("cargo:rustc-env=ESP_IDF_VERSION=v5.1.2");
+        std::env::set_var("ESP_IDF_VERSION", "v5.1.2");
     }
 
     // Tell cargo to rebuild if any environment variable changes
