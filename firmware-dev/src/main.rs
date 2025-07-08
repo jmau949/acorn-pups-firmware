@@ -148,7 +148,7 @@ async fn main(spawner: Spawner) {
 
     // Initialize ESP32 peripherals
     let peripherals = Peripherals::take().unwrap();
-    let sys_loop = EspSystemEventLoop::take().unwrap();
+    let _sys_loop = EspSystemEventLoop::take().unwrap();
     let _nvs = EspDefaultNvsPartition::take().unwrap();
 
     // Create LED pins for Wokwi (GPIO 2, 4, 5 as in diagram.json)
