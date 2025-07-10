@@ -130,25 +130,6 @@ async fn main(spawner: Spawner) {
     // After this, info!(), warn!(), error!() macros will output to the serial console
     esp_idf_svc::log::EspLogger::initialize_default();
 
-    // ========================================================================
-    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
-    // This section clears stored WiFi credentials to force BLE provisioning mode
-    // for testing purposes. This allows repeated testing of the BLE provisioning
-    // flow without manually clearing NVS storage.
-    //
-    // ⚠️  WARNING: REMOVE THIS ENTIRE SECTION BEFORE PRODUCTION DEPLOYMENT!
-    // ⚠️  This will erase user's WiFi settings on every boot!
-    // ========================================================================
-
-    info!("🧪 TESTING MODE: Will clear WiFi credentials after NVS initialization");
-
-    // Note: Actual clearing happens after NVS partition is initialized below
-
-    // ========================================================================
-    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
-
     // Log a startup message - this will appear in the serial monitor
     info!("Starting Embassy-based Application with BLE status LED indicator!");
 
@@ -196,40 +177,12 @@ async fn main(spawner: Spawner) {
         return;
     }
 
-    // ========================================================================
-    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
-    // System initialization code commented out for wokwi compatibility
-    // wokwi simulator doesn't support real NVS/storage operations
-    // Uncomment and restore this section for production deployment
-    // ========================================================================
-
-    // 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
-    /*
     // Initialize system components
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let timer_service = EspTaskTimerService::new().unwrap();
     let nvs = EspDefaultNvsPartition::take().unwrap();
 
     info!("🔧 Initializing shared resources in main() to avoid NVS conflicts");
-
-    // ========================================================================
-    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
-    // Clear WiFi credentials BEFORE creating WiFi storage to force BLE mode
-    info!("🧪 TESTING: Clearing WiFi credentials with cloned NVS partition...");
-    match clear_wifi_credentials_for_testing(nvs.clone()) {
-        Ok(_) => {
-            info!("✅ TESTING: WiFi credentials cleared - device will enter BLE mode");
-        }
-        Err(e) => {
-            warn!("⚠️ TESTING: Failed to clear credentials: {:?}", e);
-            info!("🔄 TESTING: Continuing with normal startup...");
-        }
-    }
-    // ========================================================================
-    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
 
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
@@ -244,25 +197,10 @@ async fn main(spawner: Spawner) {
             return;
         }
     };
-    */
-
-    // ========================================================================
-    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
-
-    // ========================================================================
-    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
-    // WiFi and BLE code commented out for wokwi compatibility
-    // wokwi simulator doesn't support real hardware BLE/WiFi operations
-    // Uncomment and restore this section for production deployment
-    // ========================================================================
 
     // Check WiFi credentials to determine device mode
     info!("🔧 Checking WiFi credentials to determine device mode...");
 
-    // 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
-    /*
     if wifi_storage.has_stored_credentials() {
         info!("✅ WiFi credentials found - Starting in WiFi-only mode");
 
@@ -301,11 +239,6 @@ async fn main(spawner: Spawner) {
 
         info!("📱 Device operating in BLE provisioning mode - WiFi disabled");
     }
-    */
-
-    // ========================================================================
-    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-    // ========================================================================
 
     // Spawn the LED status task - provides BLE connection status visual feedback
     if let Err(_) = spawner.spawn(led_task(led_red, led_green, led_blue)) {
@@ -486,16 +419,6 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
     }
 }
 
-// ========================================================================
-// 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
-// WiFi-only mode task commented out for wokwi compatibility
-// wokwi simulator doesn't support real WiFi hardware operations
-// Uncomment and restore this section for production deployment
-// ========================================================================
-
-// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
-/*
 // WIFI-ONLY MODE TASK - Pure WiFi operation when credentials exist
 #[embassy_executor::task]
 async fn wifi_only_mode_task(
@@ -623,22 +546,7 @@ async fn wifi_only_mode_task(
         }
     }
 }
-*/
 
-// ========================================================================
-// 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
-
-// ========================================================================
-// 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
-// BLE provisioning mode task commented out for wokwi compatibility
-// wokwi simulator doesn't support real BLE hardware operations
-// Uncomment and restore this section for production deployment
-// ========================================================================
-
-// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
-/*
 // BLE PROVISIONING MODE TASK - Pure BLE operation when no credentials exist
 #[embassy_executor::task]
 async fn ble_provisioning_mode_task(
@@ -761,11 +669,6 @@ async fn ble_provisioning_mode_task(
         Timer::after(Duration::from_millis(10)).await;
     }
 }
-*/
-
-// ========================================================================
-// 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
 
 // Device restart function - cleanly restarts the ESP32
 async fn restart_device(reason: &str) {
@@ -783,70 +686,9 @@ async fn restart_device(reason: &str) {
     }
 }
 
-// ========================================================================
-// 🚨🚨🚨 TESTING ONLY FUNCTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
-// This function clears stored WiFi credentials from NVS storage to force
-// the device into BLE provisioning mode for testing purposes.
-//
-// ⚠️  WARNING: REMOVE THIS FUNCTION BEFORE PRODUCTION DEPLOYMENT!
-// ⚠️  This will erase user's WiFi settings!
-// ========================================================================
-
-/// Clear WiFi credentials from NVS storage for testing purposes
-///
-/// # Parameters
-/// - `nvs_partition`: Cloned NVS partition to use for credential clearing
-///
-/// # Returns
-/// - `Ok(())` if credentials were cleared successfully or didn't exist
-/// - `Err(e)` if there was an error accessing NVS storage
-fn clear_wifi_credentials_for_testing(
-    nvs_partition: EspDefaultNvsPartition,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🧪 TESTING: Creating temporary WiFi storage for credential clearing...");
-
-    // Create a temporary WiFi storage instance using the cloned NVS partition
-    // This is safe because we're only using it to clear credentials
-    let mut wifi_storage = wifi_storage::WiFiStorage::new_with_partition(nvs_partition)
-        .map_err(|e| format!("Failed to create WiFi storage: {:?}", e))?;
-
-    // Clear stored credentials
-    match wifi_storage.clear_credentials() {
-        Ok(_) => {
-            info!("✅ TESTING: WiFi credentials cleared from NVS storage");
-            info!("🔄 TESTING: Device will now enter BLE provisioning mode");
-            Ok(())
-        }
-        Err(e) => {
-            // This is OK - credentials might not exist yet
-            info!(
-                "ℹ️ TESTING: No credentials to clear or clear failed: {:?}",
-                e
-            );
-            info!("🔄 TESTING: Device will enter BLE provisioning mode anyway");
-            Ok(()) // Return OK since this is expected during first boot
-        }
-    }
-}
-
-// ========================================================================
-// 🚨🚨🚨 END OF TESTING FUNCTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
-
 // OLD WiFi FUNCTIONS REMOVED - Now using persistent WiFi task with channel communication
 // This eliminates the Peripherals::take() singleton issue entirely!
 
-// ========================================================================
-// 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
-// HTTP connectivity and device registration functions commented out for wokwi
-// wokwi simulator doesn't support real HTTP/internet operations
-// Uncomment and restore these functions for production deployment
-// ========================================================================
-
-// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
-/*
 async fn test_connectivity_and_register(
     ip_address: Ipv4Addr,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -869,7 +711,7 @@ async fn test_connectivity_and_register(
 
     // Step 3: Register device with Acorn Pups backend
     info!("📡 Registering device with Acorn Pups backend...");
-    match register_device_with_backend(&device_id, ip_address).await {
+    match register_device_with_backend().await {
         Ok(_) => {
             info!("✅ Device registration successful");
             info!("🎯 Device is now registered and ready for Acorn Pups operations");
@@ -892,10 +734,7 @@ async fn test_connectivity_and_register(
 
     Ok(())
 }
-*/
 
-// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
-/*
 // Test basic HTTP connectivity using httpbin.org
 async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
     info!("🔗 Testing HTTP connectivity to httpbin.org...");
@@ -938,8 +777,6 @@ async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
         Err(error_msg.into())
     }
 }
-
-
 
 // Send heartbeat to backend to indicate device is alive
 async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -988,11 +825,6 @@ async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error
         Err(error_msg.into())
     }
 }
-*/
-
-// ========================================================================
-// 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
-// ========================================================================
 
 #[embassy_executor::task]
 async fn led_task(
