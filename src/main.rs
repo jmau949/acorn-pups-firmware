@@ -46,15 +46,22 @@ use embassy_time::with_timeout;
 // error! = critical errors, info! = general information, warn! = warnings
 use log::{error, info, warn};
 
+// Import anyhow for error handling
+use anyhow::Result;
+
 // Declare our custom modules (separate files in src/ directory)
 // Each mod statement tells Rust to include code from src/module_name.rs
 mod ble_server; // Bluetooth Low Energy server functionality
 mod wifi_storage; // Persistent storage of WiFi credentials
+mod api; // HTTP API client for REST communication
+mod device_api; // Device-specific API client for ESP32 receivers
+
 
 // Import specific items from our modules to use in this file
 // This is like "from module import function" in Python
 use ble_server::{generate_device_id, BleServer}; // BLE advertising and communication
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
+use device_api::DeviceApiClient; // Device-specific API client for registration
 
 // Task coordination structures and system state
 // These provide event-driven communication between tasks eliminating polling loops
@@ -391,6 +398,13 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
                 state.wifi_ip = Some(ip);
             }
 
+            // Register device with backend API after WiFi connection
+            // This follows the technical documentation flow: WiFi connection => device registration
+            if let Err(e) = register_device_with_backend().await {
+                error!("❌ Device registration failed: {}", e);
+                warn!("🔄 Device will continue operating but may have limited functionality");
+            }
+
             // Signal system transition to WiFi mode
             SYSTEM_EVENT_SIGNAL.signal(SystemEvent::WiFiMode);
         }
@@ -412,6 +426,86 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
 
         WiFiConnectionEvent::CredentialsInvalid => {
             warn!("⚠️ Invalid WiFi credentials received");
+        }
+    }
+}
+
+// Device registration function - called after WiFi connection is successful
+// This implements the technical documentation flow: WiFi connection => device registration
+async fn register_device_with_backend() -> Result<(), anyhow::Error> {
+    info!("🔧 Starting device registration process");
+    
+    // Create device API client
+    // Use development endpoint for testing, production for release builds
+    let base_url = if cfg!(debug_assertions) {
+        "https://api-dev.acornpups.com/v1".to_string()
+    } else {
+        "https://api.acornpups.com/v1".to_string()
+    };
+    
+    let firmware_version = "1.0.0".to_string();
+    let device_id = generate_device_id();
+    let device_api_client = DeviceApiClient::new(base_url, device_id.clone(), firmware_version.clone());
+    
+    // HARDCODED: Authentication token from BLE setup process
+    // TODO: Replace with actual token received from mobile app during BLE provisioning
+    let HARDCODED_AUTH_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.HARDCODED_JWT_TOKEN_FOR_TESTING";
+    
+    // Set authentication token for device registration
+    device_api_client.set_auth_token(HARDCODED_AUTH_TOKEN.to_string()).await;
+    
+    // HARDCODED: Device registration data
+    // TODO: Replace with actual hardware-specific values
+    let device_registration = device_api_client.create_device_registration(
+        "HARDCODED_SERIAL_ESP32SN123456789".to_string(),     // serial_number
+        "HARDCODED_MAC_AA:BB:CC:DD:EE:FF".to_string(),       // mac_address  
+        "HARDCODED_ACORN_PUPS_RECEIVER".to_string(),         // device_name
+        "HARDCODED_ESP32_DEVKIT_V1".to_string(),             // hardware_version
+        "HARDCODED_WIFI_NETWORK_NAME".to_string(),           // wifi_ssid
+        -42,                                                 // signal_strength (dBm)
+    );
+    
+    info!("📋 Device registration data:");
+    info!("  Device ID: {}", device_registration.device_id);
+    info!("  Serial Number: {}", device_registration.serial_number);
+    info!("  MAC Address: {}", device_registration.mac_address);
+    info!("  Device Name: {}", device_registration.device_name);
+    info!("  Firmware Version: {}", device_registration.firmware_version);
+    info!("  Hardware Version: {}", device_registration.hardware_version);
+    info!("  WiFi SSID: {}", device_registration.wifi_ssid);
+    info!("  Signal Strength: {} dBm", device_registration.signal_strength);
+    
+    
+    // Register device with backend
+    match device_api_client.register_device(&device_registration).await {
+        Ok(response) => {
+            info!("✅ Device registered successfully with backend!");
+            info!("🔑 Device ID: {}", response.device_id);
+            info!("🌐 IoT Endpoint: {}", response.iot_endpoint);
+            info!("📡 IoT Thing Name: {}", response.iot_thing_name);
+            
+            // TODO: Store AWS IoT Core credentials for MQTT communication
+            info!("🔐 TODO: Store IoT credentials securely");
+            info!("📜 Certificate length: {} bytes", response.certificate.len());
+            info!("🔑 Private key length: {} bytes", response.private_key.len());
+            
+            // TODO: Apply device settings received from backend  
+            info!("⚙️ TODO: Apply device settings");
+            info!("🔊 Sound volume: {}", response.device_settings.sound_volume);
+            info!("💡 LED brightness: {}", response.device_settings.led_brightness);
+            
+            info!("🎯 Device registration completed successfully!");
+            info!("📡 MQTT topics configured:");
+            info!("  Button Press: {}", response.mqtt_topics.button_press_topic);
+            info!("  Status: {}", response.mqtt_topics.status_topic);
+            info!("  Settings: {}", response.mqtt_topics.settings_topic);
+            info!("  Commands: {}", response.mqtt_topics.commands_topic);
+            
+            Ok(())
+        }
+        Err(e) => {
+            error!("❌ Device registration failed: {}", e);
+            Err(e)
         }
     }
 }
