@@ -101,19 +101,23 @@ impl ApiClient {
     /// Get or create the HTTP connection (creates new connection each time)
     async fn get_connection(&self) -> Result<EspHttpConnection> {
         let inner = self.inner.lock().await;
-        
+
         debug!("Creating new HTTP connection");
-        
+
         let http_config = Configuration {
             timeout: Some(inner.config.timeout),
             buffer_size: Some(inner.config.buffer_size),
             buffer_size_tx: Some(inner.config.buffer_size),
+            // 🔧 TLS Configuration for HTTPS support
+            // Enable certificate bundle for server verification
+            // This should resolve the "No server verification option set" error
+            crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
             ..Default::default()
         };
 
         let connection = EspHttpConnection::new(&http_config)?;
-        debug!("HTTP connection established");
-        
+        debug!("HTTP connection established with TLS certificate bundle");
+
         Ok(connection)
     }
 
@@ -121,52 +125,68 @@ impl ApiClient {
     pub async fn post<T: Serialize>(&self, endpoint: &str, payload: &T) -> Result<ResponseData> {
         let url = self.build_url(endpoint).await;
         let json_payload = serde_json::to_string(payload)?;
-        
+
         debug!("POST request to: {}", url);
         debug!("Payload: {}", json_payload);
 
         let connection = self.get_connection().await?;
         let headers = self.build_headers_with_auth().await;
-        
-        self.send_request(connection, Method::Post, &url, Some(json_payload.as_bytes()), &headers).await
+
+        self.send_request(
+            connection,
+            Method::Post,
+            &url,
+            Some(json_payload.as_bytes()),
+            &headers,
+        )
+        .await
     }
 
     /// Perform a GET request
     pub async fn get(&self, endpoint: &str) -> Result<ResponseData> {
         let url = self.build_url(endpoint).await;
-        
+
         debug!("GET request to: {}", url);
 
         let connection = self.get_connection().await?;
         let headers = self.build_headers_with_auth().await;
-        
-        self.send_request(connection, Method::Get, &url, None, &headers).await
+
+        self.send_request(connection, Method::Get, &url, None, &headers)
+            .await
     }
 
     /// Perform a PUT request with JSON payload
     pub async fn put<T: Serialize>(&self, endpoint: &str, payload: &T) -> Result<ResponseData> {
         let url = self.build_url(endpoint).await;
         let json_payload = serde_json::to_string(payload)?;
-        
+
         debug!("PUT request to: {}", url);
         debug!("Payload: {}", json_payload);
 
         let connection = self.get_connection().await?;
         let headers = self.build_headers_with_auth().await;
-        
-        self.send_request(connection, Method::Put, &url, Some(json_payload.as_bytes()), &headers).await
+
+        self.send_request(
+            connection,
+            Method::Put,
+            &url,
+            Some(json_payload.as_bytes()),
+            &headers,
+        )
+        .await
     }
 
     /// Perform a DELETE request
     pub async fn delete(&self, endpoint: &str) -> Result<ResponseData> {
         let url = self.build_url(endpoint).await;
-        
+
         debug!("DELETE request to: {}", url);
 
         let connection = self.get_connection().await?;
         let headers = self.build_headers_with_auth().await;
-        
-        self.send_request(connection, Method::Delete, &url, None, &headers).await
+
+        self.send_request(connection, Method::Delete, &url, None, &headers)
+            .await
     }
 
     /// Send the actual HTTP request and process the response
@@ -179,15 +199,16 @@ impl ApiClient {
         headers: &[(String, String)],
     ) -> Result<ResponseData> {
         use embedded_svc::http::client::Client;
-        
+
         // Wrap the connection in a client
         let mut client = Client::wrap(connection);
-        
+
         // Convert headers to the required format
-        let header_refs: Vec<(&str, &str)> = headers.iter()
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        
+
         // Create request based on method with headers
         let mut request = match method {
             Method::Get => client.get(url)?,
@@ -217,7 +238,7 @@ impl ApiClient {
         let mut body_buffer = vec![0u8; 4096];
         let mut body_content = String::new();
         let mut total_read = 0;
-        
+
         loop {
             match response.read(&mut body_buffer) {
                 Ok(0) => break, // EOF
@@ -226,7 +247,7 @@ impl ApiClient {
                     if let Ok(chunk) = std::str::from_utf8(&body_buffer[..bytes_read]) {
                         body_content.push_str(chunk);
                     }
-                    
+
                     // Prevent infinite loops with very large responses
                     if total_read > 1024 * 1024 {
                         warn!("Response body too large, truncating at 1MB");
@@ -264,15 +285,13 @@ impl ApiClient {
     async fn build_url(&self, endpoint: &str) -> String {
         let inner = self.inner.lock().await;
         let base_url = &inner.base_url;
-        
+
         if endpoint.starts_with('/') {
             format!("{}{}", base_url.trim_end_matches('/'), endpoint)
         } else {
             format!("{}/{}", base_url.trim_end_matches('/'), endpoint)
         }
     }
-
-
 
     /// Build HTTP headers with authorization token (internal use)
     async fn build_headers_with_auth(&self) -> Vec<(String, String)> {
@@ -292,13 +311,20 @@ impl ApiClient {
     }
 
     /// Example method: Register a device with the API
-    pub async fn register_device(&self, device_info: &DeviceRegistration) -> Result<DeviceRegistrationResponse> {
+    pub async fn register_device(
+        &self,
+        device_info: &DeviceRegistration,
+    ) -> Result<DeviceRegistrationResponse> {
         let response = self.post("/devices/register", device_info).await?;
-        
+
         // Parse the response JSON
-        let registration_response: DeviceRegistrationResponse = serde_json::from_str(&response.body)?;
-        
-        info!("Device registered successfully: {}", registration_response.device_id);
+        let registration_response: DeviceRegistrationResponse =
+            serde_json::from_str(&response.body)?;
+
+        info!(
+            "Device registered successfully: {}",
+            registration_response.device_id
+        );
         Ok(registration_response)
     }
 
@@ -306,10 +332,10 @@ impl ApiClient {
     pub async fn get_device_status(&self, device_id: &str) -> Result<DeviceStatus> {
         let endpoint = format!("/devices/{}/status", device_id);
         let response = self.get(&endpoint).await?;
-        
+
         // Parse the response JSON
         let status: DeviceStatus = serde_json::from_str(&response.body)?;
-        
+
         debug!("Device status retrieved: {:?}", status);
         Ok(status)
     }
@@ -318,7 +344,7 @@ impl ApiClient {
     pub async fn update_device_config(&self, device_id: &str, config: &DeviceConfig) -> Result<()> {
         let endpoint = format!("/devices/{}/config", device_id);
         let _response = self.put(&endpoint, config).await?;
-        
+
         info!("Device configuration updated successfully");
         Ok(())
     }
@@ -327,7 +353,7 @@ impl ApiClient {
     pub async fn send_telemetry(&self, device_id: &str, telemetry: &TelemetryData) -> Result<()> {
         let endpoint = format!("/devices/{}/telemetry", device_id);
         let _response = self.post(&endpoint, telemetry).await?;
-        
+
         debug!("Telemetry data sent successfully");
         Ok(())
     }
@@ -335,7 +361,7 @@ impl ApiClient {
     /// Health check endpoint
     pub async fn health_check(&self) -> Result<HealthStatus> {
         let response = self.get("/health").await?;
-        
+
         let health: HealthStatus = serde_json::from_str(&response.body)?;
         Ok(health)
     }
@@ -415,10 +441,10 @@ mod tests {
     #[tokio::test]
     async fn test_api_client_creation() {
         let client = ApiClient::new("https://api.example.com".to_string());
-        
+
         // Test that the client can be cloned (Arc behavior)
         let _client_clone = client.clone();
-        
+
         // Test token setting
         let client_with_token = client.with_token("test_token".to_string()).await;
         // Additional tests would go here in a real implementation
@@ -427,11 +453,11 @@ mod tests {
     #[tokio::test]
     async fn test_url_building() {
         let client = ApiClient::new("https://api.example.com".to_string());
-        
+
         let url1 = client.build_url("/devices/register").await;
         assert_eq!(url1, "https://api.example.com/devices/register");
-        
+
         let url2 = client.build_url("devices/register").await;
         assert_eq!(url2, "https://api.example.com/devices/register");
     }
-} 
+}
