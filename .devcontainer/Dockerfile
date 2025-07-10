@@ -10,11 +10,14 @@ ARG CONTAINER_GROUP=esp
 ARG ESP_BOARD=all
 ARG GITHUB_TOKEN
 
-# Install dependencies
-RUN apt-get update \
-    && apt-get install -y pkg-config curl gcc clang libudev-dev unzip xz-utils \
-    git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0 \
-    && apt-get clean -y && rm -rf /var/lib/apt/lists/* /tmp/library-scripts
+# Install dependencies with retry logic
+RUN for i in 1 2 3; do \
+        apt-get update && \
+        apt-get install -y pkg-config curl gcc clang libudev-dev unzip xz-utils \
+        git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0 && \
+        apt-get clean -y && rm -rf /var/lib/apt/lists/* /tmp/library-scripts && \
+        break || sleep 5; \
+    done
 
 # Set users
 RUN adduser --disabled-password --gecos "" ${CONTAINER_USER}
@@ -62,5 +65,11 @@ RUN rustup default esp
 
 # Activate ESP environment
 RUN echo "source /home/${CONTAINER_USER}/export-esp.sh" >> ~/.bashrc
+
+# Ensure cargo directories and workspace exist and are writable by the user
+USER root
+RUN mkdir -p /usr/local/cargo/registry /usr/local/cargo/git /home/${CONTAINER_USER}/pup && \
+    chown -R ${CONTAINER_USER}:${CONTAINER_USER} /usr/local/cargo /home/${CONTAINER_USER}/pup
+USER ${CONTAINER_USER}
 
 CMD [ "/bin/bash" ]

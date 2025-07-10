@@ -8,7 +8,8 @@
       "CONTAINER_USER": "esp",
       "CONTAINER_GROUP": "esp",
       "ESP_BOARD": "esp32"
-    }
+    },
+    "options": ["--network=host"]
   },
   // https://github.com/serialport/serialport-rs/issues/153
   "runArgs": [
@@ -31,7 +32,7 @@
     "bash", "-c", "docker volume create pup-workspace 2>/dev/null || true; docker volume create cargo-registry 2>/dev/null || true; docker volume create cargo-git 2>/dev/null || true"
   ],
   "postCreateCommand": [
-    "bash", "-c", "chown -R esp:esp /usr/local/cargo && if [ ! -f /home/esp/pup/Cargo.toml ]; then echo 'Syncing code from host to volume...'; cp -r /tmp/host-workspace/. /home/esp/pup/ && chown -R esp:esp /home/esp/pup; echo 'Code sync complete. All operations now use fast volumes.'; fi"
+    "bash", "-c", "set -e; if [ ! -f /home/esp/pup/Cargo.toml ]; then echo 'Syncing code from host to volume...'; ls -la /tmp/host-workspace/; cp -rv /tmp/host-workspace/. /home/esp/pup/; ls -la /home/esp/pup/; echo 'Code sync complete. All operations now use fast volumes.'; else echo 'Code already synced to volume.'; fi"
   ],
   "customizations": {
     "vscode": {
