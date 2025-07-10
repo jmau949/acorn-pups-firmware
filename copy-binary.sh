@@ -4,10 +4,10 @@
 echo "Copying binary to Windows target directory..."
 
 # Create target directory structure if it doesn't exist
-mkdir -p /tmp/host-workspace/target/xtensa-esp32-espidf/debug/
+mkdir -p /tmp/windows-target/xtensa-esp32-espidf/debug/
 
 # Copy the binary
-cp target/xtensa-esp32-espidf/debug/pup /tmp/host-workspace/target/xtensa-esp32-espidf/debug/
+cp target/xtensa-esp32-espidf/debug/pup /tmp/windows-target/xtensa-esp32-espidf/debug/
 
 echo "Binary copied! You can now flash from Windows PowerShell:"
 echo "cd C:/esp/pup"

@@ -23,8 +23,10 @@
     // Mount cargo registry and git to avoid re-downloading on container rebuild
     "source=cargo-registry,target=/usr/local/cargo/registry,type=volume",
     "source=cargo-git,target=/usr/local/cargo/git,type=volume",
-    // Temporary mount for initial sync
-    "source=${localWorkspaceFolder},target=/tmp/host-workspace,type=bind,readonly"
+    // Temporary mount for initial sync (readonly)
+    "source=${localWorkspaceFolder},target=/tmp/host-workspace,type=bind,readonly",
+    // Writable mount for copying binaries back to Windows
+    "source=${localWorkspaceFolder}/target,target=/tmp/windows-target,type=bind"
   ],
   "workspaceFolder": "/home/esp/pup",
   // Ensure volumes exist
