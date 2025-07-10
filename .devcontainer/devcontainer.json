@@ -34,7 +34,7 @@
     "bash", "-c", "docker volume create pup-workspace 2>/dev/null || true; docker volume create cargo-registry 2>/dev/null || true; docker volume create cargo-git 2>/dev/null || true"
   ],
   "postCreateCommand": [
-    "bash", "-c", "set -e; if [ ! -f /home/esp/pup/Cargo.toml ]; then echo 'Syncing code from host to volume...'; ls -la /tmp/host-workspace/; cp -rv /tmp/host-workspace/. /home/esp/pup/; ls -la /home/esp/pup/; echo 'Code sync complete. All operations now use fast volumes.'; else echo 'Code already synced to volume.'; fi && echo 'Installing espflash...' && cargo install espflash --locked && echo 'espflash installed successfully' && chmod +x copy-binary.sh"
+    "bash", "-c", "set -e; if [ ! -f /home/esp/pup/Cargo.toml ]; then echo 'Syncing code from host to volume...'; ls -la /tmp/host-workspace/; cp -rv /tmp/host-workspace/. /home/esp/pup/; ls -la /home/esp/pup/; echo 'Code sync complete. All operations now use fast volumes.'; else echo 'Code already synced to volume.'; fi"
   ],
   "customizations": {
     "vscode": {
