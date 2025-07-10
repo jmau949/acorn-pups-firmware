@@ -189,6 +189,16 @@ async fn main(spawner: Spawner) {
         return;
     }
 
+    // ========================================================================
+    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
+    // System initialization code commented out for wokwi compatibility
+    // wokwi simulator doesn't support real NVS/storage operations
+    // Uncomment and restore this section for production deployment
+    // ========================================================================
+
+    // 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
+    /*
     // Initialize system components
     let sys_loop = EspSystemEventLoop::take().unwrap();
     let timer_service = EspTaskTimerService::new().unwrap();
@@ -227,10 +237,25 @@ async fn main(spawner: Spawner) {
             return;
         }
     };
+    */
+
+    // ========================================================================
+    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
+
+    // ========================================================================
+    // 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
+    // WiFi and BLE code commented out for wokwi compatibility
+    // wokwi simulator doesn't support real hardware BLE/WiFi operations
+    // Uncomment and restore this section for production deployment
+    // ========================================================================
 
     // Check WiFi credentials to determine device mode
     info!("🔧 Checking WiFi credentials to determine device mode...");
 
+    // 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
+    /*
     if wifi_storage.has_stored_credentials() {
         info!("✅ WiFi credentials found - Starting in WiFi-only mode");
 
@@ -269,6 +294,11 @@ async fn main(spawner: Spawner) {
 
         info!("📱 Device operating in BLE provisioning mode - WiFi disabled");
     }
+    */
+
+    // ========================================================================
+    // 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+    // ========================================================================
 
     // Spawn the LED status task - provides BLE connection status visual feedback
     if let Err(_) = spawner.spawn(led_task(led_red, led_green, led_blue)) {
@@ -386,6 +416,16 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
     }
 }
 
+// ========================================================================
+// 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
+// WiFi-only mode task commented out for wokwi compatibility
+// wokwi simulator doesn't support real WiFi hardware operations
+// Uncomment and restore this section for production deployment
+// ========================================================================
+
+// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
+/*
 // WIFI-ONLY MODE TASK - Pure WiFi operation when credentials exist
 #[embassy_executor::task]
 async fn wifi_only_mode_task(
@@ -513,7 +553,22 @@ async fn wifi_only_mode_task(
         }
     }
 }
+*/
 
+// ========================================================================
+// 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
+
+// ========================================================================
+// 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
+// BLE provisioning mode task commented out for wokwi compatibility
+// wokwi simulator doesn't support real BLE hardware operations
+// Uncomment and restore this section for production deployment
+// ========================================================================
+
+// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
+/*
 // BLE PROVISIONING MODE TASK - Pure BLE operation when no credentials exist
 #[embassy_executor::task]
 async fn ble_provisioning_mode_task(
@@ -636,6 +691,11 @@ async fn ble_provisioning_mode_task(
         Timer::after(Duration::from_millis(10)).await;
     }
 }
+*/
+
+// ========================================================================
+// 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
 
 // Device restart function - cleanly restarts the ESP32
 async fn restart_device(reason: &str) {
@@ -707,6 +767,16 @@ fn clear_wifi_credentials_for_testing(
 // OLD WiFi FUNCTIONS REMOVED - Now using persistent WiFi task with channel communication
 // This eliminates the Peripherals::take() singleton issue entirely!
 
+// ========================================================================
+// 🚨🚨🚨 TESTING ONLY - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
+// HTTP connectivity and device registration functions commented out for wokwi
+// wokwi simulator doesn't support real HTTP/internet operations
+// Uncomment and restore these functions for production deployment
+// ========================================================================
+
+// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
+/*
 async fn test_connectivity_and_register(
     ip_address: Ipv4Addr,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -752,7 +822,10 @@ async fn test_connectivity_and_register(
 
     Ok(())
 }
+*/
 
+// 🚨 TESTING ONLY - COMMENTED OUT FOR WOKWI 🚨
+/*
 // Test basic HTTP connectivity using httpbin.org
 async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
     info!("🔗 Testing HTTP connectivity to httpbin.org...");
@@ -920,6 +993,11 @@ async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error
         Err(error_msg.into())
     }
 }
+*/
+
+// ========================================================================
+// 🚨🚨🚨 END OF TESTING SECTION - REMOVE ME IN PRODUCTION 🚨🚨🚨
+// ========================================================================
 
 #[embassy_executor::task]
 async fn led_task(
@@ -1008,3 +1086,5 @@ async fn led_task(
         Timer::after(Duration::from_millis(250)).await;
     }
 }
+
+
