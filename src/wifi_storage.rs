@@ -226,4 +226,70 @@ impl WiFiStorage {
             .unwrap_or_default()
             .as_secs()
     }
+
+    /// Debug method to dump all persistent storage contents
+    pub fn debug_dump_storage(&mut self) {
+        info!(
+            "🔍 DEBUG: Dumping all persistent storage contents for namespace '{}'",
+            NVS_NAMESPACE
+        );
+
+        // Try to read the complete WiFi config JSON
+        let mut config_buffer = [0u8; 512];
+        match self.nvs.get_str(WIFI_CONFIG_KEY, &mut config_buffer) {
+            Ok(Some(json_str)) => {
+                info!("🔍 DEBUG: {} = '{}'", WIFI_CONFIG_KEY, json_str);
+
+                // Try to parse and display structured data
+                match serde_json::from_str::<StoredWiFiConfig>(&json_str) {
+                    Ok(config) => {
+                        info!("🔍 DEBUG:   Parsed Config:");
+                        info!("🔍 DEBUG:     SSID: '{}'", config.ssid);
+                        info!("🔍 DEBUG:     Password: '{}'", config.password);
+                        info!("🔍 DEBUG:     Timestamp: {}", config.timestamp);
+                        info!("🔍 DEBUG:     Is Valid: {}", config.is_valid);
+                    }
+                    Err(e) => {
+                        warn!("🔍 DEBUG:   Failed to parse JSON config: {}", e);
+                    }
+                }
+            }
+            Ok(None) => {
+                info!("🔍 DEBUG: {} = <not found>", WIFI_CONFIG_KEY);
+            }
+            Err(e) => {
+                warn!("🔍 DEBUG: {} = <read error: {:?}>", WIFI_CONFIG_KEY, e);
+            }
+        }
+
+        // Try to read individual SSID field
+        let mut ssid_buffer = [0u8; 64];
+        match self.nvs.get_str(SSID_KEY, &mut ssid_buffer) {
+            Ok(Some(ssid)) => {
+                info!("🔍 DEBUG: {} = '{}'", SSID_KEY, ssid);
+            }
+            Ok(None) => {
+                info!("🔍 DEBUG: {} = <not found>", SSID_KEY);
+            }
+            Err(e) => {
+                warn!("🔍 DEBUG: {} = <read error: {:?}>", SSID_KEY, e);
+            }
+        }
+
+        // Try to read individual password field
+        let mut password_buffer = [0u8; 64];
+        match self.nvs.get_str(PASSWORD_KEY, &mut password_buffer) {
+            Ok(Some(password)) => {
+                info!("🔍 DEBUG: {} = '{}'", PASSWORD_KEY, password);
+            }
+            Ok(None) => {
+                info!("🔍 DEBUG: {} = <not found>", PASSWORD_KEY);
+            }
+            Err(e) => {
+                warn!("🔍 DEBUG: {} = <read error: {:?}>", PASSWORD_KEY, e);
+            }
+        }
+
+        info!("🔍 DEBUG: End of persistent storage dump");
+    }
 }

@@ -186,8 +186,12 @@ async fn main(spawner: Spawner) {
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
     let mut wifi_storage = match WiFiStorage::new_with_partition(nvs) {
-        Ok(storage) => {
+        Ok(mut storage) => {
             info!("✅ WiFi storage initialized successfully with NVS partition");
+
+            // 🔍 DEBUG: Dump current storage contents on startup
+            storage.debug_dump_storage();
+
             storage
         }
         Err(e) => {
@@ -478,6 +482,11 @@ async fn wifi_only_mode_task(
                 "📶 Connecting to WiFi with stored credentials: {}",
                 credentials.ssid
             );
+            info!("🔍 DEBUG: WiFi SSID: '{}'", credentials.ssid);
+            info!("🔍 DEBUG: WiFi Password: '{}'", credentials.password);
+
+            // 🔍 DEBUG: Dump all persistent storage contents after loading
+            wifi_storage.debug_dump_storage();
 
             let wifi_config = Configuration::Client(ClientConfiguration {
                 ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
@@ -539,6 +548,10 @@ async fn wifi_only_mode_task(
                     // Clear invalid credentials
                     if let Err(e) = wifi_storage.clear_credentials() {
                         error!("Failed to clear credentials: {:?}", e);
+                    } else {
+                        info!("🔍 DEBUG: Credentials cleared successfully");
+                        // 🔍 DEBUG: Dump storage contents after clearing
+                        wifi_storage.debug_dump_storage();
                     }
 
                     // Restart device to enter BLE provisioning mode
@@ -629,6 +642,11 @@ async fn ble_provisioning_mode_task(
         // Check for received credentials (take to prevent repeated processing)
         if let Some(credentials) = ble_server.take_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
+            info!("🔍 DEBUG: Received WiFi SSID: '{}'", credentials.ssid);
+            info!(
+                "🔍 DEBUG: Received WiFi Password: '{}'",
+                credentials.password
+            );
 
             // 🎯 STAGE 2: Send processing status (if still connected)
             if ble_server.is_client_connected() {
@@ -641,6 +659,11 @@ async fn ble_provisioning_mode_task(
             match wifi_storage.store_credentials(&credentials) {
                 Ok(()) => {
                     info!("💾 WiFi credentials stored successfully");
+                    info!("🔍 DEBUG: Stored WiFi SSID: '{}'", credentials.ssid);
+                    info!("🔍 DEBUG: Stored WiFi Password: '{}'", credentials.password);
+
+                    // 🔍 DEBUG: Dump all persistent storage contents after storing
+                    wifi_storage.debug_dump_storage();
 
                     // Send storage success notification (if still connected)
                     if ble_server.is_client_connected() {
