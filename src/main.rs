@@ -398,13 +398,6 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
                 state.wifi_ip = Some(ip);
             }
 
-            // Register device with backend API after WiFi connection
-            // This follows the technical documentation flow: WiFi connection => device registration
-            if let Err(e) = register_device_with_backend().await {
-                error!("❌ Device registration failed: {}", e);
-                warn!("🔄 Device will continue operating but may have limited functionality");
-            }
-
             // Signal system transition to WiFi mode
             SYSTEM_EVENT_SIGNAL.signal(SystemEvent::WiFiMode);
         }
@@ -437,11 +430,8 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
     
     // Create device API client
     // Use development endpoint for testing, production for release builds
-    let base_url = if cfg!(debug_assertions) {
-        "https://api-dev.acornpups.com/v1".to_string()
-    } else {
-        "https://api.acornpups.com/v1".to_string()
-    };
+    let base_url = "https://utpfo2x8f6.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
+    
     
     let firmware_version = "1.0.0".to_string();
     let device_id = generate_device_id();
@@ -460,9 +450,6 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
         "HARDCODED_SERIAL_ESP32SN123456789".to_string(),     // serial_number
         "HARDCODED_MAC_AA:BB:CC:DD:EE:FF".to_string(),       // mac_address  
         "HARDCODED_ACORN_PUPS_RECEIVER".to_string(),         // device_name
-        "HARDCODED_ESP32_DEVKIT_V1".to_string(),             // hardware_version
-        "HARDCODED_WIFI_NETWORK_NAME".to_string(),           // wifi_ssid
-        -42,                                                 // signal_strength (dBm)
     );
     
     info!("📋 Device registration data:");
@@ -470,36 +457,25 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
     info!("  Serial Number: {}", device_registration.serial_number);
     info!("  MAC Address: {}", device_registration.mac_address);
     info!("  Device Name: {}", device_registration.device_name);
-    info!("  Firmware Version: {}", device_registration.firmware_version);
-    info!("  Hardware Version: {}", device_registration.hardware_version);
-    info!("  WiFi SSID: {}", device_registration.wifi_ssid);
-    info!("  Signal Strength: {} dBm", device_registration.signal_strength);
     
     
     // Register device with backend
     match device_api_client.register_device(&device_registration).await {
         Ok(response) => {
             info!("✅ Device registered successfully with backend!");
-            info!("🔑 Device ID: {}", response.device_id);
-            info!("🌐 IoT Endpoint: {}", response.iot_endpoint);
-            info!("📡 IoT Thing Name: {}", response.iot_thing_name);
+            info!("🔑 Device ID: {}", response.data.device_id);
+            info!("👤 Owner ID: {}", response.data.owner_id);
+            info!("🌐 IoT Endpoint: {}", response.data.certificates.iot_endpoint);
+            info!("📅 Registered at: {}", response.data.registered_at);
+            info!("📊 Status: {}", response.data.status);
+            info!("🔍 Request ID: {}", response.request_id);
             
             // TODO: Store AWS IoT Core credentials for MQTT communication
             info!("🔐 TODO: Store IoT credentials securely");
-            info!("📜 Certificate length: {} bytes", response.certificate.len());
-            info!("🔑 Private key length: {} bytes", response.private_key.len());
-            
-            // TODO: Apply device settings received from backend  
-            info!("⚙️ TODO: Apply device settings");
-            info!("🔊 Sound volume: {}", response.device_settings.sound_volume);
-            info!("💡 LED brightness: {}", response.device_settings.led_brightness);
+            info!("📜 Certificate length: {} bytes", response.data.certificates.device_certificate.len());
+            info!("🔑 Private key length: {} bytes", response.data.certificates.private_key.len());
             
             info!("🎯 Device registration completed successfully!");
-            info!("📡 MQTT topics configured:");
-            info!("  Button Press: {}", response.mqtt_topics.button_press_topic);
-            info!("  Status: {}", response.mqtt_topics.status_topic);
-            info!("  Settings: {}", response.mqtt_topics.settings_topic);
-            info!("  Commands: {}", response.mqtt_topics.commands_topic);
             
             Ok(())
         }
@@ -963,82 +939,7 @@ async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-// Register device with Acorn Pups backend
-async fn register_device_with_backend(
-    device_id: &str,
-    ip_address: Ipv4Addr,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("📡 Registering with Acorn Pups backend...");
 
-    // Device registration payload
-    let registration_data = format!(
-        r#"{{
-            "device_id": "{}",
-            "device_type": "acorn_pups_esp32",
-            "firmware_version": "1.0.0",
-            "ip_address": "{}",
-            "capabilities": ["wifi_provisioning", "ble", "sensors"],
-            "registration_time": "{}",
-            "hardware_info": {{
-                "platform": "ESP32",
-                "ram_size": "520KB",
-                "flash_size": "4MB",
-                "wifi_mac": "auto_detected"
-            }}
-        }}"#,
-        device_id,
-        ip_address,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
-
-    let config = esp_idf_svc::http::client::Configuration {
-        timeout: Some(std::time::Duration::from_secs(15)),
-        ..Default::default()
-    };
-
-    let mut client = Client::wrap(EspHttpConnection::new(&config)?);
-
-    // Replace with your actual Acorn Pups backend URL
-    let backend_url = "https://api.acornpups.com/devices/register";
-
-    info!("🌐 Sending registration to: {}", backend_url);
-
-    let headers = [
-        ("Content-Type", "application/json"),
-        ("User-Agent", "AcornPups-ESP32/1.0.0"),
-        ("X-Device-Type", "acorn_pups"),
-    ];
-
-    let mut request = client.post(backend_url, &headers)?;
-    request.write_all(registration_data.as_bytes())?;
-    request.flush()?;
-
-    let response = request.submit()?;
-
-    match response.status() {
-        201 | 200 => {
-            info!(
-                "✅ Device registration successful - status: {}",
-                response.status()
-            );
-            Ok(())
-        }
-        409 => {
-            info!(
-                "ℹ️ Device already registered - status: {}",
-                response.status()
-            );
-            Ok(())
-        }
-        _ => {
-            let error_msg = format!("Registration failed with status: {}", response.status());
-            Err(error_msg.into())
-        }
-    }
-}
 
 // Send heartbeat to backend to indicate device is alive
 async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error>> {

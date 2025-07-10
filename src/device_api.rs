@@ -8,76 +8,68 @@ use crate::api::ApiClient;
 /// Device registration request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRegistration {
-    /// Unique device identifier (UUID)
+    /// Unique device identifier
+    #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// User-friendly device name
+    #[serde(rename = "deviceName")]
+    pub device_name: String,
     /// Hardware serial number (unique)
+    #[serde(rename = "serialNumber")]
     pub serial_number: String,
     /// Device MAC address
+    #[serde(rename = "macAddress")]
     pub mac_address: String,
-    /// User-friendly device name
-    pub device_name: String,
-    /// Current firmware version
-    pub firmware_version: String,
-    /// Hardware version/revision
-    pub hardware_version: String,
-    /// Device type identifier
-    pub device_type: String,
-    /// WiFi network SSID the device is connected to
-    pub wifi_ssid: String,
-    /// WiFi signal strength in dBm
-    pub signal_strength: i32,
 }
 
 /// Device registration response from the backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceRegistrationResponse {
+    /// Device registration data
+    pub data: DeviceRegistrationData,
+    /// Request ID for tracking
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceRegistrationData {
     /// Confirmed device ID
+    #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// User-friendly device name
+    #[serde(rename = "deviceName")]
+    pub device_name: String,
+    /// Hardware serial number
+    #[serde(rename = "serialNumber")]
+    pub serial_number: String,
+    /// Device owner user ID
+    #[serde(rename = "ownerId")]
+    pub owner_id: String,
+    /// Registration timestamp
+    #[serde(rename = "registeredAt")]
+    pub registered_at: String,
+    /// Device status
+    pub status: String,
+    /// Device certificates and IoT configuration
+    pub certificates: DeviceCertificates,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCertificates {
     /// AWS IoT Core device certificate (X.509 PEM format)
-    pub certificate: String,
+    #[serde(rename = "deviceCertificate")]
+    pub device_certificate: String,
     /// Device private key (RSA PEM format)
+    #[serde(rename = "privateKey")]
     pub private_key: String,
     /// AWS IoT Core endpoint URL
+    #[serde(rename = "iotEndpoint")]
     pub iot_endpoint: String,
-    /// AWS IoT Thing name
-    pub iot_thing_name: String,
-    /// MQTT topics the device should use
-    pub mqtt_topics: MqttTopics,
-    /// Device configuration settings
-    pub device_settings: DeviceSettings,
 }
 
 /// MQTT topic configuration for the device
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MqttTopics {
-    /// Topic for publishing button press events
-    pub button_press_topic: String,
-    /// Topic for publishing device status updates
-    pub status_topic: String,
-    /// Topic for subscribing to device settings updates
-    pub settings_topic: String,
-    /// Topic for subscribing to device commands
-    pub commands_topic: String,
-}
 
-/// Device settings configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceSettings {
-    /// Device sound volume (1-10)
-    pub sound_volume: u8,
-    /// LED brightness level (1-10)
-    pub led_brightness: u8,
-    /// Notification cooldown period in seconds
-    pub notification_cooldown: u32,
-    /// Whether sound alerts are enabled
-    pub sound_enabled: bool,
-    /// Whether quiet hours are enabled
-    pub quiet_hours_enabled: bool,
-    /// Quiet hours start time (HH:MM format)
-    pub quiet_hours_start: Option<String>,
-    /// Quiet hours end time (HH:MM format)
-    pub quiet_hours_end: Option<String>,
-}
 
 /// Device reset request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,12 +89,23 @@ pub struct DeviceResetRequest {
 /// Device reset response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceResetResponse {
-    /// Confirmation of reset processing
-    pub success: bool,
+    /// Device reset data
+    pub data: DeviceResetData,
+    /// Request ID for tracking
+    #[serde(rename = "requestId")]
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceResetData {
+    /// Device ID that was reset
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
     /// Reset acknowledgment message
     pub message: String,
-    /// Timestamp of reset processing
-    pub processed_at: u64,
+    /// Timestamp when reset was initiated
+    #[serde(rename = "resetInitiatedAt")]
+    pub reset_initiated_at: String,
 }
 
 /// Device status update payload
@@ -182,6 +185,10 @@ impl DeviceApiClient {
             return Err(anyhow!("MAC address cannot be empty"));
         }
 
+        if device_info.device_name.is_empty() {
+            return Err(anyhow!("Device name cannot be empty"));
+        }
+
         debug!("Device registration details: {:?}", device_info);
         
         // Make authenticated API call
@@ -190,16 +197,11 @@ impl DeviceApiClient {
                 // Parse the registration response
                 match serde_json::from_str::<DeviceRegistrationResponse>(&response.body) {
                     Ok(registration_response) => {
-                        info!("Device registered successfully: {}", registration_response.device_id);
-                        info!("IoT endpoint: {}", registration_response.iot_endpoint);
-                        info!("IoT thing name: {}", registration_response.iot_thing_name);
-                        
-                        // Log MQTT topics for debugging
-                        debug!("MQTT topics configured:");
-                        debug!("  Button press: {}", registration_response.mqtt_topics.button_press_topic);
-                        debug!("  Status: {}", registration_response.mqtt_topics.status_topic);
-                        debug!("  Settings: {}", registration_response.mqtt_topics.settings_topic);
-                        debug!("  Commands: {}", registration_response.mqtt_topics.commands_topic);
+                        info!("Device registered successfully: {}", registration_response.data.device_id);
+                        info!("Owner ID: {}", registration_response.data.owner_id);
+                        info!("IoT endpoint: {}", registration_response.data.certificates.iot_endpoint);
+                        info!("Registration timestamp: {}", registration_response.data.registered_at);
+                        info!("Request ID: {}", registration_response.request_id);
                         
                         Ok(registration_response)
                     }
@@ -242,7 +244,10 @@ impl DeviceApiClient {
             Ok(response) => {
                 match serde_json::from_str::<DeviceResetResponse>(&response.body) {
                     Ok(reset_response) => {
-                        info!("Device reset processed successfully: {}", reset_response.message);
+                        info!("Device reset processed successfully: {}", reset_response.data.message);
+                        info!("Device ID: {}", reset_response.data.device_id);
+                        info!("Reset initiated at: {}", reset_response.data.reset_initiated_at);
+                        info!("Request ID: {}", reset_response.request_id);
                         Ok(reset_response)
                     }
                     Err(e) => {
@@ -295,40 +300,19 @@ impl DeviceApiClient {
         serial_number: String,
         mac_address: String,
         device_name: String,
-        hardware_version: String,
-        wifi_ssid: String,
-        signal_strength: i32,
     ) -> DeviceRegistration {
         DeviceRegistration {
             device_id: self.device_id.clone(),
+            device_name,
             serial_number,
             mac_address,
-            device_name,
-            firmware_version: self.firmware_version.clone(),
-            hardware_version,
-            device_type: "acorn-pups-receiver".to_string(),
-            wifi_ssid,
-            signal_strength,
         }
     }
 
 
 }
 
-/// Default device settings
-impl Default for DeviceSettings {
-    fn default() -> Self {
-        Self {
-            sound_volume: 7,
-            led_brightness: 5,
-            notification_cooldown: 5,
-            sound_enabled: true,
-            quiet_hours_enabled: false,
-            quiet_hours_start: None,
-            quiet_hours_end: None,
-        }
-    }
-}
+
 
 
 
