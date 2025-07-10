@@ -9,12 +9,24 @@ This guide will help you set up your development environment for building and fl
 ```sh
 sudo apt-get install -y gcc build-essential curl pkg-config
 
-cargo install cargo-espflash espflash ldproxy
+cargo install espflash ldproxy
 
 cargo install espup --locked
 
 
 . /home/jodan/export-esp.sh
+
+
+sudo usermod -a -G dialout jodan
+
+newgrp dialout
+
+groups
+# Should show: dialout jodan adm sudo lpadmin
+
+cargo run
+
+
 ```
 
 ---
@@ -43,54 +55,3 @@ cd esp-idf
 
 ---
 
-## 6. Build the Project
-
-From the project root:
-
-```sh
-cargo build
-```
-
----
-
-## 7. Flashing and Serial Monitor
-
-Install the flashing tools:
-
-```sh
-cargo install cargo-espflash espflash ldproxy
-```
-
-To flash your firmware and open a serial monitor:
-
-```sh
-cargo espflash /dev/ttyUSB0
-# Replace /dev/ttyUSB0 with your ESP32's serial port
-```
-
----
-
-## 8. Troubleshooting
-
-### Error: `custom toolchain 'esp' specified in override file ... is not installed`
-- This means the ESP Rust toolchain is missing.
-- Fix: Run `cargo install espup` and then `espup install`.
-
-### Error: Python venv not found
-- Run: `sudo apt install python3-venv`
-
-### Other Issues
-- Ensure you have all dependencies from step 2.
-- Restart your terminal after installation steps.
-- If you encounter build errors, try `cargo clean` and rebuild.
-
----
-
-## 9. References
-- [Rust on ESP Book](https://esp-rs.github.io/book/)
-- [espup GitHub](https://github.com/esp-rs/espup)
-- [esp-idf-sys crate](https://github.com/esp-rs/esp-idf-sys)
-
----
-
-Happy hacking with Rust on ESP32! 
