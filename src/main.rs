@@ -53,14 +53,19 @@ use anyhow::Result;
 // Each mod statement tells Rust to include code from src/module_name.rs
 mod api; // HTTP API client for REST communication
 mod ble_server; // Bluetooth Low Energy server functionality
-mod device_api;
-mod wifi_storage; // Persistent storage of WiFi credentials // Device-specific API client for ESP32 receivers
+mod device_api; // Device-specific API client for ESP32 receivers
+mod mqtt_certificates; // Secure storage of AWS IoT Core certificates
+mod mqtt_client; // AWS IoT Core MQTT client with TLS authentication
+mod mqtt_manager; // Embassy task coordination for MQTT operations
+mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
 // This is like "from module import function" in Python
 use ble_server::{generate_device_id, BleServer}; // BLE advertising and communication
-use device_api::DeviceApiClient;
-use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds // Device-specific API client for registration
+use device_api::DeviceApiClient; // Device-specific API client for registration
+use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
+use mqtt_manager::{MqttManager, MQTT_EVENT_SIGNAL}; // MQTT task coordination
+use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 // Task coordination structures and system state
 // These provide event-driven communication between tasks eliminating polling loops
@@ -186,8 +191,12 @@ async fn main(spawner: Spawner) {
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
     let mut wifi_storage = match WiFiStorage::new_with_partition(nvs) {
-        Ok(storage) => {
+        Ok(mut storage) => {
             info!("✅ WiFi storage initialized successfully with NVS partition");
+
+            // 🔍 DEBUG: Dump current storage contents on startup
+            storage.debug_dump_storage();
+
             storage
         }
         Err(e) => {
@@ -244,6 +253,16 @@ async fn main(spawner: Spawner) {
         error!("Failed to spawn LED task");
         return;
     }
+
+    // Spawn the MQTT manager task - handles AWS IoT Core communication
+    // Task will wait for certificates to be available before initializing
+    let mqtt_device_id = generate_device_id(); // Generate device ID for MQTT
+    if let Err(_) = spawner.spawn(mqtt_manager_task(mqtt_device_id)) {
+        error!("Failed to spawn MQTT manager task");
+        return;
+    }
+
+    info!("🔌 MQTT manager task spawned - will activate after device registration");
 
     info!("✅ All tasks spawned successfully - system coordination active");
     info!("🎛️  Event-driven architecture initialized - no polling loops");
@@ -357,7 +376,7 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
 
 // Device registration function - called after WiFi connection is successful
 // This implements the technical documentation flow: WiFi connection => device registration
-async fn register_device_with_backend() -> Result<(), anyhow::Error> {
+async fn register_device_with_backend() -> Result<String, anyhow::Error> {
     info!("🔧 Starting device registration process");
 
     // Create device API client
@@ -372,7 +391,7 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
     // HARDCODED: Authentication token from BLE setup process
     // TODO: Replace with actual token received from mobile app during BLE provisioning
     let HARDCODED_AUTH_TOKEN =
-        "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.HARDCODED_JWT_TOKEN_FOR_TESTING";
+        "eyJraWQiOiI0eEdGUjRMaHJsNlc1cDgyWkdnbzlNVUN0dytCNkhCd2dSUFFtOHJsaTNNPSIsImFsZyI6IlJTMjU2In0.eyJzdWIiOiI2ODQxMjM1MC0xMGExLTcwODAtY2U5NS1hNmUyZGQxMzhhZmMiLCJpc3MiOiJodHRwczpcL1wvY29nbml0by1pZHAudXMtd2VzdC0yLmFtYXpvbmF3cy5jb21cL3VzLXdlc3QtMl9wRjRaYXM5OEEiLCJjbGllbnRfaWQiOiJnMXU2bnVvZ2ZoZzc2Z2I1MWlua3U0OTFhIiwib3JpZ2luX2p0aSI6ImRhYTJiOWQ2LTJhMTUtNDE5ZS05ODFkLWVjZGQ0ZTQ5NjA2MyIsImV2ZW50X2lkIjoiZjViZDVkNzQtMjk3Yy00OTlhLTlmYTEtYTdhNjMxMTgzZjBlIiwidG9rZW5fdXNlIjoiYWNjZXNzIiwic2NvcGUiOiJhd3MuY29nbml0by5zaWduaW4udXNlci5hZG1pbiIsImF1dGhfdGltZSI6MTc1MjE0MDIyNiwiZXhwIjoxNzUyMTQzODI2LCJpYXQiOjE3NTIxNDAyMjYsImp0aSI6ImUyYTM2ZTA5LWYwZjktNDViNy1hNDNhLWJlZDQ3N2Y4M2ZkZiIsInVzZXJuYW1lIjoiNjg0MTIzNTAtMTBhMS03MDgwLWNlOTUtYTZlMmRkMTM4YWZjIn0.KNe7Bjo-22OHNz4XuAkhdh-_KGbDju-ICXM1D-BSup4cYEZYL1tzl6CArILgoADE-ieblVTVSMrE8AgOJrDkIJuQJCwFDgeGy82Q-JIbN-Lcvgrjij7c9CPcAvL8xH_kPJMlTWkyA9eqZnNp67j3NZYZeCh30QvPdNevriX52AGpmpbbYGls2aenqAFo-xzdf_irueNLpW3HWpovxWmAEIhfCv2EvyvuRdZD9MXYyY7_bepqYayeBIML-Fi6Ez2MfOGepIFA4RGIWW5PwfDITxcwys7WyqzInbQISel19OvhYbW9v3qE8HIj-U1VmhaZ2VEUHqu13kizZNrZEIYbPA";
 
     // Set authentication token for device registration
     device_api_client
@@ -383,7 +402,7 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
     // TODO: Replace with actual hardware-specific values
     let device_registration = device_api_client.create_device_registration(
         "HARDCODED_SERIAL_ESP32SN123456789".to_string(), // serial_number
-        "HARDCODED_MAC_AA:BB:CC:DD:EE:FF".to_string(),   // mac_address
+        "AA:BB:CC:DD:EE:FF".to_string(),                 // mac_address
         "HARDCODED_ACORN_PUPS_RECEIVER".to_string(),     // device_name
     );
 
@@ -410,8 +429,8 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
             info!("📊 Status: {}", response.data.status);
             info!("🔍 Request ID: {}", response.request_id);
 
-            // TODO: Store AWS IoT Core credentials for MQTT communication
-            info!("🔐 TODO: Store IoT credentials securely");
+            // Store AWS IoT Core credentials for MQTT communication
+            info!("🔐 Storing AWS IoT Core certificates securely");
             info!(
                 "📜 Certificate length: {} bytes",
                 response.data.certificates.device_certificate.len()
@@ -421,9 +440,33 @@ async fn register_device_with_backend() -> Result<(), anyhow::Error> {
                 response.data.certificates.private_key.len()
             );
 
+            // Initialize certificate storage and store credentials
+            match MqttCertificateStorage::new() {
+                Ok(mut cert_storage) => {
+                    match cert_storage
+                        .store_certificates(&response.data.certificates, &response.data.device_id)
+                    {
+                        Ok(_) => {
+                            info!("✅ AWS IoT Core certificates stored successfully in NVS");
+
+                            // Signal that certificates are available for MQTT initialization
+                            SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemStartup);
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to store certificates: {:?}", e);
+                            warn!("⚠️ Device will operate without MQTT functionality until certificates are stored");
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to initialize certificate storage: {:?}", e);
+                    warn!("⚠️ Device will operate without MQTT functionality");
+                }
+            }
+
             info!("🎯 Device registration completed successfully!");
 
-            Ok(())
+            Ok(response.data.device_id)
         }
         Err(e) => {
             error!("❌ Device registration failed: {}", e);
@@ -478,6 +521,11 @@ async fn wifi_only_mode_task(
                 "📶 Connecting to WiFi with stored credentials: {}",
                 credentials.ssid
             );
+            info!("🔍 DEBUG: WiFi SSID: '{}'", credentials.ssid);
+            info!("🔍 DEBUG: WiFi Password: '{}'", credentials.password);
+
+            // 🔍 DEBUG: Dump all persistent storage contents after loading
+            wifi_storage.debug_dump_storage();
 
             let wifi_config = Configuration::Client(ClientConfiguration {
                 ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
@@ -539,6 +587,10 @@ async fn wifi_only_mode_task(
                     // Clear invalid credentials
                     if let Err(e) = wifi_storage.clear_credentials() {
                         error!("Failed to clear credentials: {:?}", e);
+                    } else {
+                        info!("🔍 DEBUG: Credentials cleared successfully");
+                        // 🔍 DEBUG: Dump storage contents after clearing
+                        wifi_storage.debug_dump_storage();
                     }
 
                     // Restart device to enter BLE provisioning mode
@@ -629,6 +681,11 @@ async fn ble_provisioning_mode_task(
         // Check for received credentials (take to prevent repeated processing)
         if let Some(credentials) = ble_server.take_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
+            info!("🔍 DEBUG: Received WiFi SSID: '{}'", credentials.ssid);
+            info!(
+                "🔍 DEBUG: Received WiFi Password: '{}'",
+                credentials.password
+            );
 
             // 🎯 STAGE 2: Send processing status (if still connected)
             if ble_server.is_client_connected() {
@@ -641,6 +698,11 @@ async fn ble_provisioning_mode_task(
             match wifi_storage.store_credentials(&credentials) {
                 Ok(()) => {
                     info!("💾 WiFi credentials stored successfully");
+                    info!("🔍 DEBUG: Stored WiFi SSID: '{}'", credentials.ssid);
+                    info!("🔍 DEBUG: Stored WiFi Password: '{}'", credentials.password);
+
+                    // 🔍 DEBUG: Dump all persistent storage contents after storing
+                    wifi_storage.debug_dump_storage();
 
                     // Send storage success notification (if still connected)
                     if ble_server.is_client_connected() {
@@ -725,13 +787,22 @@ async fn test_connectivity_and_register(
     // Step 3: Register device with Acorn Pups backend
     info!("📡 Registering device with Acorn Pups backend...");
     match register_device_with_backend().await {
-        Ok(_) => {
+        Ok(registered_device_id) => {
             info!("✅ Device registration successful");
             info!("🎯 Device is now registered and ready for Acorn Pups operations");
+            info!("🔑 Registered device ID: {}", registered_device_id);
+
+            // IMPORTANT: Use the registered device_id for consistency with certificates
+            let device_id_for_mqtt = registered_device_id;
+
+            info!("🔌 AWS IoT Core certificates should now be stored, spawning MQTT task...");
+            // Note: MQTT task will wait for certificates to be available
+            // The mqtt_manager_task will check for certificate availability in a loop
         }
         Err(e) => {
             warn!("⚠️ Device registration failed: {:?}", e);
             info!("📲 Device will operate in standalone mode until next connection attempt");
+            info!("🔌 MQTT functionality will not be available without device registration");
         }
     }
 
@@ -924,5 +995,69 @@ async fn led_task(
 
         // Check system state every 250ms (responsive but not excessive)
         Timer::after(Duration::from_millis(250)).await;
+    }
+}
+
+// MQTT MANAGER TASK - Handles AWS IoT Core communication with certificate-based authentication
+#[embassy_executor::task]
+async fn mqtt_manager_task(device_id: String) {
+    info!("🔌 MQTT Manager Task started for device: {}", device_id);
+
+    // Wait for certificates to be available before initializing MQTT
+    info!("⏳ Waiting for AWS IoT Core certificates to be stored...");
+
+    // Initialize certificate storage
+    let cert_storage = loop {
+        match MqttCertificateStorage::new() {
+            Ok(mut storage) => {
+                // Check if certificates are available
+                if storage.certificates_exist() {
+                    info!("✅ AWS IoT Core certificates found in storage");
+                    break storage;
+                } else {
+                    info!("📭 No certificates found, waiting for device registration...");
+                    Timer::after(Duration::from_secs(5)).await;
+                }
+            }
+            Err(e) => {
+                error!("❌ Failed to initialize certificate storage: {:?}", e);
+                Timer::after(Duration::from_secs(10)).await;
+            }
+        }
+    };
+
+    // Initialize MQTT manager
+    let mut mqtt_manager = MqttManager::new(device_id);
+
+    match mqtt_manager.initialize(cert_storage).await {
+        Ok(_) => {
+            info!("✅ MQTT manager initialized successfully");
+
+            // Run the MQTT manager main loop
+            if let Err(e) = mqtt_manager.run().await {
+                error!("❌ MQTT manager encountered fatal error: {}", e);
+
+                // Signal system error
+                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
+                    "MQTT manager failed: {}",
+                    e
+                )));
+            }
+        }
+        Err(e) => {
+            error!("❌ Failed to initialize MQTT manager: {}", e);
+
+            // Signal system error
+            SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
+                "MQTT initialization failed: {}",
+                e
+            )));
+
+            // Task remains alive but non-functional - could implement retry logic here
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+                warn!("⚠️ MQTT manager task is inactive due to initialization failure");
+            }
+        }
     }
 }

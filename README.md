@@ -1,4 +1,4 @@
-# ESP32 WiFi Provisioning with BLE - Beginner's Guide
+# ESP32 WiFi Provisioning with BLE
 
 This project demonstrates a complete WiFi provisioning system for ESP32 microcontrollers using Bluetooth Low Energy (BLE). It's designed to be educational for developers new to Rust and embedded programming.
 
@@ -136,7 +136,7 @@ The LED task demonstrates concurrent execution:
 
 These patterns run independently of WiFi/BLE operations.
 
-## 🔍 Key Rust Concepts for Beginners
+## 🔍 Key Rust Concepts
 
 ### Ownership
 ```rust
@@ -369,16 +369,3 @@ This is a learning framework. For production use, you'd need to:
 4. **Power Management**: Optimize for battery life
 5. **OTA Updates**: Over-the-air firmware updates via WiFi
 6. **Device Management**: Cloud integration for monitoring and control
-
-## 🐛 Common Issues for Beginners
-
-### Compilation Errors
-- **"use of moved value"**: Rust ownership - you can only use a value once unless you clone it
-- **"cannot borrow as mutable"**: Need `mut` keyword for modifiable variables
-- **"async function"**: Remember to use `.await` when calling async functions
-
-### Runtime Issues
-- **Serial output**: Use `info!()`, `warn!()`, `error!()` for debugging
-- **Panic on unwrap()**: Use `match` or `if let` for better error handling
-- **Task not running**: Make sure you `spawn()` the task and the main loop doesn't exit
-
