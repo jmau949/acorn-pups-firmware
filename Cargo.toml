@@ -38,6 +38,8 @@ uuid = "1.0"
 embedded-svc = { version = "0.28", features = ["std"] }
 # Additional async utilities for MQTT coordination
 embassy-futures = "0.1"
+# Cryptographic hashing for certificate fingerprinting
+sha2 = "0.10"
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }

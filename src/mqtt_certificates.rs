@@ -314,12 +314,12 @@ impl MqttCertificateStorage {
 
     /// Generate SHA256 fingerprint of certificate for validation
     fn generate_certificate_fingerprint(&self, certificate: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
 
-        let mut hasher = DefaultHasher::new();
-        certificate.hash(&mut hasher);
-        format!("{:x}", hasher.finish())
+        let mut hasher = Sha256::new();
+        hasher.update(certificate.as_bytes());
+        let result = hasher.finalize();
+        format!("{:x}", result)
     }
 
     /// Update the last used timestamp for certificates

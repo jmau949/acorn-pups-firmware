@@ -153,29 +153,26 @@ impl MqttManager {
         }
 
         loop {
-            // Process messages from the queue
+            // Process each task in sequence with proper async coordination
+            // This avoids multiple mutable borrow issues with select!
             self.process_message_queue().await;
-
-            // Check connection health periodically
             self.check_connection_health().await;
-
-            // Handle periodic heartbeat
             self.handle_periodic_heartbeat().await;
-
-            // Handle system events
             self.handle_system_events().await;
-
-            // Small delay to prevent excessive CPU usage
-            Timer::after(Duration::from_millis(100)).await;
         }
     }
 
     /// Process incoming messages from the queue
     async fn process_message_queue(&mut self) {
-        if let Ok(message) =
-            with_timeout(Duration::from_millis(100), MQTT_MESSAGE_CHANNEL.receive()).await
-        {
-            self.handle_mqtt_message(message).await;
+        // Non-blocking message processing to avoid deadlocks
+        match MQTT_MESSAGE_CHANNEL.try_receive() {
+            Ok(message) => {
+                self.handle_mqtt_message(message).await;
+            }
+            Err(_) => {
+                // No messages available, yield to other tasks
+                Timer::after(Duration::from_millis(10)).await;
+            }
         }
     }
 
@@ -248,6 +245,8 @@ impl MqttManager {
             if now.duration_since(last_check)
                 < Duration::from_secs(CONNECTION_CHECK_INTERVAL_SECONDS)
             {
+                // Not time for check yet, yield to avoid busy waiting
+                Timer::after(Duration::from_millis(100)).await;
                 return;
             }
         }
@@ -298,6 +297,8 @@ impl MqttManager {
         if let Some(last_heartbeat) = self.last_heartbeat {
             if now.duration_since(last_heartbeat) < Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS)
             {
+                // Not time for heartbeat yet, yield to avoid busy waiting
+                Timer::after(Duration::from_millis(100)).await;
                 return;
             }
         }
