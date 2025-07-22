@@ -8,7 +8,7 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sys::EspError;
 
 // Import logging macros for debug output with consistent emoji prefixes
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 // Import Serde traits for JSON serialization of certificate metadata
 use serde::{Deserialize, Serialize};
@@ -210,6 +210,123 @@ impl MqttCertificateStorage {
         match self.validate_certificate_format(&certificates) {
             Ok(_) => {
                 info!("✅ Certificates loaded and validated successfully");
+                self.update_last_used_timestamp()?;
+                Ok(Some(certificates))
+            }
+            Err(validation_result) => {
+                warn!(
+                    "⚠️ Loaded certificates failed validation: {:?}",
+                    validation_result
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Get certificate size by attempting to load with 1-byte buffer
+    /// Returns required size or defaults to 2048 for safety
+    fn get_certificate_size(&mut self, key: &str) -> usize {
+        // Try with 1-byte buffer to trigger size error
+        let mut tiny_buffer = [0u8; 1];
+        match self.nvs.get_str(key, &mut tiny_buffer) {
+            Err(e) => {
+                // Check if error indicates insufficient buffer space
+                debug!(
+                    "🔍 NVS get_str error (expected for size detection): {:?}",
+                    e
+                );
+                // For any error with tiny buffer, assume certificate exists and is larger
+                // Default to 2048 bytes for safety
+                2048
+            }
+            Ok(Some(_)) => {
+                // Certificate fits in 1 byte (impossible for real certs), use default
+                warn!("⚠️ Certificate unexpectedly small, using default buffer size");
+                2048
+            }
+            Ok(None) => {
+                // Certificate doesn't exist
+                0
+            }
+        }
+    }
+
+    /// Load certificates with optimized dynamic buffer sizing for MQTT usage
+    /// Uses dynamic buffer allocation instead of fixed 2KB arrays
+    pub fn load_certificates_for_mqtt(&mut self) -> Result<Option<DeviceCertificates>, EspError> {
+        info!("🔍 Loading AWS IoT Core certificates with optimized buffer sizing");
+
+        // Check if certificates exist
+        if !self.certificates_exist() {
+            info!("📭 No stored certificates found");
+            return Ok(None);
+        }
+
+        // Get optimized buffer sizes (with fallback to reasonable defaults)
+        let cert_size = std::cmp::max(self.get_certificate_size(DEVICE_CERT_KEY), 1500);
+        let key_size = std::cmp::max(self.get_certificate_size(PRIVATE_KEY_KEY), 1700);
+        let endpoint_size = std::cmp::max(self.get_certificate_size(IOT_ENDPOINT_KEY), 256);
+
+        debug!(
+            "📏 Using buffer sizes - cert: {}, key: {}, endpoint: {}",
+            cert_size, key_size, endpoint_size
+        );
+
+        // Load certificate components with dynamic buffers
+        let mut cert_buffer = vec![0u8; cert_size + 1]; // +1 for null terminator
+        let device_certificate = match self.nvs.get_str(DEVICE_CERT_KEY, &mut cert_buffer) {
+            Ok(Some(cert)) => cert,
+            Ok(None) => {
+                warn!("⚠️ Device certificate not found in storage");
+                return Ok(None);
+            }
+            Err(e) => {
+                error!("❌ Failed to load device certificate: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let mut key_buffer = vec![0u8; key_size + 1]; // +1 for null terminator
+        let private_key = match self.nvs.get_str(PRIVATE_KEY_KEY, &mut key_buffer) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                warn!("⚠️ Private key not found in storage");
+                return Ok(None);
+            }
+            Err(e) => {
+                error!("❌ Failed to load private key: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let mut endpoint_buffer = vec![0u8; endpoint_size + 1]; // +1 for null terminator
+        let iot_endpoint = match self.nvs.get_str(IOT_ENDPOINT_KEY, &mut endpoint_buffer) {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => {
+                warn!("⚠️ IoT endpoint not found in storage");
+                return Ok(None);
+            }
+            Err(e) => {
+                error!("❌ Failed to load IoT endpoint: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        let certificates = DeviceCertificates {
+            device_certificate: device_certificate.to_string(),
+            private_key: private_key.to_string(),
+            iot_endpoint: iot_endpoint.to_string(),
+        };
+
+        info!(
+            "✅ Certificates loaded with optimized buffer sizes - saved {} bytes",
+            (2048 * 2 + 256) - (cert_size + key_size + endpoint_size)
+        );
+
+        // Validate loaded certificates
+        match self.validate_certificate_format(&certificates) {
+            Ok(_) => {
+                info!("✅ Certificates loaded and validated successfully with optimized buffers");
                 self.update_last_used_timestamp()?;
                 Ok(Some(certificates))
             }

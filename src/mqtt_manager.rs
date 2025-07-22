@@ -106,7 +106,7 @@ impl MqttManager {
 
         self.cert_storage = Some(cert_storage);
 
-        // Load certificates and initialize MQTT client
+        // Load certificates with optimized buffer sizing and initialize MQTT client
         if let Some(ref mut storage) = self.cert_storage {
             match self.client.initialize_with_certificates(storage).await {
                 Ok(_) => {

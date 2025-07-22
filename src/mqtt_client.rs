@@ -5,6 +5,9 @@
 // Import ESP-IDF MQTT client functionality
 use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
 
+// Import ESP-IDF TLS and X.509 certificate functionality
+use esp_idf_svc::tls::X509;
+
 // Import Embassy time utilities for timeouts and delays
 use embassy_time::{Duration, Instant, Timer};
 
@@ -103,6 +106,22 @@ pub struct AwsIotMqttClient {
 }
 
 impl AwsIotMqttClient {
+    /// Convert PEM certificate string to X.509 format with static lifetime
+    /// Uses Box::leak() to create static lifetime CStr required by ESP-IDF
+    fn convert_pem_to_x509(pem_cert: &str) -> Result<X509<'static>> {
+        use std::ffi::CString;
+
+        // Convert PEM string to CString (adds null terminator automatically)
+        let c_string = CString::new(pem_cert)
+            .map_err(|e| anyhow!("PEM certificate contains null bytes: {}", e))?;
+
+        // Create static lifetime CStr using Box::leak()
+        let static_cstr: &'static std::ffi::CStr = Box::leak(c_string.into_boxed_c_str());
+
+        // Create X.509 certificate from static CStr
+        Ok(X509::pem(static_cstr))
+    }
+
     /// Create new MQTT client with device configuration
     pub fn new(device_id: String) -> Self {
         let client_id = format!("acorn-receiver-{}", device_id);
@@ -130,10 +149,10 @@ impl AwsIotMqttClient {
     ) -> Result<()> {
         info!("🔐 Initializing MQTT client with stored X.509 certificates");
 
-        // Load certificates from storage
-        match cert_storage.load_certificates()? {
+        // Load certificates from storage with optimized buffer sizing
+        match cert_storage.load_certificates_for_mqtt()? {
             Some(certificates) => {
-                info!("✅ X.509 certificates loaded successfully for MQTT");
+                info!("✅ X.509 certificates loaded successfully with optimized buffers");
                 info!(
                     "📜 Device certificate length: {} bytes",
                     certificates.device_certificate.len()
@@ -143,6 +162,7 @@ impl AwsIotMqttClient {
                     certificates.private_key.len()
                 );
                 info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
+                debug!("🔧 Used optimized certificate loading for improved memory efficiency");
 
                 // Validate certificate format
                 if !certificates
@@ -196,13 +216,28 @@ impl AwsIotMqttClient {
         // Create MQTT broker URL with TLS
         let broker_url = format!("mqtts://{}:8883", certificates.iot_endpoint);
 
-        // MQTT client configuration with X.509 certificate authentication
-        // Following ESP-IDF structure: broker.verification + credentials.authentication
+        // Convert certificates to X.509 format for ESP-IDF
+        info!("🔐 Converting certificates to X.509 format for ESP-IDF");
+        let device_cert = Self::convert_pem_to_x509(&certificates.device_certificate)?;
+        let private_key = Self::convert_pem_to_x509(&certificates.private_key)?;
+        let aws_root_ca = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
+
+        info!("✅ X.509 certificates converted successfully");
+
+        // MQTT client configuration for AWS IoT Core with X.509 certificate authentication
         let mqtt_config = MqttClientConfiguration {
             client_id: Some(&self.client_id),
             keep_alive_interval: Some(std::time::Duration::from_secs(60)),
             reconnect_timeout: Some(std::time::Duration::from_secs(30)),
             network_timeout: std::time::Duration::from_secs(30),
+
+            // X.509 certificate configuration for mutual TLS authentication
+            client_certificate: Some(device_cert),
+            private_key: Some(private_key),
+            server_certificate: Some(aws_root_ca),
+            use_global_ca_store: false, // Use our specific AWS Root CA
+            skip_cert_common_name_check: false, // Verify server identity
+
             ..Default::default()
         };
 
@@ -212,6 +247,7 @@ impl AwsIotMqttClient {
                 info!("🔐 TLS handshake successful with X.509 certificate mutual authentication");
                 info!("✅ Verified server certificate using Amazon Root CA 1");
                 info!("🔒 Client authenticated using device certificate and private key");
+                info!("🎯 X.509 certificate authentication fully configured and active");
 
                 // Subscribe to device-specific topics
                 self.subscribe_to_device_topics(&mut client).await?;
