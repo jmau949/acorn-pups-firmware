@@ -25,6 +25,9 @@ use esp_idf_svc::hal::gpio::PinDriver;
 // Peripherals contains references to GPIO pins, SPI, I2C, WiFi, etc.
 use esp_idf_svc::hal::peripherals::Peripherals;
 
+// Import NVS (Non-Volatile Storage) types for flash storage debugging
+use esp_idf_svc::nvs::{EspNvs, NvsDefault};
+
 // Import modem for BLE functionality
 use esp_idf_svc::hal::modem::Modem;
 
@@ -133,6 +136,174 @@ impl SystemState {
     }
 }
 
+/// Comprehensive NVS flash storage dump function
+/// This dumps all namespaces and their key-value pairs for debugging
+fn dump_entire_nvs_storage(nvs_partition: &EspDefaultNvsPartition) {
+    info!("🔍 Starting comprehensive NVS flash storage analysis...");
+    info!("📱 NVS Partition: Initialized and ready");
+
+    // List of known namespaces to check
+    let known_namespaces = [
+        "nvs.net80211",  // WiFi system data
+        "wifi_config",   // Our WiFi credentials
+        "reset_pending", // Reset notification data
+        "mqtt_certs",    // MQTT certificates
+        "acorn_device",  // Device-specific data
+        "nvs",           // Default namespace
+        "phy_init",      // PHY calibration data
+        "tcpip_adapter", // TCP/IP adapter config
+    ];
+
+    info!("🔍 Checking {} known namespaces...", known_namespaces.len());
+
+    for namespace in &known_namespaces {
+        info!("🔍 === Checking namespace: '{}' ===", namespace);
+
+        match EspNvs::new(nvs_partition.clone(), namespace, true) {
+            Ok(nvs_handle) => {
+                info!("✅ Opened namespace '{}' successfully", namespace);
+                dump_namespace_contents(&nvs_handle, namespace);
+            }
+            Err(e) => {
+                info!("📭 Namespace '{}' not found or empty: {:?}", namespace, e);
+            }
+        }
+    }
+
+    info!("🔍 NVS flash storage dump completed");
+}
+
+/// Dump known keys from a specific NVS namespace
+fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
+    info!(
+        "📂 Attempting to dump known keys from namespace: '{}'",
+        namespace
+    );
+
+    // Known keys for different namespaces
+    let known_keys = match namespace {
+        "wifi_config" => vec!["ssid", "password", "last_connected"],
+        "reset_pending" => vec!["device_id", "reset_timestamp", "old_cert_arn", "reason"],
+        "mqtt_certs" => vec![
+            "device_cert",
+            "private_key",
+            "ca_cert",
+            "iot_endpoint",
+            "device_id",
+        ],
+        "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
+        _ => vec![""], // Try empty key for other namespaces
+    };
+
+    let mut found_keys = 0;
+
+    for key in &known_keys {
+        if key.is_empty() && namespace != "nvs" {
+            continue;
+        }
+
+        // Try reading as string first
+        match nvs_handle.get_str(key, &mut [0u8; 512]) {
+            Ok(Some(value)) => {
+                info!("   📝 '{}' = '{}' (string)", key, value);
+                found_keys += 1;
+                continue;
+            }
+            Ok(None) => {
+                // Key doesn't exist as string, try other types
+            }
+            Err(_) => {
+                // Not a string, try other types
+            }
+        }
+
+        // Try reading as blob
+        let mut buffer = vec![0u8; 1024];
+        match nvs_handle.get_blob(key, &mut buffer) {
+            Ok(Some(blob_data)) => {
+                let size = blob_data.len();
+                info!("   💾 '{}' = <blob {} bytes>", key, size);
+
+                // Display first 32 bytes as hex if data exists
+                if size > 0 {
+                    let display_bytes = std::cmp::min(size, 32);
+                    let hex_string: String = blob_data[..display_bytes]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    info!(
+                        "       Hex: {} {}",
+                        hex_string,
+                        if size > 32 { "..." } else { "" }
+                    );
+
+                    // Try to display as UTF-8 if possible
+                    if let Ok(utf8_str) = std::str::from_utf8(blob_data) {
+                        let display_str = if utf8_str.len() > 64 {
+                            format!("{}...", &utf8_str[..64])
+                        } else {
+                            utf8_str.to_string()
+                        };
+                        info!("       UTF8: '{}'", display_str);
+                    }
+                }
+                found_keys += 1;
+                continue;
+            }
+            Ok(None) => {
+                // Not a blob
+            }
+            Err(_) => {
+                // Error reading as blob
+            }
+        }
+
+        // Try reading as u32
+        match nvs_handle.get_u32(key) {
+            Ok(Some(value)) => {
+                info!("   🔢 '{}' = {} (u32)", key, value);
+                found_keys += 1;
+                continue;
+            }
+            Ok(None) => {
+                // Not a u32
+            }
+            Err(_) => {
+                // Error reading as u32
+            }
+        }
+
+        // Try reading as u64
+        match nvs_handle.get_u64(key) {
+            Ok(Some(value)) => {
+                info!("   🔢 '{}' = {} (u64)", key, value);
+                found_keys += 1;
+                continue;
+            }
+            Ok(None) => {
+                // Not a u64
+            }
+            Err(_) => {
+                // Error reading as u64
+            }
+        }
+
+        // Key not found in any format
+        debug!("   ❓ '{}' = <not found>", key);
+    }
+
+    if found_keys == 0 {
+        info!("📭 No known keys found in namespace '{}'", namespace);
+    } else {
+        info!(
+            "📊 Found {} known keys in namespace '{}'",
+            found_keys, namespace
+        );
+    }
+}
+
 // The #[embassy_executor::main] attribute transforms this function into the main async runtime
 // This is similar to #[tokio::main] but optimized for embedded systems
 // It sets up the Embassy executor and starts our async main function
@@ -200,6 +371,13 @@ async fn main(spawner: Spawner) {
 
     info!("🔧 Initializing shared resources in main() to avoid NVS conflicts");
 
+    // ========================================================================
+    // 🔍 COMPREHENSIVE NVS FLASH STORAGE DUMP
+    // ========================================================================
+    info!("🔍 ===== COMPLETE NVS FLASH STORAGE DUMP =====");
+    dump_entire_nvs_storage(&nvs);
+    info!("🔍 ===== END NVS FLASH STORAGE DUMP =====");
+
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
     let mut wifi_storage = match WiFiStorage::new_with_partition(nvs.clone()) {
@@ -218,8 +396,79 @@ async fn main(spawner: Spawner) {
         }
     };
 
+    // // ========================================================================
+    // // 🧪 TEMPORARY TEST CODE - REMOVE AFTER HARDWARE TESTING
+    // // ========================================================================
+    // info!("🧪 TEMPORARY: Starting immediate factory reset test");
+
+    // // Initialize reset storage for the test using existing NVS partition
+    // let reset_storage = match ResetStorage::new_with_partition(nvs.clone()) {
+    //     Ok(storage) => {
+    //         info!("✅ Test reset storage initialized");
+    //         storage
+    //     }
+    //     Err(e) => {
+    //         error!("❌ Failed to initialize test reset storage: {:?}", e);
+    //         return;
+    //     }
+    // };
+
+    // // Generate device ID for reset handler
+    // let test_device_id = generate_device_id();
+
+    // // Initialize reset handler
+    // let mut reset_handler = ResetHandler::new(test_device_id.clone());
+    // if let Err(e) = reset_handler.initialize_storage(reset_storage) {
+    //     error!("❌ Failed to initialize test reset handler storage: {}", e);
+    //     return;
+    // }
+
+    // // Initialize NVS partition for selective erasure
+    // if let Err(e) = reset_handler.initialize_nvs_partition(nvs.clone()) {
+    //     error!("❌ Failed to initialize reset handler NVS partition: {}", e);
+    //     return;
+    // }
+
+    // info!("🧪 Test reset handler initialized successfully");
+
+    // // Create dummy reset data for testing
+    // use reset_storage::ResetNotificationData;
+    // let test_reset_data = ResetNotificationData {
+    //     device_id: test_device_id.clone(),
+    //     reset_timestamp: std::time::SystemTime::now()
+    //         .duration_since(std::time::UNIX_EPOCH)
+    //         .unwrap_or_default()
+    //         .as_secs()
+    //         .to_string(),
+    //     old_cert_arn: "arn:aws:iot:us-west-2:123456789012:cert/test-hardware-reset".to_string(),
+    //     reason: "hardware_test_factory_reset".to_string(),
+    // };
+
+    // info!("🧪 Executing test factory reset...");
+
+    // // Execute offline reset (since we're testing early in startup before WiFi)
+    // match reset_handler.execute_offline_reset(test_reset_data).await {
+    //     Ok(_) => {
+    //         info!("✅ Test factory reset completed successfully");
+    //         info!("🔄 Device should reboot now...");
+    //         // Device will restart, so execution stops here
+    //         return;
+    //     }
+    //     Err(e) => {
+    //         error!("❌ Test factory reset failed: {}", e);
+    //         info!("🧪 Continuing with normal startup...");
+    //     }
+    // }
+
+    // // ========================================================================
+    // // 🧪 END TEMPORARY TEST CODE
+    // // ========================================================================
+
     // Check WiFi credentials to determine device mode
     info!("🔧 Checking WiFi credentials to determine device mode...");
+
+    // Generate device ID for potential use in both modes
+    let device_id = generate_device_id();
 
     if wifi_storage.has_stored_credentials() {
         info!("✅ WiFi credentials found - Starting in WiFi-only mode");
@@ -235,6 +484,13 @@ async fn main(spawner: Spawner) {
             return;
         }
 
+        // Spawn the MQTT manager task - only for WiFi-only mode
+        if let Err(_) = spawner.spawn(mqtt_manager_task(device_id.clone())) {
+            error!("Failed to spawn MQTT manager task");
+            return;
+        }
+
+        info!("🔌 MQTT manager task spawned - will activate after device registration");
         info!("📶 Device operating in WiFi-only mode - BLE disabled");
     } else {
         info!("📻 No WiFi credentials found - Starting in BLE provisioning mode");
@@ -257,7 +513,7 @@ async fn main(spawner: Spawner) {
             return;
         }
 
-        info!("📱 Device operating in BLE provisioning mode - WiFi disabled");
+        info!("📱 Device operating in BLE provisioning mode - WiFi and MQTT disabled");
     }
 
     // Spawn the LED status task - provides BLE connection status visual feedback
@@ -266,19 +522,9 @@ async fn main(spawner: Spawner) {
         return;
     }
 
-    // Spawn the MQTT manager task - handles AWS IoT Core communication
-    // Task will wait for certificates to be available before initializing
-    let mqtt_device_id = generate_device_id(); // Generate device ID for MQTT
-    if let Err(_) = spawner.spawn(mqtt_manager_task(mqtt_device_id.clone())) {
-        error!("Failed to spawn MQTT manager task");
-        return;
-    }
-
-    info!("🔌 MQTT manager task spawned - will activate after device registration");
-
     // Spawn the reset manager task - handles physical reset button monitoring
     if let Err(_) = spawner.spawn(reset_manager_task(
-        mqtt_device_id.clone(),
+        device_id.clone(),
         nvs.clone(),
         peripherals.pins.gpio0,
     )) {
@@ -1127,6 +1373,12 @@ async fn reset_manager_task(
     let mut reset_handler = ResetHandler::new(device_id.clone());
     if let Err(e) = reset_handler.initialize_storage(reset_storage) {
         error!("❌ Failed to initialize reset handler storage: {}", e);
+        return;
+    }
+
+    // Initialize NVS partition for selective erasure
+    if let Err(e) = reset_handler.initialize_nvs_partition(nvs_partition.clone()) {
+        error!("❌ Failed to initialize reset handler NVS partition: {}", e);
         return;
     }
 
