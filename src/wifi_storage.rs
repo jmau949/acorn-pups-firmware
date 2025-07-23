@@ -3,8 +3,8 @@
 // Data stored in NVS survives device reboots and power cycles
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
-// Import ESP-IDF error type for operation results
-use esp_idf_svc::sys::EspError;
+// Import anyhow for consistent error handling
+use anyhow::{anyhow, Result};
 
 // Import logging macros for debug output
 use log::{error, info, warn};
@@ -40,150 +40,156 @@ pub struct WiFiStorage {
 }
 
 impl WiFiStorage {
+    /// Create new WiFi storage instance with default NVS partition
+    pub fn new() -> Result<Self> {
+        info!("Initializing WiFi storage with default NVS partition");
+
+        // Take the default NVS partition
+        let nvs_partition = EspDefaultNvsPartition::take()
+            .map_err(|e| anyhow!("Failed to take NVS partition: {}", e))?;
+
+        Self::new_with_partition(nvs_partition)
+    }
+
     /// Create WiFi storage using provided NVS partition
-    pub fn new_with_partition(nvs_partition: EspDefaultNvsPartition) -> Result<Self, EspError> {
+    pub fn new_with_partition(nvs_partition: EspDefaultNvsPartition) -> Result<Self> {
         info!("Initializing WiFi storage with provided NVS partition");
 
         // Open the NVS namespace for WiFi configuration
-        let nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)?;
+        let nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)
+            .map_err(|e| anyhow!("Failed to open WiFi NVS namespace: {}", e))?;
 
         info!("WiFi storage initialized successfully");
 
         Ok(Self { nvs })
     }
 
-    /// Create WiFi storage by taking the default NVS partition
-    /// Note: Will fail if partition is already taken elsewhere
-    pub fn new() -> Result<Self, EspError> {
-        info!("Initializing WiFi storage with default NVS partition");
-
-        let nvs_default_partition = EspDefaultNvsPartition::take()?;
-        let nvs = EspNvs::new(nvs_default_partition, NVS_NAMESPACE, true)?;
-
-        info!("WiFi storage initialized successfully");
-
-        Ok(Self { nvs })
-    }
-
-    pub fn store_credentials(&mut self, credentials: &WiFiCredentials) -> Result<(), EspError> {
+    /// Store WiFi credentials in NVS flash memory
+    pub fn store_credentials(&mut self, credentials: &WiFiCredentials) -> Result<()> {
         info!("Storing WiFi credentials for SSID: {}", credentials.ssid);
 
         // Validate credentials before storing
-        if !self.validate_credentials(credentials) {
-            error!("Invalid credentials provided for storage");
-            return Err(EspError::from_infallible::<
-                { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
-            >());
+        if credentials.ssid.is_empty() {
+            return Err(anyhow!("SSID cannot be empty"));
         }
 
-        // Create stored config with metadata
-        let stored_config = StoredWiFiConfig {
+        // Store basic credentials
+        self.nvs
+            .set_str(SSID_KEY, &credentials.ssid)
+            .map_err(|e| anyhow!("Failed to store SSID: {}", e))?;
+        self.nvs
+            .set_str(PASSWORD_KEY, &credentials.password)
+            .map_err(|e| anyhow!("Failed to store password: {}", e))?;
+
+        // Create extended configuration with metadata
+        let config = StoredWiFiConfig {
             ssid: credentials.ssid.clone(),
             password: credentials.password.clone(),
-            timestamp: self.get_current_timestamp(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             is_valid: true,
         };
 
-        // Serialize the config to JSON
-        match serde_json::to_string(&stored_config) {
-            Ok(json_str) => {
-                // Store the serialized config in NVS
-                self.nvs.set_str(WIFI_CONFIG_KEY, &json_str)?;
+        // Store complete configuration as JSON
+        let config_json = serde_json::to_string(&config)
+            .map_err(|e| anyhow!("Failed to serialize WiFi config: {}", e))?;
 
-                // Also store individual fields for backward compatibility
-                self.nvs.set_str(SSID_KEY, &credentials.ssid)?;
-                self.nvs.set_str(PASSWORD_KEY, &credentials.password)?;
+        self.nvs
+            .set_str(WIFI_CONFIG_KEY, &config_json)
+            .map_err(|e| anyhow!("Failed to store WiFi config: {}", e))?;
 
-                info!("WiFi credentials stored successfully in NVS");
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to serialize WiFi config: {}", e);
-                Err(EspError::from_infallible::<
-                    { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
-                >())
-            }
-        }
+        info!("WiFi credentials stored successfully");
+        Ok(())
     }
 
-    pub fn load_credentials(&mut self) -> Result<Option<WiFiCredentials>, EspError> {
+    /// Load WiFi credentials from NVS flash memory
+    pub fn load_credentials(&mut self) -> Result<Option<WiFiCredentials>> {
         info!("Loading WiFi credentials from NVS");
 
-        // Try to load the complete config first
-        match self.nvs.get_str(WIFI_CONFIG_KEY, &mut [0u8; 512]) {
-            Ok(Some(json_str)) => match serde_json::from_str::<StoredWiFiConfig>(&json_str) {
-                Ok(config) if config.is_valid => {
-                    info!("Loaded WiFi config for SSID: {}", config.ssid);
-                    Ok(Some(WiFiCredentials {
-                        ssid: config.ssid,
-                        password: config.password,
-                    }))
-                }
-                Ok(_) => {
-                    warn!("Found invalid WiFi config in storage");
-                    Ok(None)
-                }
-                Err(e) => {
-                    warn!("Failed to parse stored WiFi config: {}", e);
-                    self.load_credentials_fallback()
-                }
-            },
-            Ok(None) => {
-                info!("No WiFi config found in NVS, trying fallback method");
-                self.load_credentials_fallback()
-            }
-            Err(e) => {
-                warn!("Error reading WiFi config: {:?}, trying fallback", e);
-                self.load_credentials_fallback()
+        // Try to load from complete JSON config first
+        if let Ok(Some(config)) = self.load_config() {
+            if config.is_valid {
+                info!("Loaded WiFi credentials for SSID: {}", config.ssid);
+                return Ok(Some(WiFiCredentials {
+                    ssid: config.ssid,
+                    password: config.password,
+                }));
             }
         }
+
+        // Fallback to loading individual keys
+        self.load_credentials_fallback()
     }
 
-    fn load_credentials_fallback(&mut self) -> Result<Option<WiFiCredentials>, EspError> {
-        // Try to load individual SSID and password fields
-        let mut ssid_read_buffer = [0u8; 64];
-        let mut password_read_buffer = [0u8; 64];
+    /// Internal method to load credentials from individual NVS keys
+    fn load_credentials_fallback(&mut self) -> Result<Option<WiFiCredentials>> {
+        let mut ssid_buf = [0u8; 32];
+        let mut password_buf = [0u8; 64];
 
-        let ssid = match self.nvs.get_str(SSID_KEY, &mut ssid_read_buffer)? {
-            Some(ssid) if !ssid.is_empty() => ssid,
-            _ => {
-                info!("No SSID found in NVS storage");
+        let ssid = match self
+            .nvs
+            .get_str(SSID_KEY, &mut ssid_buf)
+            .map_err(|e| anyhow!("Failed to load SSID: {}", e))?
+        {
+            Some(ssid) => ssid,
+            None => {
+                info!("No WiFi credentials found in NVS");
                 return Ok(None);
             }
         };
 
-        let password = match self.nvs.get_str(PASSWORD_KEY, &mut password_read_buffer)? {
+        let password = match self
+            .nvs
+            .get_str(PASSWORD_KEY, &mut password_buf)
+            .map_err(|e| anyhow!("Failed to load password: {}", e))?
+        {
             Some(password) => password,
             None => {
-                warn!("SSID found but no password in storage");
+                warn!("SSID found but password missing - clearing incomplete credentials");
+                let _ = self.clear_credentials();
                 return Ok(None);
             }
         };
 
-        let credentials = WiFiCredentials {
+        info!("Loaded WiFi credentials for SSID: {}", ssid);
+        Ok(Some(WiFiCredentials {
             ssid: ssid.to_string(),
             password: password.to_string(),
-        };
-
-        if self.validate_credentials(&credentials) {
-            info!("Loaded WiFi credentials from fallback storage");
-            Ok(Some(credentials))
-        } else {
-            warn!("Invalid credentials found in storage");
-            Ok(None)
-        }
+        }))
     }
 
-    pub fn clear_credentials(&mut self) -> Result<(), EspError> {
-        info!("Clearing stored WiFi credentials");
+    /// Clear all WiFi credentials from NVS
+    pub fn clear_credentials(&mut self) -> Result<()> {
+        info!("Clearing WiFi credentials from NVS");
 
-        // Remove all WiFi-related keys
-        let _ = self.nvs.remove(WIFI_CONFIG_KEY);
+        // Remove individual keys
         let _ = self.nvs.remove(SSID_KEY);
         let _ = self.nvs.remove(PASSWORD_KEY);
+        let _ = self.nvs.remove(WIFI_CONFIG_KEY);
 
-        info!("WiFi credentials cleared from storage");
+        info!("WiFi credentials cleared successfully");
         Ok(())
+    }
+
+    /// Load complete WiFi configuration from JSON
+    fn load_config(&mut self) -> Result<Option<StoredWiFiConfig>> {
+        let mut config_buf = [0u8; 256];
+
+        let config_json = match self
+            .nvs
+            .get_str(WIFI_CONFIG_KEY, &mut config_buf)
+            .map_err(|e| anyhow!("Failed to load WiFi config: {}", e))?
+        {
+            Some(json) => json,
+            None => return Ok(None),
+        };
+
+        let config: StoredWiFiConfig = serde_json::from_str(config_json)
+            .map_err(|e| anyhow!("Failed to parse WiFi config JSON: {}", e))?;
+
+        Ok(Some(config))
     }
 
     pub fn has_stored_credentials(&mut self) -> bool {
@@ -227,69 +233,26 @@ impl WiFiStorage {
             .as_secs()
     }
 
-    /// Debug method to dump all persistent storage contents
+    /// Debug utility to display current WiFi storage contents
     pub fn debug_dump_storage(&mut self) {
-        info!(
-            "🔍 DEBUG: Dumping all persistent storage contents for namespace '{}'",
-            NVS_NAMESPACE
-        );
+        info!("🔍 DEBUG: WiFi storage contents:");
 
-        // Try to read the complete WiFi config JSON
-        let mut config_buffer = [0u8; 512];
-        match self.nvs.get_str(WIFI_CONFIG_KEY, &mut config_buffer) {
-            Ok(Some(json_str)) => {
-                info!("🔍 DEBUG: {} = '{}'", WIFI_CONFIG_KEY, json_str);
-
-                // Try to parse and display structured data
-                match serde_json::from_str::<StoredWiFiConfig>(&json_str) {
-                    Ok(config) => {
-                        info!("🔍 DEBUG:   Parsed Config:");
-                        info!("🔍 DEBUG:     SSID: '{}'", config.ssid);
-                        info!("🔍 DEBUG:     Password: '{}'", config.password);
-                        info!("🔍 DEBUG:     Timestamp: {}", config.timestamp);
-                        info!("🔍 DEBUG:     Is Valid: {}", config.is_valid);
-                    }
-                    Err(e) => {
-                        warn!("🔍 DEBUG:   Failed to parse JSON config: {}", e);
-                    }
-                }
+        match self.load_credentials() {
+            Ok(Some(creds)) => {
+                info!("  SSID: {}", creds.ssid);
+                info!("  Password: [REDACTED - {} chars]", creds.password.len());
             }
-            Ok(None) => {
-                info!("🔍 DEBUG: {} = <not found>", WIFI_CONFIG_KEY);
-            }
-            Err(e) => {
-                warn!("🔍 DEBUG: {} = <read error: {:?}>", WIFI_CONFIG_KEY, e);
-            }
+            Ok(None) => info!("  No credentials stored"),
+            Err(e) => info!("  Error loading credentials: {}", e),
         }
 
-        // Try to read individual SSID field
-        let mut ssid_buffer = [0u8; 64];
-        match self.nvs.get_str(SSID_KEY, &mut ssid_buffer) {
-            Ok(Some(ssid)) => {
-                info!("🔍 DEBUG: {} = '{}'", SSID_KEY, ssid);
+        match self.load_config() {
+            Ok(Some(config)) => {
+                info!("  Config timestamp: {}", config.timestamp);
+                info!("  Config valid: {}", config.is_valid);
             }
-            Ok(None) => {
-                info!("🔍 DEBUG: {} = <not found>", SSID_KEY);
-            }
-            Err(e) => {
-                warn!("🔍 DEBUG: {} = <read error: {:?}>", SSID_KEY, e);
-            }
+            Ok(None) => info!("  No config found"),
+            Err(e) => info!("  Error loading config: {}", e),
         }
-
-        // Try to read individual password field
-        let mut password_buffer = [0u8; 64];
-        match self.nvs.get_str(PASSWORD_KEY, &mut password_buffer) {
-            Ok(Some(password)) => {
-                info!("🔍 DEBUG: {} = '{}'", PASSWORD_KEY, password);
-            }
-            Ok(None) => {
-                info!("🔍 DEBUG: {} = <not found>", PASSWORD_KEY);
-            }
-            Err(e) => {
-                warn!("🔍 DEBUG: {} = <read error: {:?}>", PASSWORD_KEY, e);
-            }
-        }
-
-        info!("🔍 DEBUG: End of persistent storage dump");
     }
 }
