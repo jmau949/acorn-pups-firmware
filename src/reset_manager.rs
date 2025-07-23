@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 // Import our reset storage module and system events
 use crate::reset_storage::{ResetNotificationData, ResetStorage};
-use crate::{SystemEvent, SYSTEM_EVENT_SIGNAL, SYSTEM_STATE};
+use crate::SYSTEM_STATE;
 
 // Reset button configuration constants
 const RESET_BUTTON_GPIO: u32 = 0; // GPIO0 is commonly used for reset/boot button on ESP32
@@ -48,7 +48,10 @@ pub enum ResetEvent {
 pub enum ResetManagerEvent {
     ResetButtonPressed,
     ResetInitiated,
-    ResetInProgress,
+    ResetTriggered {
+        wifi_available: bool,
+        reset_data: ResetNotificationData,
+    },
     ResetCompleted,
     ResetError(String),
 }
@@ -199,7 +202,6 @@ impl ResetManager {
 
         // Button held for required duration - trigger reset
         info!("🔥 Reset button held for required time - triggering reset");
-        RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetInProgress);
 
         // Check WiFi connectivity
         let wifi_available = self.check_wifi_connectivity().await;
@@ -263,12 +265,12 @@ impl ResetManager {
 
             ResetEvent::ResetCompleted => {
                 info!("✅ Reset completed successfully");
-                RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetCompleted);
+                // Reset completion is now handled by reset_handler directly
             }
 
             ResetEvent::ResetError(error) => {
                 error!("❌ Reset error occurred: {}", error);
-                RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetError(error));
+                // Reset errors are now handled by reset_handler directly
             }
 
             ResetEvent::ButtonPressed | ResetEvent::ButtonReleased => {
@@ -289,7 +291,7 @@ impl ResetManager {
         }
 
         info!(
-            "🚀 Executing reset process - WiFi available: {}",
+            "🚀 Triggering reset process - WiFi available: {}",
             wifi_available
         );
 
@@ -301,128 +303,17 @@ impl ResetManager {
             reason: "physical_button_reset".to_string(),
         };
 
-        let result = if wifi_available {
-            // Online reset: Send immediate notification then reset
-            info!("🌐 Performing online reset with immediate notification");
-            self.execute_online_reset(reset_data).await
-        } else {
-            // Offline reset: Store notification for later delivery
-            info!("📴 Performing offline reset with deferred notification");
-            self.execute_offline_reset(reset_data).await
-        };
+        // Signal that reset is triggered - delegate execution to reset_handler
+        RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetTriggered {
+            wifi_available,
+            reset_data,
+        });
 
-        // Clear reset in progress flag
+        info!("📡 Reset trigger signal sent to reset handler");
+
+        // Reset manager's job is done - reset_handler will take over
+        // Clear reset in progress flag will be handled by reset_handler
         RESET_IN_PROGRESS.store(false, Ordering::SeqCst);
-
-        result
-    }
-
-    /// Execute online reset with immediate MQTT notification
-    async fn execute_online_reset(&mut self, reset_data: ResetNotificationData) -> Result<()> {
-        info!("🌐 Executing online reset with immediate notification");
-
-        // Send reset notification via MQTT (handled by reset_handler)
-        // This will be implemented when we create the reset_handler module
-        // For now, we'll use the existing MQTT system to send the notification
-
-        // Import MQTT message types for reset notification
-        use crate::mqtt_manager::{MqttMessage, MQTT_MESSAGE_CHANNEL};
-
-        // Create a device status message to indicate reset (temporary solution)
-        let reset_message = MqttMessage::DeviceStatus {
-            status: format!("reset_cleanup: {}", serde_json::to_string(&reset_data)?),
-            wifi_signal: None,
-        };
-
-        // Send reset notification via MQTT
-        MQTT_MESSAGE_CHANNEL.sender().send(reset_message).await;
-
-        info!("📤 Reset notification sent via MQTT");
-
-        // Wait for MQTT confirmation (with timeout)
-        if let Err(_) = with_timeout(
-            Duration::from_millis(WIFI_CHECK_TIMEOUT_MS),
-            Timer::after(Duration::from_secs(2)),
-        )
-        .await
-        {
-            warn!("⚠️ MQTT notification timeout, proceeding with reset");
-        }
-
-        // Perform factory reset
-        self.perform_factory_reset().await?;
-
-        Ok(())
-    }
-
-    /// Execute offline reset with deferred notification storage
-    async fn execute_offline_reset(&mut self, reset_data: ResetNotificationData) -> Result<()> {
-        info!("📴 Executing offline reset with deferred notification");
-
-        // Store reset notification for deferred delivery
-        if let Some(ref mut storage) = self.reset_storage {
-            // Retry storage operation up to 3 times
-            let mut retry_count = 0;
-            while retry_count < 3 {
-                match storage.store_reset_notification(&reset_data) {
-                    Ok(_) => {
-                        info!("💾 Reset notification stored for deferred delivery");
-                        break;
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        error!(
-                            "❌ Failed to store reset notification (attempt {}): {}",
-                            retry_count, e
-                        );
-                        if retry_count >= 3 {
-                            error!(
-                                "❌ Failed to store reset notification after {} attempts",
-                                retry_count
-                            );
-                            return Err(anyhow!("Critical: Unable to store reset notification for deferred delivery"));
-                        }
-                        Timer::after(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        } else {
-            error!("❌ Reset storage not available, cannot store notification");
-            return Err(anyhow!(
-                "Critical: Reset storage not available for deferred notification"
-            ));
-        }
-
-        // Perform factory reset
-        self.perform_factory_reset().await?;
-
-        Ok(())
-    }
-
-    /// Perform the actual factory reset
-    async fn perform_factory_reset(&mut self) -> Result<()> {
-        info!("🔥 Performing factory reset");
-
-        // Signal system that reset is in progress
-        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(
-            "Factory reset in progress".to_string(),
-        ));
-
-        // Wait a moment for the signal to be processed
-        Timer::after(Duration::from_millis(500)).await;
-
-        // This would normally trigger a system reboot
-        // For safety in development, we'll just log the action
-        info!("🔄 Factory reset completed - system would reboot here");
-
-        // In production, this would be:
-        // esp_idf_svc::sys::esp_restart();
-
-        // Signal reset completion
-        RESET_EVENT_CHANNEL
-            .sender()
-            .try_send(ResetEvent::ResetCompleted)
-            .map_err(|e| anyhow!("Failed to signal reset completion: {:?}", e))?;
 
         Ok(())
     }

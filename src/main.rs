@@ -6,6 +6,9 @@ use embassy_executor::Spawner;
 // Duration represents a time span, Timer provides async delays (non-blocking waits)
 use embassy_time::{Duration, Timer};
 
+// Import Embassy async utilities for event coordination
+use embassy_futures::select::{select, Either};
+
 // Import Embassy synchronization primitives for task coordination
 // Signal provides event-driven communication between tasks
 // Mutex provides thread-safe shared state access
@@ -69,7 +72,7 @@ use device_api::DeviceApiClient; // Device-specific API client for registration
 use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
 use reset_handler::ResetHandler; // Reset behavior execution
-use reset_manager::ResetManager; // Reset button monitoring
+use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring
 use reset_storage::ResetStorage; // Reset state persistence
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
@@ -1120,16 +1123,16 @@ async fn reset_manager_task(
         }
     };
 
-    // Initialize reset handler
+    // Initialize reset handler (single source of truth for reset execution)
     let mut reset_handler = ResetHandler::new(device_id.clone());
     if let Err(e) = reset_handler.initialize_storage(reset_storage) {
         error!("❌ Failed to initialize reset handler storage: {}", e);
         return;
     }
 
-    info!("🔄 Reset handler initialized successfully");
+    info!("✅ Reset handler initialized successfully");
 
-    // Initialize actual reset manager with GPIO
+    // Initialize reset manager (only for GPIO monitoring)
     let mut reset_manager =
         match ResetManager::new(device_id.clone(), "placeholder-cert-arn".to_string(), gpio0) {
             Ok(manager) => {
@@ -1142,7 +1145,7 @@ async fn reset_manager_task(
             }
         };
 
-    // Initialize reset manager storage with a separate storage instance
+    // Initialize reset manager storage (minimal - only for GPIO state tracking)
     let reset_manager_storage = loop {
         match ResetStorage::new_with_partition(nvs_partition.clone()) {
             Ok(storage) => {
@@ -1161,9 +1164,7 @@ async fn reset_manager_task(
         return;
     }
 
-    info!("🔄 Reset manager task active - waiting for MQTT connection signal");
-
-    // Wait for MQTT connection to become available before processing deferred notifications
+    // Wait for MQTT connection to process any deferred notifications first
     loop {
         use crate::mqtt_manager::MQTT_EVENT_SIGNAL;
         let mqtt_event = MQTT_EVENT_SIGNAL.wait().await;
@@ -1178,20 +1179,91 @@ async fn reset_manager_task(
                     info!("✅ Deferred reset notification processing completed");
                 }
 
-                // After processing deferred notifications once, start GPIO monitoring
-                break;
+                break; // Continue to main event loop
             }
             _ => {
-                // Other MQTT events, continue waiting for connection
                 debug!("🔄 MQTT event received, waiting for connection");
             }
         }
     }
 
-    info!("🎯 Starting GPIO reset button monitoring");
+    info!("🎯 Starting coordinated reset monitoring with event delegation");
 
-    // Start the main reset manager loop for GPIO monitoring
-    if let Err(e) = reset_manager.run().await {
-        error!("❌ Reset manager encountered fatal error: {}", e);
+    // Main event loop: coordinate between reset_manager GPIO monitoring and reset_handler execution
+    loop {
+        use crate::reset_manager::RESET_MANAGER_EVENT_SIGNAL;
+        use embassy_futures::select::{select, Either};
+
+        // Run GPIO monitoring and listen for reset events concurrently
+        match select(
+            reset_manager.run(),               // GPIO monitoring (non-blocking)
+            RESET_MANAGER_EVENT_SIGNAL.wait(), // Reset events from manager
+        )
+        .await
+        {
+            Either::First(manager_result) => {
+                // Reset manager encountered an error
+                if let Err(e) = manager_result {
+                    error!("❌ Reset manager GPIO monitoring failed: {}", e);
+                    Timer::after(Duration::from_secs(5)).await; // Recovery delay
+                    continue;
+                }
+            }
+            Either::Second(reset_event) => {
+                // Handle reset events from reset_manager
+                match reset_event {
+                    ResetManagerEvent::ResetButtonPressed => {
+                        info!("🔘 Physical reset button pressed");
+                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetButtonPressed);
+                    }
+                    ResetManagerEvent::ResetInitiated => {
+                        info!("🔄 Reset process initiated");
+                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetInProgress);
+                    }
+                    ResetManagerEvent::ResetTriggered {
+                        wifi_available,
+                        reset_data,
+                    } => {
+                        info!(
+                            "🚀 Reset triggered - delegating to reset handler (WiFi: {})",
+                            wifi_available
+                        );
+                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetInProgress);
+
+                        // Delegate reset execution to reset_handler (single source of truth)
+                        let execution_result = if wifi_available {
+                            reset_handler.execute_online_reset(reset_data).await
+                        } else {
+                            reset_handler.execute_offline_reset(reset_data).await
+                        };
+
+                        match execution_result {
+                            Ok(_) => {
+                                info!("✅ Reset execution completed successfully");
+                                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetCompleted);
+                                // System will reboot, so this task will end
+                                return;
+                            }
+                            Err(e) => {
+                                error!("❌ Reset execution failed: {}", e);
+                                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
+                                    "Reset execution failed: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                    ResetManagerEvent::ResetCompleted => {
+                        info!("✅ Reset completed successfully");
+                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetCompleted);
+                    }
+                    ResetManagerEvent::ResetError(error) => {
+                        error!("❌ Reset error: {}", error);
+                        SYSTEM_EVENT_SIGNAL
+                            .signal(SystemEvent::SystemError(format!("Reset error: {}", error)));
+                    }
+                }
+            }
+        }
     }
 }
