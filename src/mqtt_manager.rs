@@ -4,11 +4,11 @@
 
 // Import Embassy synchronization primitives for task coordination
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, Receiver, Sender};
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 
 // Import Embassy time utilities for periodic operations and timeouts
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{Duration, Timer};
 
 // Import logging macros for debug output with consistent emoji prefixes
 use log::{debug, error, info, warn};
@@ -21,7 +21,7 @@ use crate::mqtt_certificates::MqttCertificateStorage;
 use crate::mqtt_client::{AwsIotMqttClient, ConnectionStatus};
 
 // Import existing system events for integration
-use crate::{SystemEvent, SYSTEM_EVENT_SIGNAL};
+// System events imported where needed
 
 // MQTT manager configuration constants
 const MQTT_MESSAGE_QUEUE_SIZE: usize = 32; // Channel capacity for message queue
@@ -43,6 +43,12 @@ pub enum MqttMessage {
     VolumeChange {
         volume: u8,
         source: String,
+    },
+    ResetNotification {
+        device_id: String,
+        reset_timestamp: String,
+        old_cert_arn: String,
+        reason: String,
     },
     Heartbeat,
     Connect,
@@ -204,6 +210,22 @@ impl MqttManager {
 
             MqttMessage::VolumeChange { volume, source } => {
                 self.client.publish_volume_change(volume, &source).await
+            }
+
+            MqttMessage::ResetNotification {
+                device_id,
+                reset_timestamp,
+                old_cert_arn,
+                reason,
+            } => {
+                self.client
+                    .publish_reset_notification(
+                        &device_id,
+                        &reset_timestamp,
+                        &old_cert_arn,
+                        &reason,
+                    )
+                    .await
             }
 
             MqttMessage::Heartbeat => self.client.publish_heartbeat().await,
@@ -391,6 +413,7 @@ impl MqttManager {
             }
             MqttMessage::DeviceStatus { .. } => format!("acorn-pups/status/{}", self.device_id),
             MqttMessage::VolumeChange { .. } => format!("acorn-pups/status/{}", self.device_id),
+            MqttMessage::ResetNotification { .. } => format!("acorn-pups/reset/{}", self.device_id),
             MqttMessage::Heartbeat => format!("acorn-pups/heartbeat/{}", self.device_id),
             _ => "system".to_string(),
         }

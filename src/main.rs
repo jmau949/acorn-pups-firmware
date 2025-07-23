@@ -57,6 +57,9 @@ mod device_api; // Device-specific API client for ESP32 receivers
 mod mqtt_certificates; // Secure storage of AWS IoT Core certificates
 mod mqtt_client; // AWS IoT Core MQTT client with TLS authentication
 mod mqtt_manager; // Embassy task coordination for MQTT operations
+mod reset_handler; // Reset behavior execution and notification processing
+mod reset_manager; // GPIO reset button monitoring and state management
+mod reset_storage; // Reset state persistence and NVS management
 mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
@@ -64,7 +67,10 @@ mod wifi_storage; // Persistent storage of WiFi credentials
 use ble_server::{generate_device_id, BleServer}; // BLE advertising and communication
 use device_api::DeviceApiClient; // Device-specific API client for registration
 use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
-use mqtt_manager::{MqttManager, MQTT_EVENT_SIGNAL}; // MQTT task coordination
+use mqtt_manager::MqttManager; // MQTT task coordination
+use reset_handler::ResetHandler; // Reset behavior execution
+                                 // Reset manager imported in task function
+use reset_storage::ResetStorage; // Reset state persistence
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 // Task coordination structures and system state
@@ -86,6 +92,9 @@ pub enum SystemEvent {
     SystemStartup,           // System has started and is initializing
     ProvisioningMode,        // Device is in WiFi provisioning mode via BLE
     WiFiMode,                // Device has transitioned to WiFi-only mode
+    ResetButtonPressed,      // Physical reset button was pressed
+    ResetInProgress,         // Factory reset is in progress
+    ResetCompleted,          // Factory reset completed successfully
     SystemError(String),     // System error occurred
     TaskTerminating(String), // Task is cleanly terminating
 }
@@ -190,7 +199,7 @@ async fn main(spawner: Spawner) {
 
     // 🔧 CRITICAL FIX: Initialize WiFi storage FIRST using the NVS partition
     info!("🔧 Initializing WiFi storage first with provided NVS partition...");
-    let mut wifi_storage = match WiFiStorage::new_with_partition(nvs) {
+    let mut wifi_storage = match WiFiStorage::new_with_partition(nvs.clone()) {
         Ok(mut storage) => {
             info!("✅ WiFi storage initialized successfully with NVS partition");
 
@@ -257,12 +266,20 @@ async fn main(spawner: Spawner) {
     // Spawn the MQTT manager task - handles AWS IoT Core communication
     // Task will wait for certificates to be available before initializing
     let mqtt_device_id = generate_device_id(); // Generate device ID for MQTT
-    if let Err(_) = spawner.spawn(mqtt_manager_task(mqtt_device_id)) {
+    if let Err(_) = spawner.spawn(mqtt_manager_task(mqtt_device_id.clone())) {
         error!("Failed to spawn MQTT manager task");
         return;
     }
 
     info!("🔌 MQTT manager task spawned - will activate after device registration");
+
+    // Spawn the reset manager task - handles physical reset button monitoring
+    if let Err(_) = spawner.spawn(reset_manager_task(mqtt_device_id.clone(), nvs.clone())) {
+        error!("Failed to spawn reset manager task");
+        return;
+    }
+
+    info!("🔄 Reset manager task spawned - monitoring physical reset button");
 
     info!("✅ All tasks spawned successfully - system coordination active");
     info!("🎛️  Event-driven architecture initialized - no polling loops");
@@ -298,6 +315,21 @@ async fn main(spawner: Spawner) {
                     state.provisioning_complete = true;
                 }
                 info!("🎯 Device now operating as WiFi-only device");
+            }
+
+            SystemEvent::ResetButtonPressed => {
+                info!("🔘 Physical reset button pressed");
+                // Reset button press handled by reset manager
+            }
+
+            SystemEvent::ResetInProgress => {
+                info!("🔄 Factory reset in progress");
+                // Factory reset handled by reset handler
+            }
+
+            SystemEvent::ResetCompleted => {
+                info!("✅ Factory reset completed successfully");
+                // Reset completion handled by reset handler
             }
 
             SystemEvent::SystemError(error) => {
@@ -793,7 +825,7 @@ async fn test_connectivity_and_register(
             info!("🔑 Registered device ID: {}", registered_device_id);
 
             // IMPORTANT: Use the registered device_id for consistency with certificates
-            let device_id_for_mqtt = registered_device_id;
+            let _device_id_for_mqtt = registered_device_id;
 
             info!("🔌 AWS IoT Core certificates should now be stored, spawning MQTT task...");
             // Note: MQTT task will wait for certificates to be available
@@ -1058,6 +1090,55 @@ async fn mqtt_manager_task(device_id: String) {
                 Timer::after(Duration::from_secs(60)).await;
                 warn!("⚠️ MQTT manager task is inactive due to initialization failure");
             }
+        }
+    }
+}
+
+// RESET MANAGER TASK - Handles physical reset button monitoring and factory reset operations
+#[embassy_executor::task]
+async fn reset_manager_task(device_id: String, nvs_partition: EspDefaultNvsPartition) {
+    info!("🔄 Reset Manager Task started for device: {}", device_id);
+
+    // Initialize reset storage
+    let reset_storage = loop {
+        match ResetStorage::new_with_partition(nvs_partition.clone()) {
+            Ok(storage) => {
+                info!("✅ Reset storage initialized successfully");
+                break storage;
+            }
+            Err(e) => {
+                error!("❌ Failed to initialize reset storage: {:?}", e);
+                Timer::after(Duration::from_secs(10)).await;
+            }
+        }
+    };
+
+    // Initialize reset handler
+    let mut reset_handler = ResetHandler::new(device_id.clone());
+    if let Err(e) = reset_handler.initialize_storage(reset_storage) {
+        error!("❌ Failed to initialize reset handler storage: {}", e);
+        return;
+    }
+
+    info!("🔄 Reset handler initialized successfully");
+
+    // Check for pending reset notifications from previous offline resets
+    info!("🔍 Checking for pending reset notifications...");
+    if let Err(e) = reset_handler.process_deferred_notifications().await {
+        warn!("⚠️ Failed to process deferred reset notifications: {}", e);
+    }
+
+    // Note: GPIO reset button monitoring would be implemented here
+    // For now, we'll focus on deferred notification processing
+    info!("🔄 Reset manager task active - monitoring for deferred notifications");
+
+    // Main loop - process deferred notifications periodically
+    loop {
+        // Check for deferred notifications every 30 seconds
+        Timer::after(Duration::from_secs(30)).await;
+
+        if let Err(e) = reset_handler.process_deferred_notifications().await {
+            warn!("⚠️ Error processing deferred reset notifications: {}", e);
         }
     }
 }
