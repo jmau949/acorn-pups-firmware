@@ -19,7 +19,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 // Import ESP-IDF NVS for selective erasure
-// NVS functionality imported where needed
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
 // Import our modules and system components
 use crate::mqtt_manager::{MqttMessage, MQTT_MESSAGE_CHANNEL};
@@ -65,6 +65,7 @@ pub static RESET_HANDLER_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, ResetHand
 pub struct ResetHandler {
     device_id: String,
     reset_storage: Option<ResetStorage>,
+    nvs_partition: Option<EspDefaultNvsPartition>,
 }
 
 impl ResetHandler {
@@ -75,6 +76,7 @@ impl ResetHandler {
         Self {
             device_id,
             reset_storage: None,
+            nvs_partition: None,
         }
     }
 
@@ -83,6 +85,17 @@ impl ResetHandler {
         info!("🔧 Initializing reset storage for reset handler");
         self.reset_storage = Some(reset_storage);
         info!("✅ Reset storage initialized for reset handler");
+        Ok(())
+    }
+
+    /// Initialize NVS partition for selective erasure
+    pub fn initialize_nvs_partition(
+        &mut self,
+        nvs_partition: EspDefaultNvsPartition,
+    ) -> Result<()> {
+        info!("🔧 Initializing NVS partition for reset handler");
+        self.nvs_partition = Some(nvs_partition);
+        info!("✅ NVS partition initialized for reset handler");
         Ok(())
     }
 
@@ -304,8 +317,6 @@ impl ResetHandler {
         Timer::after(Duration::from_millis(500)).await;
 
         // Perform selective NVS erasure (preserving reset_pending namespace)
-        // Note: This would normally use the actual NVS partition, but for safety
-        // in development we'll just simulate the operation
         match self.perform_selective_erasure().await {
             Ok(_) => {
                 info!("✅ Selective NVS erasure completed successfully");
@@ -336,14 +347,31 @@ impl ResetHandler {
     async fn perform_selective_erasure(&self) -> Result<()> {
         info!("🗑️ Starting selective NVS erasure");
 
-        // Simulate selective erasure operation with timeout
+        // Get NVS partition for erasure
+        let nvs_partition = self
+            .nvs_partition
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVS partition not initialized"))?;
+
+        // Perform actual selective erasure operation with timeout
         let erasure_timeout = Duration::from_millis(SELECTIVE_ERASURE_TIMEOUT_MS);
 
-        match with_timeout(erasure_timeout, self.simulate_selective_erasure()).await {
-            Ok(_) => {
-                info!("✅ Selective NVS erasure simulation completed");
-                Ok(())
-            }
+        match with_timeout(
+            erasure_timeout,
+            self.execute_selective_erasure(nvs_partition.clone()),
+        )
+        .await
+        {
+            Ok(result) => match result {
+                Ok(_) => {
+                    info!("✅ Selective NVS erasure completed successfully");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("❌ Selective NVS erasure failed: {}", e);
+                    Err(e)
+                }
+            },
             Err(_) => {
                 error!(
                     "❌ Selective NVS erasure timeout after {}ms",
@@ -354,22 +382,104 @@ impl ResetHandler {
         }
     }
 
-    /// Simulate selective NVS erasure (placeholder for actual implementation)
-    async fn simulate_selective_erasure(&self) {
-        debug!("🔧 Simulating selective NVS erasure");
+    /// Execute selective NVS erasure (production implementation)
+    async fn execute_selective_erasure(&self, nvs_partition: EspDefaultNvsPartition) -> Result<()> {
+        info!("🔥 Executing selective NVS erasure for factory reset");
 
-        // Simulate erasure of different namespaces
-        let namespaces = ["wifi_config", "mqtt_certs", "acorn_device"];
+        // List of namespaces to erase during factory reset
+        let namespaces_to_erase = [
+            "wifi_config",  // WiFi credentials
+            "mqtt_certs",   // MQTT certificates
+            "acorn_device", // Device configuration
+        ];
 
-        for namespace in &namespaces {
-            debug!("🗑️ Erasing namespace: {}", namespace);
-            Timer::after(Duration::from_millis(200)).await;
+        for namespace in &namespaces_to_erase {
+            match self.erase_namespace(nvs_partition.clone(), namespace).await {
+                Ok(_) => {
+                    info!("✅ Successfully erased namespace: {}", namespace);
+                }
+                Err(e) => {
+                    warn!("⚠️ Failed to erase namespace {}: {}", namespace, e);
+                    // Continue with other namespaces even if one fails
+                }
+            }
         }
 
-        debug!("💾 Preserving reset_pending namespace");
-        Timer::after(Duration::from_millis(100)).await;
+        info!("🎯 Selective NVS erasure completed - reset_pending namespace preserved");
+        Ok(())
+    }
 
-        info!("✅ Selective NVS erasure simulation completed");
+    /// Erase a specific NVS namespace by removing all known keys
+    async fn erase_namespace(
+        &self,
+        nvs_partition: EspDefaultNvsPartition,
+        namespace: &str,
+    ) -> Result<()> {
+        debug!("🗑️ Erasing NVS namespace: {}", namespace);
+
+        let mut nvs = EspNvs::new(nvs_partition, namespace, true)
+            .map_err(|e| anyhow!("Failed to open namespace {}: {}", namespace, e))?;
+
+        // Define known keys for each namespace to erase
+        let keys_to_remove = match namespace {
+            "wifi_config" => vec!["ssid", "password", "wifi_creds", "last_connected"],
+            "mqtt_certs" => vec![
+                "device_cert",
+                "private_key",
+                "root_ca",
+                "cert_metadata",
+                "device_id",
+                "cert_arn",
+                "endpoint",
+                "created_at",
+                "iot_endpoint",
+                "ca_cert",
+                "validation",
+            ],
+            "acorn_device" => vec![
+                "device_id",
+                "firmware_version",
+                "device_config",
+                "auth_token",
+                "registration_status",
+                "last_heartbeat",
+                "serial_number",
+                "mac_address",
+                "device_name",
+            ],
+            _ => {
+                warn!("Unknown namespace for erasure: {}", namespace);
+                return Ok(());
+            }
+        };
+
+        // Remove each key in the namespace
+        let mut removed_count = 0;
+        for key in keys_to_remove {
+            match nvs.remove(key) {
+                Ok(existed) => {
+                    if existed {
+                        debug!("🗑️ Removed key: {}", key);
+                        removed_count += 1;
+                    } else {
+                        debug!("🔍 Key not found: {}", key);
+                    }
+                }
+                Err(e) => {
+                    // Error removing key, log and continue
+                    debug!("⚠️ Error removing key {}: {}", key, e);
+                }
+            }
+
+            // Small delay to prevent blocking
+            Timer::after(Duration::from_millis(10)).await;
+        }
+
+        info!(
+            "✅ Erased {} keys from namespace: {}",
+            removed_count, namespace
+        );
+        Ok(())
     }
 
     /// Check if reset storage is properly initialized
