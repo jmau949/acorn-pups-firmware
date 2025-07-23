@@ -1,0 +1,22 @@
+[0mThis error occurs when a method is used on a type which doesn't implement it:[0m
+
+[0mErroneous code example:[0m
+
+[0m[0m[2mstruct Mouth;
+
+let x = Mouth;
+x.chocolate(); // error: no method named `chocolate` found for type `Mouth`
+               //        in the current scope[0m
+
+[0mIn this case, you need to implement the [0m[0m[2mchocolate[0m method to fix the error:[0m
+
+[0m[0m[2mstruct Mouth;
+
+impl Mouth {
+    fn chocolate(&self) { // We implement the `chocolate` method here.
+        println!("Hmmm! I love chocolate!");
+    }
+}
+
+let x = Mouth;
+x.chocolate(); // ok![0m[0m

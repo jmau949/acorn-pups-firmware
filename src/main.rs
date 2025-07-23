@@ -829,7 +829,6 @@ async fn test_connectivity_and_register(
             info!("🔑 Registered device ID: {}", registered_device_id);
 
             // IMPORTANT: Use the registered device_id for consistency with certificates
-            let _device_id_for_mqtt = registered_device_id;
 
             info!("🔌 AWS IoT Core certificates should now be stored, spawning MQTT task...");
             // Note: MQTT task will wait for certificates to be available

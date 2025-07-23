@@ -321,10 +321,14 @@ impl ResetHandler {
         // Signal reset completion
         RESET_HANDLER_EVENT_SIGNAL.signal(ResetHandlerEvent::ResetCompleted);
 
-        // In production, this would trigger a system reboot:
-        // esp_idf_svc::sys::esp_restart();
-        info!("🔄 Factory reset completed - system would reboot here");
+        // Production system reboot
+        info!("🔄 Factory reset completed - rebooting system");
+        unsafe {
+            esp_idf_svc::sys::esp_restart();
+        }
 
+        // This line will never be reached due to the restart above, but kept for function signature
+        #[allow(unreachable_code)]
         Ok(())
     }
 

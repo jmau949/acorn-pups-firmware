@@ -4,7 +4,6 @@
 
 // Import ESP-IDF's NVS (Non-Volatile Storage) functionality
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-// ESP error types handled by esp_idf_svc
 
 // Import logging macros for debug output
 use log::{debug, info, warn};
@@ -139,8 +138,8 @@ impl ResetStorage {
             .map_err(|e| anyhow!("Failed to load reset timestamp: {}", e))?
             .ok_or_else(|| anyhow!("Reset timestamp not found in reset storage"))?;
 
-        // Load old certificate ARN
-        let mut cert_arn_buf = [0u8; 256];
+        // Load old certificate ARN (AWS ARNs can be long, use 512 bytes)
+        let mut cert_arn_buf = [0u8; 512];
         let old_cert_arn = self
             .nvs_reset
             .get_str(OLD_CERT_ARN_KEY, &mut cert_arn_buf)
