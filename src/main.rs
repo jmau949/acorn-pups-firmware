@@ -235,7 +235,8 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
         }
 
         // Try reading as string first
-        match nvs_handle.get_str(key, &mut [0u8; 512]) {
+        match nvs_handle.get_str(key, &mut [0u8; 2048]) {
+            // Increased buffer for JWT tokens
             Ok(Some(value)) => {
                 info!("   📝 '{}' = '{}' (string)", key, value);
                 found_keys += 1;

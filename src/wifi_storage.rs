@@ -177,7 +177,7 @@ impl WiFiStorage {
         info!("Loaded WiFi credentials for SSID: {}", ssid);
 
         // Load additional fields (with defaults if not present)
-        let mut buffer = [0u8; 512]; // Larger buffer for auth tokens
+        let mut buffer = [0u8; 2048]; // Larger buffer for JWT tokens and enhanced data
         let auth_token = self
             .nvs
             .get_str(AUTH_TOKEN_KEY, &mut buffer)
@@ -224,7 +224,7 @@ impl WiFiStorage {
 
     /// Load complete WiFi configuration from JSON
     fn load_config(&mut self) -> Result<Option<StoredWiFiConfig>> {
-        let mut config_buf = [0u8; 256];
+        let mut config_buf = [0u8; 2048]; // Increased buffer for enhanced JSON with JWT tokens
 
         let config_json = match self
             .nvs

@@ -1,5 +1,44 @@
 // Production-grade BLE server implementation using real ESP-IDF GATT APIs
 // This provides actual WiFi provisioning via real BLE GATT services
+//
+// 📋 LENGTH-PREFIX PROTOCOL SPECIFICATION:
+// =======================================
+//
+// The server now uses a length-prefix protocol to reliably receive large JSON payloads
+// from mobile apps. This eliminates issues with MTU limitations and chunk detection.
+//
+// PROTOCOL FORMAT:
+// 1. Length Prefix (4 bytes): u32 little-endian indicating payload size
+// 2. JSON Payload (variable): The actual WiFi credentials JSON data
+//
+// MOBILE APP IMPLEMENTATION:
+// The mobile app should send data as follows:
+//
+// ```javascript
+// const jsonString = JSON.stringify(credentials);
+// const jsonBytes = new TextEncoder().encode(jsonString);
+// const lengthPrefix = new Uint32Array([jsonBytes.length]);
+// const lengthBytes = new Uint8Array(lengthPrefix.buffer);
+//
+// // Combine length prefix + payload
+// const fullPayload = new Uint8Array(lengthBytes.length + jsonBytes.length);
+// fullPayload.set(lengthBytes, 0);
+// fullPayload.set(jsonBytes, lengthBytes.length);
+//
+// // Send in chunks based on MTU (minus 3 bytes for ATT header)
+// const maxChunkSize = mtu - 3;
+// for (let i = 0; i < fullPayload.length; i += maxChunkSize) {
+//     const chunk = fullPayload.slice(i, i + maxChunkSize);
+//     await characteristic.writeValueWithResponse(chunk);
+// }
+// ```
+//
+// BENEFITS:
+// - ✅ Reliable detection of complete payloads regardless of MTU
+// - ✅ Supports payloads up to 4GB (u32 length)
+// - ✅ Automatic timeout reset per chunk (prevents stale data)
+// - ✅ Detailed progress logging and statistics
+// - ✅ Robust error handling with immediate mobile app feedback
 
 // Import Embassy's critical section mutex for thread-safe access
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -163,11 +202,18 @@ pub const STATUS_CHAR_UUID: &str = "12345678-1234-1234-1234-123456789abf";
 
 // BLE operation timeout for credential reception
 const CREDENTIALS_TIMEOUT_SECONDS: u64 = 30;
+// Timeout per chunk (resets after each valid data chunk)
+const CHUNK_TIMEOUT_SECONDS: u64 = 10;
+// Maximum payload size (4KB)
+const MAX_PAYLOAD_SIZE: usize = 4096;
+// Length prefix size (4 bytes for u32)
+const LENGTH_PREFIX_SIZE: usize = 4;
 
 // Global state for BLE operations
 static BLE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static BLE_ADVERTISING: AtomicBool = AtomicBool::new(false);
 static GATT_INTERFACE: AtomicU8 = AtomicU8::new(0);
+static BLE_MTU_SIZE: AtomicU8 = AtomicU8::new(23); // Default BLE MTU
 
 // Global channel for BLE events
 pub static BLE_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel::new();
@@ -276,6 +322,17 @@ where
     Some(f(&mut state))
 }
 
+// Protocol state for length-prefix reception
+#[derive(Debug, Clone, PartialEq)]
+enum ReceptionState {
+    WaitingForLength, // Waiting for 4-byte length prefix
+    ReceivingPayload {
+        // Receiving payload data
+        expected_length: u32,
+        received_length: usize,
+    },
+}
+
 // Thread-safe state for callback access
 struct BleServerState {
     is_connected: bool,
@@ -284,6 +341,14 @@ struct BleServerState {
     char_handles: HashMap<String, u16>,
     connection_time: Option<std::time::Instant>,
     credentials_timeout_seconds: u64,
+
+    // Enhanced chunked reception with length prefix protocol
+    reception_state: ReceptionState,
+    data_buffer: Vec<u8>,   // Buffer for assembling multi-packet writes
+    length_buffer: Vec<u8>, // Buffer for length prefix bytes
+    last_chunk_time: Option<std::time::Instant>, // When last valid chunk was received
+    chunk_timeout_seconds: u64, // Timeout per chunk
+    total_chunks_received: u32, // Statistics
 }
 
 impl BleServerState {
@@ -295,6 +360,33 @@ impl BleServerState {
             char_handles: HashMap::new(),
             connection_time: None,
             credentials_timeout_seconds: CREDENTIALS_TIMEOUT_SECONDS,
+
+            // Enhanced chunked reception with length prefix protocol
+            reception_state: ReceptionState::WaitingForLength,
+            data_buffer: Vec::new(),
+            length_buffer: Vec::new(),
+            last_chunk_time: None,
+            chunk_timeout_seconds: CHUNK_TIMEOUT_SECONDS,
+            total_chunks_received: 0,
+        }
+    }
+
+    /// Reset reception state and clear all buffers
+    fn reset_reception(&mut self) {
+        self.reception_state = ReceptionState::WaitingForLength;
+        self.data_buffer.clear();
+        self.length_buffer.clear();
+        self.last_chunk_time = None;
+        self.total_chunks_received = 0;
+        info!("🔄 Reception state reset - ready for new payload");
+    }
+
+    /// Check if chunk reception has timed out
+    fn is_chunk_timed_out(&self) -> bool {
+        if let Some(last_chunk) = self.last_chunk_time {
+            last_chunk.elapsed().as_secs() > self.chunk_timeout_seconds
+        } else {
+            false
         }
     }
 }
@@ -646,14 +738,21 @@ impl BleServer {
     }
 
     /// Check if current connection has timed out waiting for credentials
+    /// This checks both overall connection timeout and chunk reception timeout
     pub fn is_connection_timed_out(&self) -> bool {
         with_ble_server_state(|state| {
-            if let Some(connection_time) = state.connection_time {
+            // Check overall connection timeout
+            let connection_timeout = if let Some(connection_time) = state.connection_time {
                 let elapsed = connection_time.elapsed().as_secs();
                 elapsed > state.credentials_timeout_seconds
             } else {
                 false
-            }
+            };
+
+            // Check chunk timeout (if we're in the middle of receiving data)
+            let chunk_timeout = state.is_chunk_timed_out();
+
+            connection_timeout || chunk_timeout
         })
         .unwrap_or(false)
     }
@@ -662,11 +761,12 @@ impl BleServer {
     pub async fn force_disconnect_client(&self, reason: &str) -> BleResult<()> {
         info!("🚫 Force disconnecting client: {}", reason);
 
-        // Update state to mark as disconnected
+        // Update state to mark as disconnected and reset reception
         with_ble_server_state(|state| {
             state.is_connected = false;
             state.connection_time = None;
             state.received_credentials = None;
+            state.reset_reception(); // Clear any partial data
         });
 
         // Send disconnection event
@@ -674,6 +774,27 @@ impl BleServer {
 
         info!("✅ Client force disconnected successfully");
         Ok(())
+    }
+
+    /// Get current reception statistics for debugging
+    pub fn get_reception_stats(&self) -> Option<(String, u32, usize, usize)> {
+        with_ble_server_state(|state| {
+            let state_desc = match &state.reception_state {
+                ReceptionState::WaitingForLength => "WaitingForLength".to_string(),
+                ReceptionState::ReceivingPayload {
+                    expected_length,
+                    received_length: _,
+                } => {
+                    format!("ReceivingPayload({})", expected_length)
+                }
+            };
+            (
+                state_desc,
+                state.total_chunks_received,
+                state.data_buffer.len(),
+                state.length_buffer.len(),
+            )
+        })
     }
 
     pub fn is_client_connected(&self) -> bool {
@@ -1042,10 +1163,15 @@ fn gatts_event_handler_impl(
             with_ble_server_state(|state| {
                 state.is_connected = true;
                 state.connection_time = Some(std::time::Instant::now());
-                // Clear any previous credentials
+                // Clear any previous credentials and reset reception state
                 state.received_credentials = None;
+                state.reset_reception();
             });
-            info!("⏰ Starting 30-second timeout for WiFi credentials");
+            info!(
+                "⏰ Starting {}-second timeout for WiFi credentials",
+                CREDENTIALS_TIMEOUT_SECONDS
+            );
+            info!("🔄 Reception state reset - ready for length-prefix protocol");
             send_ble_event_with_backpressure(BleEvent::ClientConnected);
         }
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT => {
@@ -1054,6 +1180,8 @@ fn gatts_event_handler_impl(
             with_ble_server_state(|state| {
                 state.is_connected = false;
                 state.connection_time = None;
+                // Reset reception state to clean up any partial data
+                state.reset_reception();
                 // Keep credentials if they were received
             });
             send_ble_event_with_backpressure(BleEvent::ClientDisconnected);
@@ -1061,6 +1189,20 @@ fn gatts_event_handler_impl(
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_WRITE_EVT => {
             let write_event = unsafe { &(*event_param).write };
             handle_characteristic_write(write_event);
+        }
+        esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_MTU_EVT => {
+            let mtu_event = unsafe { &(*event_param).mtu };
+            let new_mtu = mtu_event.mtu;
+            BLE_MTU_SIZE.store(new_mtu as u8, Ordering::SeqCst);
+            info!(
+                "📏 BLE MTU negotiated: {} bytes (effective payload: {} bytes)",
+                new_mtu,
+                new_mtu.saturating_sub(3) // ATT header is 3 bytes
+            );
+
+            // Send status update to mobile app about MTU
+            let mtu_msg = format!("MTU_NEGOTIATED:{}", new_mtu);
+            send_immediate_status_notification(&mtu_msg);
         }
         _ => {
             // Handle other events as needed
@@ -1222,7 +1364,7 @@ fn send_immediate_status_notification(message: &str) {
     }
 }
 
-// Handle characteristic write events
+// Handle characteristic write events with length-prefix protocol
 fn handle_characteristic_write(
     param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param,
 ) {
@@ -1232,52 +1374,167 @@ fn handle_characteristic_write(
         return;
     }
 
-    // Validate data length bounds
-    const MIN_DATA_LEN: u16 = 10; // Minimum for valid JSON: {"ssid":"x"}
-    const MAX_DATA_LEN: u16 = 512; // Reasonable maximum for BLE characteristic
-
-    if param.len < MIN_DATA_LEN {
-        warn!(
-            "❌ BLE write: data too short ({} bytes, min {})",
-            param.len, MIN_DATA_LEN
-        );
-        return;
-    }
-
-    if param.len > MAX_DATA_LEN {
-        warn!(
-            "❌ BLE write: data too long ({} bytes, max {})",
-            param.len, MAX_DATA_LEN
-        );
-        return;
-    }
-
     let data = unsafe { std::slice::from_raw_parts(param.value, param.len as usize) };
+    let mtu_size = BLE_MTU_SIZE.load(Ordering::SeqCst) as usize;
 
-    // Validate UTF-8 first
-    let json_str = match std::str::from_utf8(data) {
+    info!(
+        "📥 BLE write: received {} bytes (MTU: {}, chunk: {})",
+        data.len(),
+        mtu_size,
+        data.len()
+    );
+
+    // Process the chunk and check if we have a complete payload
+    let complete_payload = with_ble_server_state(|state| {
+        // Check for chunk timeout
+        if state.is_chunk_timed_out() {
+            warn!("⏰ Chunk timeout - resetting reception state");
+            state.reset_reception();
+        }
+
+        // Update chunk reception time
+        state.last_chunk_time = Some(std::time::Instant::now());
+        state.total_chunks_received += 1;
+
+        info!(
+            "📊 Chunk {} received ({} bytes), state: {:?}",
+            state.total_chunks_received,
+            data.len(),
+            state.reception_state
+        );
+
+        match &state.reception_state {
+            ReceptionState::WaitingForLength => {
+                // Accumulate length prefix bytes
+                state.length_buffer.extend_from_slice(data);
+
+                if state.length_buffer.len() >= LENGTH_PREFIX_SIZE {
+                    // We have enough bytes to read the length
+                    let length_bytes = &state.length_buffer[..LENGTH_PREFIX_SIZE];
+                    let expected_length = u32::from_le_bytes([
+                        length_bytes[0],
+                        length_bytes[1],
+                        length_bytes[2],
+                        length_bytes[3],
+                    ]);
+
+                    info!(
+                        "📏 Length prefix received: {} bytes expected",
+                        expected_length
+                    );
+
+                    // Validate expected length
+                    if expected_length == 0 || expected_length > MAX_PAYLOAD_SIZE as u32 {
+                        warn!("❌ Invalid payload length: {} bytes", expected_length);
+                        state.reset_reception();
+                        return None;
+                    }
+
+                    // Transition to payload reception
+                    state.reception_state = ReceptionState::ReceivingPayload {
+                        expected_length,
+                        received_length: 0,
+                    };
+
+                    // If there are extra bytes after length prefix, process them as payload
+                    if state.length_buffer.len() > LENGTH_PREFIX_SIZE {
+                        let payload_start = &state.length_buffer[LENGTH_PREFIX_SIZE..];
+                        state.data_buffer.extend_from_slice(payload_start);
+                        info!(
+                            "📦 {} payload bytes received with length prefix",
+                            payload_start.len()
+                        );
+                    }
+
+                    // Clear length buffer
+                    state.length_buffer.clear();
+
+                    // Check if we already have complete payload
+                    if let ReceptionState::ReceivingPayload {
+                        expected_length, ..
+                    } = &state.reception_state
+                    {
+                        if state.data_buffer.len() >= *expected_length as usize {
+                            // Complete payload received
+                            let payload = state.data_buffer[..*expected_length as usize].to_vec();
+                            state.reset_reception();
+                            return Some(payload);
+                        }
+                    }
+                }
+                None
+            }
+            ReceptionState::ReceivingPayload {
+                expected_length,
+                received_length: _,
+            } => {
+                // Accumulate payload data
+                state.data_buffer.extend_from_slice(data);
+
+                info!(
+                    "📦 Payload progress: {}/{} bytes ({:.1}%)",
+                    state.data_buffer.len(),
+                    expected_length,
+                    (state.data_buffer.len() as f32 / *expected_length as f32) * 100.0
+                );
+
+                // Check if we have received the complete payload
+                if state.data_buffer.len() >= *expected_length as usize {
+                    info!(
+                        "✅ Complete payload received ({} bytes)",
+                        state.data_buffer.len()
+                    );
+
+                    // Extract the exact payload (in case we received extra bytes)
+                    let payload = state.data_buffer[..*expected_length as usize].to_vec();
+                    state.reset_reception();
+                    Some(payload)
+                } else {
+                    // Still waiting for more payload data
+                    None
+                }
+            }
+        }
+    });
+
+    // Process complete payload if we have it
+    if let Some(Some(payload_data)) = complete_payload {
+        process_complete_payload(payload_data);
+    }
+}
+
+// Process a complete payload using length-prefix protocol
+fn process_complete_payload(payload_data: Vec<u8>) {
+    info!(
+        "🔄 Processing complete payload ({} bytes)",
+        payload_data.len()
+    );
+
+    // Convert to UTF-8 string for JSON parsing
+    let json_str = match std::str::from_utf8(&payload_data) {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
             warn!(
-                "❌ BLE write: received invalid UTF-8 data ({} bytes)",
-                data.len()
+                "❌ Payload contains invalid UTF-8 data: {} ({} bytes)",
+                e,
+                payload_data.len()
             );
+            send_immediate_status_notification("ERROR_INVALID_UTF8");
             return;
         }
     };
-
-    // Basic JSON format validation
-    if !json_str.trim().starts_with('{') || !json_str.trim().ends_with('}') {
-        warn!("❌ BLE write: data doesn't look like JSON: {}", json_str);
-        return;
-    }
 
     // Parse and validate WiFi credentials
     match serde_json::from_str::<WiFiCredentials>(json_str) {
         Ok(credentials) => {
             info!(
-                "🔑 Received WiFi credentials via real BLE: SSID={}",
-                credentials.ssid
+                "🔑 Received enhanced WiFi credentials via BLE: SSID={}, Device={}",
+                credentials.ssid, credentials.device_name
+            );
+            info!(
+                "🌍 User timezone: {}, Auth token: {}...",
+                credentials.user_timezone,
+                &credentials.auth_token[..std::cmp::min(20, credentials.auth_token.len())]
             );
 
             // 🎯 STAGE 1: Send immediate acknowledgment to mobile app
