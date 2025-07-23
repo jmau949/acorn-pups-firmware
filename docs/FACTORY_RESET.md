@@ -183,7 +183,7 @@ const RESET_PENDING_NAMESPACE: &str = "reset_pending"; // Deferred notifications
 ```rust
 // Manual key enumeration for surgical data removal
 let keys_to_remove = match namespace {
-    WIFI_CONFIG_NAMESPACE => vec!["ssid", "password", "wifi_creds"],
+    WIFI_CONFIG_NAMESPACE => vec!["ssid", "password", "auth_token", "device_name", "user_timezone", "wifi_creds"],
     MQTT_CERTS_NAMESPACE => vec![
         "device_cert", "private_key", "root_ca", "cert_metadata",
         "device_id", "cert_arn", "endpoint", "created_at"

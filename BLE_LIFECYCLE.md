@@ -23,23 +23,33 @@ ble_server.start_advertising().await?;
 
 ### Phase 2: PROVISIONING
 ```rust
-// Wait for mobile app to connect and send WiFi credentials
+// Wait for mobile app to connect and send enhanced WiFi provisioning data
 while !wifi_connection_successful {
     ble_server.handle_events().await;
     
     if let Some(credentials) = ble_server.get_received_credentials() {
-        // Process credentials...
+        // Process enhanced credentials with auth_token, device_name, user_timezone
+        // credentials.ssid, credentials.password (WiFi)
+        // credentials.auth_token (for device registration)
+        // credentials.device_name (user-defined name)
+        // credentials.user_timezone (user preference)
     }
 }
 ```
 
 ### Phase 3: VALIDATION & WIFI CONNECTION
 ```rust
-// Store credentials and attempt WiFi connection
+// Store enhanced credentials and attempt WiFi connection
 wifi_storage.store_credentials(&credentials)?;
 match attempt_wifi_connection(credentials).await {
     Ok(ip_address) => {
         // WiFi connection successful!
+        // Use auth_token for device registration
+        register_device_with_backend(
+            credentials.auth_token,
+            credentials.device_name,
+            credentials.user_timezone
+        ).await?;
         // Proceed to cleanup phase...
     }
 }
@@ -96,7 +106,8 @@ self.disconnect_all_clients().await?;
 self.cleanup_gatt_services().await?;
 ```
 - Removes WiFi provisioning service
-- Removes SSID, password, and status characteristics
+- Removes enhanced provisioning characteristic (JSON data)
+- Removes status characteristic
 - Clears GATT attribute table
 - Frees service memory allocations
 
@@ -160,7 +171,16 @@ self.received_credentials = None;
 
 ### Connection Lifecycle
 1. **App connects** to "AcornPups-XXXX" device
-2. **App sends** WiFi credentials via BLE characteristics
+2. **App sends** enhanced provisioning data via BLE characteristic:
+   ```json
+   {
+     "ssid": "WiFiNetwork",
+     "password": "password123",
+     "auth_token": "eyJraWQiOiI0eEdGUjRMaH...",
+     "device_name": "Living Room Device",
+     "user_timezone": "America/Los_Angeles"
+   }
+   ```
 3. **App receives** success confirmation with IP address
 4. **3-second grace period** for final message delivery
 5. **BLE shuts down** - app should expect disconnection
@@ -169,6 +189,7 @@ self.received_credentials = None;
 ### Expected Behavior
 - App will receive disconnection event after WiFi success
 - This is **normal and expected** - not an error
+- Device uses auth_token for secure backend registration
 - Future communication (if needed) should use WiFi/IP protocols
 
 ## 🎛️ System State Transitions

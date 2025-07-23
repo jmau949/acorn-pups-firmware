@@ -79,6 +79,31 @@ use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring
 use reset_storage::ResetStorage; // Reset state persistence
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
+// Helper functions to get real device information
+fn get_device_serial_number() -> String {
+    // Get the default MAC address which is unique for each ESP32
+    let mut mac = [0u8; 6];
+    unsafe {
+        esp_idf_svc::sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
+    }
+    // Create a serial number from the MAC address
+    format!(
+        "ESP32-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
+fn get_device_mac_address() -> String {
+    let mut mac = [0u8; 6];
+    unsafe {
+        esp_idf_svc::sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
+    }
+    format!(
+        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 // Task coordination structures and system state
 // These provide event-driven communication between tasks eliminating polling loops
 
@@ -182,7 +207,14 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
 
     // Known keys for different namespaces
     let known_keys = match namespace {
-        "wifi_config" => vec!["ssid", "password", "last_connected"],
+        "wifi_config" => vec![
+            "ssid",
+            "password",
+            "auth_token",
+            "device_name",
+            "user_timezone",
+            "last_connected",
+        ],
         "reset_pending" => vec!["device_id", "reset_timestamp", "old_cert_arn", "reason"],
         "mqtt_certs" => vec![
             "device_cert",
@@ -661,7 +693,11 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
 
 // Device registration function - called after WiFi connection is successful
 // This implements the technical documentation flow: WiFi connection => device registration
-async fn register_device_with_backend() -> Result<String, anyhow::Error> {
+async fn register_device_with_backend(
+    auth_token: String,
+    device_name: String,
+    user_timezone: String,
+) -> Result<String, anyhow::Error> {
     info!("🔧 Starting device registration process");
 
     // Create device API client
@@ -673,23 +709,22 @@ async fn register_device_with_backend() -> Result<String, anyhow::Error> {
     let device_api_client =
         DeviceApiClient::new(base_url, device_id.clone(), firmware_version.clone());
 
-    // HARDCODED: Authentication token from BLE setup process
-    // TODO: Replace with actual token received from mobile app during BLE provisioning
-    let HARDCODED_AUTH_TOKEN =
-        "eyJraWQiOiI0eEdGUjRMaHJsNlc1cDgyWkdnbzlNVUN0dytCNkhCd2dSUFFtOHJsaTNNPSIsImFsZyI6IlJTMjU2In0.eyJzdWIiOiI2ODQxMjM1MC0xMGExLTcwODAtY2U5NS1hNmUyZGQxMzhhZmMiLCJpc3MiOiJodHRwczpcL1wvY29nbml0by1pZHAudXMtd2VzdC0yLmFtYXpvbmF3cy5jb21cL3VzLXdlc3QtMl9wRjRaYXM5OEEiLCJjbGllbnRfaWQiOiJnMXU2bnVvZ2ZoZzc2Z2I1MWlua3U0OTFhIiwib3JpZ2luX2p0aSI6ImRhYTJiOWQ2LTJhMTUtNDE5ZS05ODFkLWVjZGQ0ZTQ5NjA2MyIsImV2ZW50X2lkIjoiZjViZDVkNzQtMjk3Yy00OTlhLTlmYTEtYTdhNjMxMTgzZjBlIiwidG9rZW5fdXNlIjoiYWNjZXNzIiwic2NvcGUiOiJhd3MuY29nbml0by5zaWduaW4udXNlci5hZG1pbiIsImF1dGhfdGltZSI6MTc1MjE0MDIyNiwiZXhwIjoxNzUyMTQzODI2LCJpYXQiOjE3NTIxNDAyMjYsImp0aSI6ImUyYTM2ZTA5LWYwZjktNDViNy1hNDNhLWJlZDQ3N2Y4M2ZkZiIsInVzZXJuYW1lIjoiNjg0MTIzNTAtMTBhMS03MDgwLWNlOTUtYTZlMmRkMTM4YWZjIn0.KNe7Bjo-22OHNz4XuAkhdh-_KGbDju-ICXM1D-BSup4cYEZYL1tzl6CArILgoADE-ieblVTVSMrE8AgOJrDkIJuQJCwFDgeGy82Q-JIbN-Lcvgrjij7c9CPcAvL8xH_kPJMlTWkyA9eqZnNp67j3NZYZeCh30QvPdNevriX52AGpmpbbYGls2aenqAFo-xzdf_irueNLpW3HWpovxWmAEIhfCv2EvyvuRdZD9MXYyY7_bepqYayeBIML-Fi6Ez2MfOGepIFA4RGIWW5PwfDITxcwys7WyqzInbQISel19OvhYbW9v3qE8HIj-U1VmhaZ2VEUHqu13kizZNrZEIYbPA";
+    // Use authentication token from BLE provisioning
+    info!("🔐 Setting authentication token from BLE provisioning");
+    device_api_client.set_auth_token(auth_token).await;
 
-    // Set authentication token for device registration
-    device_api_client
-        .set_auth_token(HARDCODED_AUTH_TOKEN.to_string())
-        .await;
+    // Get real device information
+    let serial_number = get_device_serial_number();
+    let mac_address = get_device_mac_address();
 
-    // HARDCODED: Device registration data
-    // TODO: Replace with actual hardware-specific values
-    let device_registration = device_api_client.create_device_registration(
-        "HARDCODED_SERIAL_ESP32SN123456789".to_string(), // serial_number
-        "AA:BB:CC:DD:EE:FF".to_string(),                 // mac_address
-        "HARDCODED_ACORN_PUPS_RECEIVER".to_string(),     // device_name
-    );
+    info!("📋 Using device information from BLE provisioning:");
+    info!("  Device Name: {}", device_name);
+    info!("  User Timezone: {}", user_timezone);
+    info!("  Serial Number: {}", serial_number);
+    info!("  MAC Address: {}", mac_address);
+
+    let device_registration =
+        device_api_client.create_device_registration(serial_number, mac_address, device_name);
 
     info!("📋 Device registration data:");
     info!("  Device ID: {}", device_registration.device_id);
@@ -847,7 +882,9 @@ async fn wifi_only_mode_task(
                             }
 
                             // Test connectivity
-                            if let Err(e) = test_connectivity_and_register(ip_address).await {
+                            if let Err(e) =
+                                test_connectivity_and_register(ip_address, &credentials).await
+                            {
                                 warn!("⚠️ Connectivity test failed: {:?}", e);
                             }
 
@@ -1051,6 +1088,7 @@ async fn restart_device(reason: &str) {
 
 async fn test_connectivity_and_register(
     ip_address: Ipv4Addr,
+    credentials: &crate::ble_server::WiFiCredentials,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("🌐 Testing internet connectivity and registering device...");
     info!("📍 Local IP: {}", ip_address);
@@ -1069,9 +1107,19 @@ async fn test_connectivity_and_register(
     let device_id = generate_device_id();
     info!("🆔 Device ID: {}", device_id);
 
-    // Step 3: Register device with Acorn Pups backend
+    // Step 3: Register device with Acorn Pups backend using provided credentials
     info!("📡 Registering device with Acorn Pups backend...");
-    match register_device_with_backend().await {
+    info!("🔑 Using auth token from BLE provisioning");
+    info!("📱 Device name: {}", credentials.device_name);
+    info!("🌍 User timezone: {}", credentials.user_timezone);
+
+    match register_device_with_backend(
+        credentials.auth_token.clone(),
+        credentials.device_name.clone(),
+        credentials.user_timezone.clone(),
+    )
+    .await
+    {
         Ok(registered_device_id) => {
             info!("✅ Device registration successful");
             info!("🎯 Device is now registered and ready for Acorn Pups operations");
@@ -1090,7 +1138,7 @@ async fn test_connectivity_and_register(
         }
     }
 
-    // Step 4: Send periodic heartbeat (optional)
+    // Step 5: Send periodic heartbeat (optional)
     info!("💓 Sending initial heartbeat...");
     match send_heartbeat(&device_id).await {
         Ok(_) => info!("✅ Initial heartbeat sent successfully"),

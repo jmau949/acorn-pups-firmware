@@ -21,16 +21,22 @@ use crate::ble_server::WiFiCredentials;
 const NVS_NAMESPACE: &str = "wifi_config"; // Namespace groups related keys together
 const SSID_KEY: &str = "ssid"; // Key for storing WiFi network name
 const PASSWORD_KEY: &str = "password"; // Key for storing WiFi password
+const AUTH_TOKEN_KEY: &str = "auth_token"; // Key for storing authentication token
+const DEVICE_NAME_KEY: &str = "device_name"; // Key for storing device name
+const USER_TIMEZONE_KEY: &str = "user_timezone"; // Key for storing user timezone
 const WIFI_CONFIG_KEY: &str = "wifi_creds"; // Key for storing complete WiFi config as JSON
 
 // Extended WiFi configuration structure for storage
 // This includes extra metadata beyond just the basic credentials
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredWiFiConfig {
-    pub ssid: String,     // WiFi network name
-    pub password: String, // WiFi password
-    pub timestamp: u64,   // When this config was stored (Unix timestamp)
-    pub is_valid: bool,   // Whether this config should be used
+    pub ssid: String,          // WiFi network name
+    pub password: String,      // WiFi password
+    pub auth_token: String,    // Authentication token for device registration
+    pub device_name: String,   // User-defined device name
+    pub user_timezone: String, // User's timezone preference
+    pub timestamp: u64,        // When this config was stored (Unix timestamp)
+    pub is_valid: bool,        // Whether this config should be used
 }
 
 // WiFi storage manager - handles all NVS operations for WiFi credentials
@@ -73,18 +79,30 @@ impl WiFiStorage {
             return Err(anyhow!("SSID cannot be empty"));
         }
 
-        // Store basic credentials
+        // Store all credential fields
         self.nvs
             .set_str(SSID_KEY, &credentials.ssid)
             .map_err(|e| anyhow!("Failed to store SSID: {}", e))?;
         self.nvs
             .set_str(PASSWORD_KEY, &credentials.password)
             .map_err(|e| anyhow!("Failed to store password: {}", e))?;
+        self.nvs
+            .set_str(AUTH_TOKEN_KEY, &credentials.auth_token)
+            .map_err(|e| anyhow!("Failed to store auth token: {}", e))?;
+        self.nvs
+            .set_str(DEVICE_NAME_KEY, &credentials.device_name)
+            .map_err(|e| anyhow!("Failed to store device name: {}", e))?;
+        self.nvs
+            .set_str(USER_TIMEZONE_KEY, &credentials.user_timezone)
+            .map_err(|e| anyhow!("Failed to store user timezone: {}", e))?;
 
         // Create extended configuration with metadata
         let config = StoredWiFiConfig {
             ssid: credentials.ssid.clone(),
             password: credentials.password.clone(),
+            auth_token: credentials.auth_token.clone(),
+            device_name: credentials.device_name.clone(),
+            user_timezone: credentials.user_timezone.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -100,7 +118,7 @@ impl WiFiStorage {
             .set_str(WIFI_CONFIG_KEY, &config_json)
             .map_err(|e| anyhow!("Failed to store WiFi config: {}", e))?;
 
-        info!("WiFi credentials stored successfully");
+        info!("WiFi credentials and enhanced data stored successfully");
         Ok(())
     }
 
@@ -115,6 +133,9 @@ impl WiFiStorage {
                 return Ok(Some(WiFiCredentials {
                     ssid: config.ssid,
                     password: config.password,
+                    auth_token: config.auth_token,
+                    device_name: config.device_name,
+                    user_timezone: config.user_timezone,
                 }));
             }
         }
@@ -154,9 +175,34 @@ impl WiFiStorage {
         };
 
         info!("Loaded WiFi credentials for SSID: {}", ssid);
+
+        // Load additional fields (with defaults if not present)
+        let mut buffer = [0u8; 512]; // Larger buffer for auth tokens
+        let auth_token = self
+            .nvs
+            .get_str(AUTH_TOKEN_KEY, &mut buffer)
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+        let device_name = self
+            .nvs
+            .get_str(DEVICE_NAME_KEY, &mut buffer)
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+        let user_timezone = self
+            .nvs
+            .get_str(USER_TIMEZONE_KEY, &mut buffer)
+            .unwrap_or(None)
+            .unwrap_or("")
+            .to_string();
+
         Ok(Some(WiFiCredentials {
             ssid: ssid.to_string(),
             password: password.to_string(),
+            auth_token,
+            device_name,
+            user_timezone,
         }))
     }
 
@@ -164,12 +210,15 @@ impl WiFiStorage {
     pub fn clear_credentials(&mut self) -> Result<()> {
         info!("Clearing WiFi credentials from NVS");
 
-        // Remove individual keys
+        // Remove all credential keys
         let _ = self.nvs.remove(SSID_KEY);
         let _ = self.nvs.remove(PASSWORD_KEY);
+        let _ = self.nvs.remove(AUTH_TOKEN_KEY);
+        let _ = self.nvs.remove(DEVICE_NAME_KEY);
+        let _ = self.nvs.remove(USER_TIMEZONE_KEY);
         let _ = self.nvs.remove(WIFI_CONFIG_KEY);
 
-        info!("WiFi credentials cleared successfully");
+        info!("All WiFi credentials and enhanced data cleared successfully");
         Ok(())
     }
 

@@ -136,6 +136,9 @@ pub type BleResult<T> = Result<T, BleError>;
 pub struct WiFiCredentials {
     pub ssid: String,
     pub password: String,
+    pub auth_token: String,
+    pub device_name: String,
+    pub user_timezone: String,
 }
 
 // BLE communication events that main.rs expects

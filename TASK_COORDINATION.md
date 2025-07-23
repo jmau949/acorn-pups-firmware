@@ -207,7 +207,7 @@ async fn ble_provisioning_task() {
             // Signal credential reception
             BLE_LIFECYCLE_SIGNAL.signal(BleLifecycleEvent::CredentialsReceived);
             
-            // Store credentials
+            // Store enhanced credentials (WiFi + auth_token + device_name + user_timezone)
             wifi_storage.store_credentials(&credentials)?;
             WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::CredentialsStored);
             
@@ -216,6 +216,7 @@ async fn ble_provisioning_task() {
                 Ok(ip) => {
                     WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionSuccessful(ip));
                     // System coordinator will request BLE shutdown
+                    // Device will register with backend using credentials.auth_token
                 }
                 Err(e) => {
                     WIFI_STATUS_SIGNAL.signal(WiFiConnectionEvent::ConnectionFailed(format!("{:?}", e)));

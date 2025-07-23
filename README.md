@@ -4,16 +4,16 @@ This project demonstrates a complete WiFi provisioning system for ESP32 microcon
 
 ## 🎯 What This Project Does
 
-The ESP32 device starts up and checks if it knows how to connect to WiFi. If not, it becomes a Bluetooth device that mobile apps can connect to. The mobile app sends WiFi network credentials via Bluetooth, the ESP32 stores them permanently, connects to WiFi, and then turns off Bluetooth since it's no longer needed.
+The ESP32 device starts up and checks if it knows how to connect to WiFi. If not, it becomes a Bluetooth device that mobile apps can connect to. The mobile app sends enhanced WiFi provisioning data (network credentials, authentication token, device name, and user preferences) via Bluetooth, the ESP32 stores them permanently, connects to WiFi, registers with the backend using the auth token, and then turns off Bluetooth since it's no longer needed.
 
 ## 🏗️ System Architecture
 
 ```
 Mobile App (phone/tablet)
-    ↓ (Bluetooth LE)
-ESP32 BLE Server → WiFi Storage (NVS Flash) → WiFi Connection → Internet
-    ↑                                              ↓
-LED Controller ←―――――――――――――――――――――――――――――――――――――┘
+    ↓ (Enhanced BLE Data: WiFi + Auth Token + Device Info)
+ESP32 BLE Server → WiFi Storage (NVS Flash) → WiFi Connection → Device Registration → Internet
+    ↑                                              ↓                    ↓
+LED Controller ←―――――――――――――――――――――――――――――――――――――――――――――――――――――――――┘
 ```
 
 ## 📁 Project Structure
@@ -74,24 +74,39 @@ src/
 #### Process Flow:
 1. **Advertising**: Make device discoverable as "AcornPups-XXXX"
 2. **Service Creation**: Set up WiFi provisioning service with UUIDs
-3. **Data Reception**: Receive SSID and password from mobile app
-4. **Validation**: Check that credentials are properly formatted
-5. **Storage**: Save credentials to flash memory for future use
+3. **Data Reception**: Receive enhanced provisioning data from mobile app including:
+   - WiFi credentials (SSID and password)
+   - Authentication token for device registration
+   - User-defined device name
+   - User timezone preferences
+4. **Validation**: Check that all data is properly formatted
+5. **Storage**: Save complete provisioning data to flash memory for future use
+6. **Registration**: Use auth token for secure device registration with backend
 
 ### WiFi Storage (`wifi_storage.rs`)
 
 #### NVS Operations:
 - **Namespace**: Groups related data (like "wifi_config")
-- **Keys**: Individual data identifiers ("ssid", "password")
+- **Keys**: Individual data identifiers ("ssid", "password", "auth_token", "device_name", "user_timezone")
 - **Serialization**: Convert Rust structs to JSON for storage
 
 #### Data Persistence:
 ```rust
-// Store credentials
+// Store enhanced credentials
 self.nvs.set_str(SSID_KEY, &credentials.ssid)?;
+self.nvs.set_str(PASSWORD_KEY, &credentials.password)?;
+self.nvs.set_str(AUTH_TOKEN_KEY, &credentials.auth_token)?;
+self.nvs.set_str(DEVICE_NAME_KEY, &credentials.device_name)?;
+self.nvs.set_str(USER_TIMEZONE_KEY, &credentials.user_timezone)?;
 
-// Load credentials
-let ssid = self.nvs.get_str(SSID_KEY, &mut buffer)?;
+// Load credentials with enhanced fields
+let credentials = WiFiCredentials {
+    ssid: loaded_ssid,
+    password: loaded_password,
+    auth_token: loaded_auth_token,
+    device_name: loaded_device_name,
+    user_timezone: loaded_user_timezone,
+};
 ```
 
 ### WiFi Connection (in `main.rs`)
@@ -110,20 +125,27 @@ let ssid = self.nvs.get_str(SSID_KEY, &mut buffer)?;
 2. Checks NVS for stored WiFi credentials → None found
 3. Starts BLE advertising as "AcornPups-1234"
 4. Mobile app connects via Bluetooth
-5. App sends WiFi network name and password
-6. Device validates and stores credentials in flash
+5. App sends enhanced provisioning data including:
+   - WiFi network credentials (SSID and password)
+   - Authentication token for device registration
+   - User-defined device name
+   - User timezone preference
+6. Device validates and stores all data in flash
 7. Device connects to WiFi network
 8. Device gets IP address (e.g., 192.168.1.100)
-9. Device sends test message to verify internet
-10. Device notifies mobile app of success
-11. Device stops BLE advertising (no longer needed)
+9. Device registers with backend using auth token and device info
+10. Device sends test message to verify internet
+11. Device notifies mobile app of success
+12. Device stops BLE advertising (no longer needed)
 
 ### Subsequent Boots (WiFi Stored)
 1. Device starts up
 2. Checks NVS for stored WiFi credentials → Found!
 3. Automatically connects to stored WiFi network
-4. Skips BLE provisioning entirely
-5. Ready for normal operation
+4. Loads stored auth token and device info
+5. Registers with backend if not already registered
+6. Skips BLE provisioning entirely
+7. Ready for normal operation
 
 ## 🎨 LED Patterns
 
@@ -355,9 +377,39 @@ Your mobile app needs to:
 1. **Scan for BLE devices** with name "AcornPups-XXXX"
 2. **Connect to device** and discover services
 3. **Find WiFi service** using UUID: `12345678-1234-1234-1234-123456789abc`
-4. **Write SSID** to characteristic: `12345678-1234-1234-1234-123456789abd`
-5. **Write password** to characteristic: `12345678-1234-1234-1234-123456789abe`
-6. **Read status** from characteristic: `12345678-1234-1234-1234-123456789abf`
+4. **Send enhanced provisioning data** as JSON to the main characteristic
+5. **Read status** from characteristic: `12345678-1234-1234-1234-123456789abf`
+
+### Enhanced BLE Data Structure
+
+The mobile app should send a JSON object with the following structure:
+
+```json
+{
+  "ssid": "MyWiFiNetwork",
+  "password": "wifipassword123",
+  "auth_token": "eyJraWQiOiI0eEdGUjRMaH...",
+  "device_name": "Living Room Receiver",
+  "user_timezone": "America/Los_Angeles"
+}
+```
+
+### Field Descriptions:
+
+- **`ssid`**: WiFi network name (required)
+- **`password`**: WiFi password (required)
+- **`auth_token`**: JWT authentication token from user login (required)
+- **`device_name`**: User-defined name for the device (required)
+- **`user_timezone`**: User's timezone in IANA format (required)
+
+### Integration Flow:
+
+1. User authenticates in mobile app and obtains JWT token
+2. User initiates device setup and connects to ESP32 via BLE
+3. User enters WiFi credentials and device name
+4. App automatically includes auth token and user timezone
+5. App sends complete JSON object to ESP32
+6. ESP32 stores all data and uses auth token for backend registration
 
 ## 🚀 Next Steps for Production
 

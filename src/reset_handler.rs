@@ -422,7 +422,15 @@ impl ResetHandler {
 
         // Define known keys for each namespace to erase
         let keys_to_remove = match namespace {
-            "wifi_config" => vec!["ssid", "password", "wifi_creds", "last_connected"],
+            "wifi_config" => vec![
+                "ssid",
+                "password",
+                "auth_token",
+                "device_name",
+                "user_timezone",
+                "wifi_creds",
+                "last_connected",
+            ],
             "mqtt_certs" => vec![
                 "device_cert",
                 "private_key",
