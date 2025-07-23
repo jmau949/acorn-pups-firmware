@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 // Import anyhow for error handling following existing patterns
 use anyhow::{anyhow, Result};
 
-// Time utilities handled in generate_reset_timestamp function
+// Import time utilities for proper ISO 8601 timestamps
+use chrono::{DateTime, Utc};
 
 // NVS namespace constants
 const RESET_PENDING_NAMESPACE: &str = "reset_pending";
@@ -224,21 +225,63 @@ impl ResetStorage {
         Ok(())
     }
 
-    /// Erase a specific NVS namespace
+    /// Erase a specific NVS namespace by removing all known keys
     fn erase_namespace(nvs_partition: EspDefaultNvsPartition, namespace: &str) -> Result<()> {
         debug!("🗑️ Erasing NVS namespace: {}", namespace);
 
-        let _nvs = EspNvs::new(nvs_partition, namespace, true)
+        let mut nvs = EspNvs::new(nvs_partition, namespace, true)
             .map_err(|e| anyhow!("Failed to open namespace {}: {}", namespace, e))?;
 
-        // Note: NVS erase_all is not available in this version
-        // In production, you would manually remove all keys
-        warn!(
-            "NVS namespace erasure not implemented in this version: {}",
-            namespace
-        );
+        // Define known keys for each namespace to erase
+        let keys_to_remove = match namespace {
+            WIFI_CONFIG_NAMESPACE => vec!["ssid", "password", "wifi_creds"],
+            MQTT_CERTS_NAMESPACE => vec![
+                "device_cert",
+                "private_key",
+                "root_ca",
+                "cert_metadata",
+                "device_id",
+                "cert_arn",
+                "endpoint",
+                "created_at",
+            ],
+            ACORN_DEVICE_NAMESPACE => vec![
+                "device_id",
+                "firmware_version",
+                "device_config",
+                "auth_token",
+                "registration_status",
+                "last_heartbeat",
+            ],
+            _ => {
+                warn!("Unknown namespace for erasure: {}", namespace);
+                return Ok(());
+            }
+        };
 
-        debug!("✅ Successfully erased namespace: {}", namespace);
+        // Remove each key in the namespace
+        let mut removed_count = 0;
+        for key in keys_to_remove {
+            match nvs.remove(key) {
+                Ok(existed) => {
+                    if existed {
+                        debug!("🗑️ Removed key: {}", key);
+                        removed_count += 1;
+                    } else {
+                        debug!("🔍 Key not found: {}", key);
+                    }
+                }
+                Err(e) => {
+                    // Error removing key, log and continue
+                    debug!("⚠️ Error removing key {}: {}", key, e);
+                }
+            }
+        }
+
+        info!(
+            "✅ Erased {} keys from namespace: {}",
+            removed_count, namespace
+        );
         Ok(())
     }
 
@@ -304,19 +347,7 @@ impl ResetStorage {
 
     /// Generate current timestamp in ISO 8601 format
     pub fn generate_reset_timestamp() -> String {
-        // For embedded systems without real-time clock, use a placeholder
-        // In production, you would use the system time or NTP
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let since_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-
-        format!(
-            "2025-01-21T{:02}:{:02}:{:02}Z",
-            (since_epoch.as_secs() / 3600) % 24,
-            (since_epoch.as_secs() / 60) % 60,
-            since_epoch.as_secs() % 60
-        )
+        let now: DateTime<Utc> = Utc::now();
+        now.to_rfc3339()
     }
 }

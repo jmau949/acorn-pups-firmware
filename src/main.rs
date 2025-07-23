@@ -44,7 +44,7 @@ use embassy_time::with_timeout;
 
 // Import logging macros for debug output over serial/UART
 // error! = critical errors, info! = general information, warn! = warnings
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 // Import anyhow for error handling
 use anyhow::Result;
@@ -69,7 +69,7 @@ use device_api::DeviceApiClient; // Device-specific API client for registration
 use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
 use reset_handler::ResetHandler; // Reset behavior execution
-                                 // Reset manager imported in task function
+use reset_manager::ResetManager; // Reset button monitoring
 use reset_storage::ResetStorage; // Reset state persistence
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
@@ -274,7 +274,11 @@ async fn main(spawner: Spawner) {
     info!("🔌 MQTT manager task spawned - will activate after device registration");
 
     // Spawn the reset manager task - handles physical reset button monitoring
-    if let Err(_) = spawner.spawn(reset_manager_task(mqtt_device_id.clone(), nvs.clone())) {
+    if let Err(_) = spawner.spawn(reset_manager_task(
+        mqtt_device_id.clone(),
+        nvs.clone(),
+        peripherals.pins.gpio0,
+    )) {
         error!("Failed to spawn reset manager task");
         return;
     }
@@ -1096,7 +1100,11 @@ async fn mqtt_manager_task(device_id: String) {
 
 // RESET MANAGER TASK - Handles physical reset button monitoring and factory reset operations
 #[embassy_executor::task]
-async fn reset_manager_task(device_id: String, nvs_partition: EspDefaultNvsPartition) {
+async fn reset_manager_task(
+    device_id: String,
+    nvs_partition: EspDefaultNvsPartition,
+    gpio0: esp_idf_svc::hal::gpio::Gpio0,
+) {
     info!("🔄 Reset Manager Task started for device: {}", device_id);
 
     // Initialize reset storage
@@ -1122,23 +1130,69 @@ async fn reset_manager_task(device_id: String, nvs_partition: EspDefaultNvsParti
 
     info!("🔄 Reset handler initialized successfully");
 
-    // Check for pending reset notifications from previous offline resets
-    info!("🔍 Checking for pending reset notifications...");
-    if let Err(e) = reset_handler.process_deferred_notifications().await {
-        warn!("⚠️ Failed to process deferred reset notifications: {}", e);
+    // Initialize actual reset manager with GPIO
+    let mut reset_manager =
+        match ResetManager::new(device_id.clone(), "placeholder-cert-arn".to_string(), gpio0) {
+            Ok(manager) => {
+                info!("✅ Reset manager GPIO initialized successfully");
+                manager
+            }
+            Err(e) => {
+                error!("❌ Failed to initialize reset manager GPIO: {}", e);
+                return;
+            }
+        };
+
+    // Initialize reset manager storage with a separate storage instance
+    let reset_manager_storage = loop {
+        match ResetStorage::new_with_partition(nvs_partition.clone()) {
+            Ok(storage) => {
+                info!("✅ Reset manager storage initialized successfully");
+                break storage;
+            }
+            Err(e) => {
+                error!("❌ Failed to initialize reset manager storage: {:?}", e);
+                Timer::after(Duration::from_secs(10)).await;
+            }
+        }
+    };
+
+    if let Err(e) = reset_manager.initialize_storage(reset_manager_storage) {
+        error!("❌ Failed to initialize reset manager storage: {}", e);
+        return;
     }
 
-    // Note: GPIO reset button monitoring would be implemented here
-    // For now, we'll focus on deferred notification processing
-    info!("🔄 Reset manager task active - monitoring for deferred notifications");
+    info!("🔄 Reset manager task active - waiting for MQTT connection signal");
 
-    // Main loop - process deferred notifications periodically
+    // Wait for MQTT connection to become available before processing deferred notifications
     loop {
-        // Check for deferred notifications every 30 seconds
-        Timer::after(Duration::from_secs(30)).await;
+        use crate::mqtt_manager::MQTT_EVENT_SIGNAL;
+        let mqtt_event = MQTT_EVENT_SIGNAL.wait().await;
 
-        if let Err(e) = reset_handler.process_deferred_notifications().await {
-            warn!("⚠️ Error processing deferred reset notifications: {}", e);
+        match mqtt_event {
+            crate::mqtt_manager::MqttManagerEvent::Connected => {
+                info!("🔌 MQTT connected - processing deferred reset notifications");
+
+                if let Err(e) = reset_handler.process_deferred_notifications().await {
+                    error!("❌ Error processing deferred reset notifications: {}", e);
+                } else {
+                    info!("✅ Deferred reset notification processing completed");
+                }
+
+                // After processing deferred notifications once, start GPIO monitoring
+                break;
+            }
+            _ => {
+                // Other MQTT events, continue waiting for connection
+                debug!("🔄 MQTT event received, waiting for connection");
+            }
         }
+    }
+
+    info!("🎯 Starting GPIO reset button monitoring");
+
+    // Start the main reset manager loop for GPIO monitoring
+    if let Err(e) = reset_manager.run().await {
+        error!("❌ Reset manager encountered fatal error: {}", e);
     }
 }

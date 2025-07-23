@@ -11,13 +11,16 @@ use embassy_sync::signal::Signal;
 use embassy_time::{with_timeout, Duration, Timer};
 
 // Import ESP-IDF GPIO functionality for reset button input
-// GPIO functionality would be imported here in production
+use esp_idf_svc::hal::gpio::{Gpio0, Input, PinDriver, Pull};
 
 // Import logging macros for debug output
 use log::{debug, error, info, warn};
 
 // Import anyhow for error handling following existing patterns
 use anyhow::{anyhow, Result};
+
+// Import atomic operations for reset state management
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // Import our reset storage module and system events
 use crate::reset_storage::{ResetNotificationData, ResetStorage};
@@ -63,8 +66,12 @@ pub static RESET_EVENT_CHANNEL: Channel<
 pub static RESET_MANAGER_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, ResetManagerEvent> =
     Signal::new();
 
+// Atomic reset state to prevent concurrent resets
+static RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
 /// Reset button manager - handles GPIO monitoring and reset coordination
 pub struct ResetManager {
+    reset_button: PinDriver<'static, Gpio0, Input>,
     reset_storage: Option<ResetStorage>,
     device_id: String,
     certificate_arn: String,
@@ -72,14 +79,20 @@ pub struct ResetManager {
 
 impl ResetManager {
     /// Create new reset manager with GPIO configuration
-    pub fn new(device_id: String, certificate_arn: String) -> Result<Self> {
+    pub fn new(device_id: String, certificate_arn: String, gpio0: Gpio0) -> Result<Self> {
         info!(
             "🔧 Initializing reset manager for GPIO{}",
             RESET_BUTTON_GPIO
         );
 
-        // Note: GPIO configuration would be done here in production
-        // For now, we don't need the button pin for compilation
+        // Configure reset button GPIO as input with internal pull-up
+        // Pull-up means button press will read as LOW (0)
+        let mut reset_button = PinDriver::input(gpio0)
+            .map_err(|e| anyhow!("Failed to configure reset button GPIO: {}", e))?;
+
+        reset_button
+            .set_pull(Pull::Up)
+            .map_err(|e| anyhow!("Failed to set pull-up on reset button GPIO: {}", e))?;
 
         info!(
             "✅ Reset manager initialized with button on GPIO{}",
@@ -87,6 +100,7 @@ impl ResetManager {
         );
 
         Ok(Self {
+            reset_button,
             reset_storage: None,
             device_id,
             certificate_arn,
@@ -135,24 +149,53 @@ impl ResetManager {
 
     /// Monitor reset button state with debouncing and hold detection
     async fn monitor_reset_button(&mut self) -> Result<()> {
-        // Note: In production, this would read GPIO pin state
-        // For now, we'll simulate button monitoring
+        // Read current button state (LOW = pressed due to pull-up)
+        let button_pressed = self.reset_button.is_low();
 
-        // Simulate checking for button press periodically
-        Timer::after(Duration::from_secs(10)).await;
+        if button_pressed {
+            debug!("🔘 Reset button pressed, starting hold detection");
+            RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetButtonPressed);
 
+            // Debounce the button press
+            Timer::after(Duration::from_millis(BUTTON_DEBOUNCE_MS)).await;
+
+            // Verify button is still pressed after debounce
+            if self.reset_button.is_low() {
+                // Start hold time measurement
+                if let Err(e) = self.handle_button_hold().await {
+                    warn!("⚠️ Button hold handling failed: {}", e);
+                    return Err(e);
+                }
+            } else {
+                debug!("🔘 Button press was too short (bounce)");
+            }
+        }
+
+        // Small delay to prevent busy waiting
+        Timer::after(Duration::from_millis(RESET_CHECK_INTERVAL_MS)).await;
         Ok(())
     }
 
     /// Handle button hold detection and reset triggering
     async fn handle_button_hold(&mut self) -> Result<()> {
+        let start_time = embassy_time::Instant::now();
+        let hold_duration = Duration::from_millis(BUTTON_HOLD_TIME_MS);
+
         info!(
             "⏳ Button hold detected, waiting for {}ms hold time",
             BUTTON_HOLD_TIME_MS
         );
 
-        // Simulate button hold detection
-        Timer::after(Duration::from_millis(BUTTON_HOLD_TIME_MS)).await;
+        // Monitor button state during hold period
+        while start_time.elapsed() < hold_duration {
+            // Check if button was released
+            if self.reset_button.is_high() {
+                debug!("🔘 Button released before hold time completed");
+                return Ok(());
+            }
+
+            Timer::after(Duration::from_millis(RESET_CHECK_INTERVAL_MS)).await;
+        }
 
         // Button held for required duration - trigger reset
         info!("🔥 Reset button held for required time - triggering reset");
@@ -239,6 +282,12 @@ impl ResetManager {
 
     /// Execute the reset process based on WiFi availability
     async fn execute_reset(&mut self, wifi_available: bool) -> Result<()> {
+        // Check if reset is already in progress to prevent concurrent resets
+        if RESET_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+            warn!("⚠️ Reset already in progress, ignoring duplicate request");
+            return Ok(());
+        }
+
         info!(
             "🚀 Executing reset process - WiFi available: {}",
             wifi_available
@@ -252,17 +301,20 @@ impl ResetManager {
             reason: "physical_button_reset".to_string(),
         };
 
-        if wifi_available {
+        let result = if wifi_available {
             // Online reset: Send immediate notification then reset
             info!("🌐 Performing online reset with immediate notification");
-            self.execute_online_reset(reset_data).await?;
+            self.execute_online_reset(reset_data).await
         } else {
             // Offline reset: Store notification for later delivery
             info!("📴 Performing offline reset with deferred notification");
-            self.execute_offline_reset(reset_data).await?;
-        }
+            self.execute_offline_reset(reset_data).await
+        };
 
-        Ok(())
+        // Clear reset in progress flag
+        RESET_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+        result
     }
 
     /// Execute online reset with immediate MQTT notification
@@ -309,14 +361,36 @@ impl ResetManager {
 
         // Store reset notification for deferred delivery
         if let Some(ref mut storage) = self.reset_storage {
-            if let Err(e) = storage.store_reset_notification(&reset_data) {
-                error!("❌ Failed to store reset notification: {}", e);
-                // Continue with reset even if storage fails
-            } else {
-                info!("💾 Reset notification stored for deferred delivery");
+            // Retry storage operation up to 3 times
+            let mut retry_count = 0;
+            while retry_count < 3 {
+                match storage.store_reset_notification(&reset_data) {
+                    Ok(_) => {
+                        info!("💾 Reset notification stored for deferred delivery");
+                        break;
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        error!(
+                            "❌ Failed to store reset notification (attempt {}): {}",
+                            retry_count, e
+                        );
+                        if retry_count >= 3 {
+                            error!(
+                                "❌ Failed to store reset notification after {} attempts",
+                                retry_count
+                            );
+                            return Err(anyhow!("Critical: Unable to store reset notification for deferred delivery"));
+                        }
+                        Timer::after(Duration::from_millis(100)).await;
+                    }
+                }
             }
         } else {
-            warn!("⚠️ Reset storage not available, notification will be lost");
+            error!("❌ Reset storage not available, cannot store notification");
+            return Err(anyhow!(
+                "Critical: Reset storage not available for deferred notification"
+            ));
         }
 
         // Perform factory reset

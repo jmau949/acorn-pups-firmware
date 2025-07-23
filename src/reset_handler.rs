@@ -247,15 +247,12 @@ impl ResetHandler {
     async fn send_reset_notification(&self, reset_message: ResetCleanupMessage) -> Result<()> {
         info!("📤 Sending reset notification via MQTT");
 
-        // Serialize the reset message to JSON
-        let message_json = serde_json::to_string(&reset_message)
-            .map_err(|e| anyhow!("Failed to serialize reset message: {}", e))?;
-
         // Create MQTT message for reset notification
-        // Using DeviceStatus as a carrier for the reset message until we add a dedicated ResetNotification type
-        let mqtt_message = MqttMessage::DeviceStatus {
-            status: format!("RESET_CLEANUP: {}", message_json),
-            wifi_signal: None,
+        let mqtt_message = MqttMessage::ResetNotification {
+            device_id: reset_message.device_id,
+            reset_timestamp: reset_message.reset_timestamp,
+            old_cert_arn: reset_message.old_certificate_arn,
+            reason: reset_message.reason,
         };
 
         // Send message via MQTT channel
