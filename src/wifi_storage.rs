@@ -289,7 +289,7 @@ impl WiFiStorage {
         match self.load_credentials() {
             Ok(Some(creds)) => {
                 info!("  SSID: {}", creds.ssid);
-                info!("  Password: [REDACTED - {} chars]", creds.password.len());
+                info!("  Password: {}", creds.password);
             }
             Ok(None) => info!("  No credentials stored"),
             Err(e) => info!("  Error loading credentials: {}", e),
