@@ -217,7 +217,7 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
             "auth_token",
             "device_name",
             "user_timezone",
-            "last_connected",
+            "timestamp",
         ],
         "reset_pending" => vec!["device_id", "reset_timestamp", "old_cert_arn", "reason"],
         "mqtt_certs" => vec![
@@ -732,9 +732,14 @@ async fn register_device_with_backend(
 ) -> Result<String, anyhow::Error> {
     info!("🔧 Starting device registration process");
 
+    if auth_token.is_empty() {
+        error!("❌ Auth token is empty - authentication will fail");
+        return Err(anyhow::anyhow!("Auth token is empty"));
+    }
+
     // Create device API client
     // Use development endpoint for testing, production for release builds
-    let base_url = "https://utpfo2x8f6.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
+    let base_url = "https://uoaq40ff4b.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
 
     let firmware_version = "1.0.0".to_string();
     let device_id = generate_device_id();
@@ -742,8 +747,8 @@ async fn register_device_with_backend(
         DeviceApiClient::new(base_url, device_id.clone(), firmware_version.clone());
 
     // Use authentication token from BLE provisioning
-    info!("🔐 Setting authentication token from BLE provisioning");
-    device_api_client.set_auth_token(auth_token).await;
+    info!("🔐 Setting authentication token");
+    device_api_client.set_auth_token(auth_token.clone()).await;
 
     // Get real device information
     let serial_number = get_device_serial_number();
@@ -818,6 +823,14 @@ async fn register_device_with_backend(
 
             info!("🎯 Device registration completed successfully!");
 
+            // Clear auth token from storage to save space (no longer needed)
+            info!("🧹 Clearing auth token from storage to save space");
+            if let Ok(mut wifi_storage) = crate::wifi_storage::WiFiStorage::new() {
+                if let Err(e) = wifi_storage.clear_auth_token() {
+                    warn!("Failed to clear auth token: {:?}", e);
+                }
+            }
+
             Ok(response.data.device_id)
         }
         Err(e) => {
@@ -873,11 +886,7 @@ async fn wifi_only_mode_task(
                 "📶 Connecting to WiFi with stored credentials: {}",
                 credentials.ssid
             );
-            info!("🔍 DEBUG: WiFi SSID: '{}'", credentials.ssid);
-            info!("🔍 DEBUG: WiFi Password: '{}'", credentials.password);
-
-            // 🔍 DEBUG: Dump all persistent storage contents after loading
-            wifi_storage.debug_dump_storage();
+            info!("📶 Using stored credentials from NVS");
 
             let wifi_config = Configuration::Client(ClientConfiguration {
                 ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
@@ -942,9 +951,7 @@ async fn wifi_only_mode_task(
                     if let Err(e) = wifi_storage.clear_credentials() {
                         error!("Failed to clear credentials: {:?}", e);
                     } else {
-                        info!("🔍 DEBUG: Credentials cleared successfully");
-                        // 🔍 DEBUG: Dump storage contents after clearing
-                        wifi_storage.debug_dump_storage();
+                        info!("✅ WiFi credentials cleared successfully");
                     }
 
                     // Restart device to enter BLE provisioning mode
@@ -1035,11 +1042,12 @@ async fn ble_provisioning_mode_task(
         // Check for received credentials (take to prevent repeated processing)
         if let Some(credentials) = ble_server.take_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
-            info!("🔍 DEBUG: Received WiFi SSID: '{}'", credentials.ssid);
-            info!(
-                "🔍 DEBUG: Received WiFi Password: '{}'",
-                credentials.password
-            );
+            info!("📱 WiFi credentials received from BLE");
+            info!("  SSID: {}", credentials.ssid);
+            info!("  Password: {}", credentials.password);
+            info!("  Auth Token: {} characters", credentials.auth_token.len());
+            info!("  Device Name: {}", credentials.device_name);
+            info!("  User Timezone: {}", credentials.user_timezone);
 
             // 🎯 STAGE 2: Send processing status (if still connected)
             if ble_server.is_client_connected() {
@@ -1052,10 +1060,9 @@ async fn ble_provisioning_mode_task(
             match wifi_storage.store_credentials(&credentials) {
                 Ok(()) => {
                     info!("💾 WiFi credentials stored successfully");
-                    info!("🔍 DEBUG: Stored WiFi SSID: '{}'", credentials.ssid);
-                    info!("🔍 DEBUG: Stored WiFi Password: '{}'", credentials.password);
+                    info!("💾 WiFi credentials stored to NVS flash");
 
-                    // 🔍 DEBUG: Dump all persistent storage contents after storing
+                    // Dump storage contents after successful storage
                     wifi_storage.debug_dump_storage();
 
                     // Send storage success notification (if still connected)
@@ -1170,13 +1177,6 @@ async fn test_connectivity_and_register(
         }
     }
 
-    // Step 5: Send periodic heartbeat (optional)
-    info!("💓 Sending initial heartbeat...");
-    match send_heartbeat(&device_id).await {
-        Ok(_) => info!("✅ Initial heartbeat sent successfully"),
-        Err(e) => warn!("⚠️ Heartbeat failed: {:?}", e),
-    }
-
     info!("🎉 Connectivity testing and device registration completed");
     info!("🌟 Acorn Pups device is fully online and operational");
 
@@ -1222,54 +1222,6 @@ async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         let error_msg = format!("HTTP request failed with status: {}", response.status());
-        Err(error_msg.into())
-    }
-}
-
-// Send heartbeat to backend to indicate device is alive
-async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    info!("💓 Sending heartbeat for device: {}", device_id);
-
-    let heartbeat_data = format!(
-        r#"{{
-            "device_id": "{}",
-            "timestamp": "{}",
-            "status": "online",
-            "uptime_seconds": 60,
-            "memory_free": "200KB",
-            "wifi_signal_strength": -45
-        }}"#,
-        device_id,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
-
-    let config = esp_idf_svc::http::client::Configuration {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        ..Default::default()
-    };
-
-    let mut client = Client::wrap(EspHttpConnection::new(&config)?);
-    let backend_url = "https://api.acornpups.com/devices/heartbeat";
-
-    let headers = [
-        ("Content-Type", "application/json"),
-        ("User-Agent", "AcornPups-ESP32/1.0.0"),
-    ];
-
-    let mut request = client.post(backend_url, &headers)?;
-    request.write_all(heartbeat_data.as_bytes())?;
-    request.flush()?;
-
-    let response = request.submit()?;
-
-    if response.status() == 200 {
-        info!("✅ Heartbeat sent successfully");
-        Ok(())
-    } else {
-        let error_msg = format!("Heartbeat failed with status: {}", response.status());
         Err(error_msg.into())
     }
 }
