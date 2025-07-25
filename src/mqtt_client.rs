@@ -30,7 +30,6 @@ const TOPIC_DEVICE_STATUS: &str = "acorn-pups/status";
 const TOPIC_HEARTBEAT: &str = "acorn-pups/heartbeat";
 const TOPIC_SETTINGS: &str = "acorn-pups/settings";
 const TOPIC_COMMANDS: &str = "acorn-pups/commands";
-const TOPIC_RESET: &str = "acorn-pups/reset";
 
 // Connection retry configuration with exponential backoff
 const INITIAL_RETRY_DELAY_MS: u64 = 1000; // 1 second
@@ -396,45 +395,6 @@ impl AwsIotMqttClient {
             info!(
                 "🔊 Published authenticated volume change: {}% ({})",
                 volume, source
-            );
-            Ok(())
-        } else {
-            Err(anyhow!("MQTT client not initialized"))
-        }
-    }
-
-    /// Publish reset notification message
-    pub async fn publish_reset_notification(
-        &mut self,
-        device_id: &str,
-        reset_timestamp: &str,
-        old_cert_arn: &str,
-        reason: &str,
-    ) -> Result<()> {
-        if !self.is_connected() {
-            return Err(anyhow!("MQTT client not connected"));
-        }
-
-        let message = serde_json::json!({
-            "command": "reset_cleanup",
-            "deviceId": device_id,
-            "resetTimestamp": reset_timestamp,
-            "oldCertificateArn": old_cert_arn,
-            "reason": reason
-        });
-
-        let topic = format!("{}/{}", TOPIC_RESET, device_id);
-        let json_payload = serde_json::to_string(&message)
-            .map_err(|e| anyhow!("Failed to serialize reset notification: {}", e))?;
-
-        if let Some(ref mut client) = self.client {
-            client
-                .publish(&topic, QoS::AtLeastOnce, false, json_payload.as_bytes())
-                .map_err(|e| anyhow!("Failed to publish reset notification: {:?}", e))?;
-
-            info!(
-                "🔄 Published authenticated reset notification for device: {}",
-                device_id
             );
             Ok(())
         } else {

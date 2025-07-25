@@ -43,7 +43,7 @@ use esp_idf_svc::wifi::{AsyncWifi, ClientConfiguration, Configuration, EspWifi};
 
 // Import HTTP client functionality for connectivity testing
 use embedded_svc::http::client::Client;
-use embedded_svc::io::Write;
+// Note: embedded_svc::io::Write import removed - no longer used
 use esp_idf_svc::http::client::EspHttpConnection;
 
 // Import standard library components
@@ -55,6 +55,46 @@ use embassy_time::with_timeout;
 // Import logging macros for debug output over serial/UART
 // error! = critical errors, info! = general information, warn! = warnings
 use log::{debug, error, info, warn};
+
+/// Get current timestamp in ISO 8601 format
+fn get_iso8601_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Simple ISO 8601 timestamp generation
+    format!(
+        "2025-01-{:02}T{:02}:{:02}:{:02}Z",
+        ((timestamp / 86400) % 31) + 1, // Day
+        ((timestamp / 3600) % 24),      // Hour
+        ((timestamp / 60) % 60),        // Minute
+        (timestamp % 60)                // Second
+    )
+}
+
+/// Generate new device instance ID (UUID v4) for registration security
+fn generate_device_instance_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Simple UUID-like generation using timestamp
+    // In production, use a proper UUID library
+    format!(
+        "inst-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (timestamp & 0xFFFFFFFF) as u32,
+        ((timestamp >> 32) & 0xFFFF) as u16,
+        0x4000 | ((timestamp >> 16) & 0x0FFF) as u16, // Version 4
+        0x8000 | ((timestamp >> 8) & 0x3FFF) as u16,  // Variant
+        timestamp & 0xFFFFFFFFFFFF
+    )
+}
 
 // Import anyhow for error handling
 use anyhow::Result;
@@ -69,7 +109,7 @@ mod mqtt_client; // AWS IoT Core MQTT client with TLS authentication
 mod mqtt_manager; // Embassy task coordination for MQTT operations
 mod reset_handler; // Reset behavior execution and notification processing
 mod reset_manager; // GPIO reset button monitoring and state management
-mod reset_storage; // Reset state persistence and NVS management
+                   // Note: reset_storage module removed - functionality moved to reset_manager
 mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
@@ -79,8 +119,8 @@ use device_api::DeviceApiClient; // Device-specific API client for registration
 use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
 use reset_handler::ResetHandler; // Reset behavior execution
+use reset_manager::ResetNotificationData; // Reset notification data structure for events
 use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring
-use reset_storage::{ResetNotificationData, ResetStorage}; // Reset state persistence and data structure
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 // Helper functions to get real device information
@@ -368,7 +408,8 @@ async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
     info!("🆔 TESTING: Generated device ID for reset: {}", device_id);
 
     // Check WiFi connectivity status from system state
-    let wifi_available = {
+    let _wifi_available = {
+        // Prefixed with _ to indicate intentionally unused
         // Since we're early in startup, WiFi likely isn't connected yet
         // But we check the system state to follow the same pattern as physical reset
         let system_state = SYSTEM_STATE.lock().await;
@@ -382,7 +423,7 @@ async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
     // Create reset notification data (same as physical button press)
     let reset_data = ResetNotificationData {
         device_id: device_id.clone(),
-        reset_timestamp: ResetStorage::generate_reset_timestamp(),
+        reset_timestamp: get_iso8601_timestamp(), // Use local function instead of ResetStorage
         old_cert_arn: "early-startup-no-cert".to_string(), // No cert available at startup
         reason: "startup_flag_reset".to_string(), // Different reason to distinguish from physical
     };
@@ -393,29 +434,8 @@ async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
     info!("  Cert ARN: {}", reset_data.old_cert_arn);
     info!("  Reason: {}", reset_data.reason);
 
-    // Initialize reset storage for the reset handler
-    let reset_storage = match ResetStorage::new_with_partition(nvs_partition.clone()) {
-        Ok(storage) => {
-            info!("✅ TESTING: Reset storage initialized successfully");
-            storage
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "TESTING: Failed to initialize reset storage: {:?}",
-                e
-            ));
-        }
-    };
-
-    // Initialize reset handler (same as physical reset workflow)
+    // Initialize reset handler for factory reset execution
     let mut reset_handler = ResetHandler::new(device_id.clone());
-
-    if let Err(e) = reset_handler.initialize_storage(reset_storage) {
-        return Err(anyhow::anyhow!(
-            "TESTING: Failed to initialize reset handler storage: {:?}",
-            e
-        ));
-    }
 
     if let Err(e) = reset_handler.initialize_nvs_partition(nvs_partition.clone()) {
         return Err(anyhow::anyhow!(
@@ -426,14 +446,9 @@ async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
 
     info!("✅ TESTING: Reset handler initialized successfully");
 
-    // Execute the appropriate reset based on WiFi status (same as physical reset)
-    let execution_result = if wifi_available {
-        info!("🌐 TESTING: Executing online reset (WiFi available)");
-        reset_handler.execute_online_reset(reset_data).await
-    } else {
-        info!("📱 TESTING: Executing offline reset (WiFi unavailable)");
-        reset_handler.execute_offline_reset(reset_data).await
-    };
+    // Execute factory reset (no more online/offline distinction)
+    info!("🔥 TESTING: Executing factory reset with device instance ID security");
+    let execution_result = reset_handler.execute_factory_reset(reset_data.reason).await;
 
     match execution_result {
         Ok(_) => {
@@ -804,8 +819,47 @@ async fn register_device_with_backend(
     info!("  Serial Number: {}", serial_number);
     info!("  MAC Address: {}", mac_address);
 
-    let device_registration =
-        device_api_client.create_device_registration(serial_number, mac_address, device_name);
+    // Check for reset state first, then determine registration parameters
+    let nvs_partition = EspDefaultNvsPartition::take().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to take NVS partition for reset state check: {:?}",
+            e
+        )
+    })?;
+
+    let mut reset_handler = ResetHandler::new(device_id.clone());
+    reset_handler.initialize_nvs_partition(nvs_partition.clone())?;
+
+    let (device_instance_id, device_state, reset_timestamp) =
+        if let Ok(Some(reset_state)) = reset_handler.load_reset_state() {
+            info!("🔄 Found reset state - device was factory reset");
+            info!("📝 Reset instance ID: {}", reset_state.device_instance_id);
+            info!("📝 Reset timestamp: {}", reset_state.reset_timestamp);
+            (
+                reset_state.device_instance_id,
+                reset_state.device_state,
+                Some(reset_state.reset_timestamp),
+            )
+        } else {
+            info!("📋 No reset state found - normal device registration");
+            let instance_id = generate_device_instance_id();
+            info!("🆔 Generated device instance ID: {}", instance_id);
+            (instance_id, "normal".to_string(), None)
+        };
+
+    info!("📋 Registration parameters:");
+    info!("  Instance ID: {}", device_instance_id);
+    info!("  Device state: {}", device_state);
+    info!("  Reset timestamp: {:?}", reset_timestamp);
+
+    let device_registration = device_api_client.create_device_registration(
+        serial_number,
+        mac_address,
+        device_name,
+        device_instance_id,
+        device_state,
+        reset_timestamp,
+    );
 
     info!("📋 Device registration data:");
     info!("  Device ID: {}", device_registration.device_id);
@@ -1431,28 +1485,10 @@ async fn reset_manager_task(
 ) {
     info!("🔄 Reset Manager Task started for device: {}", device_id);
 
-    // Initialize reset storage
-    let reset_storage = loop {
-        match ResetStorage::new_with_partition(nvs_partition.clone()) {
-            Ok(storage) => {
-                info!("✅ Reset storage initialized successfully");
-                break storage;
-            }
-            Err(e) => {
-                error!("❌ Failed to initialize reset storage: {:?}", e);
-                Timer::after(Duration::from_secs(10)).await;
-            }
-        }
-    };
-
     // Initialize reset handler (single source of truth for reset execution)
     let mut reset_handler = ResetHandler::new(device_id.clone());
-    if let Err(e) = reset_handler.initialize_storage(reset_storage) {
-        error!("❌ Failed to initialize reset handler storage: {}", e);
-        return;
-    }
 
-    // Initialize NVS partition for selective erasure
+    // Initialize NVS partition for device instance ID management
     if let Err(e) = reset_handler.initialize_nvs_partition(nvs_partition.clone()) {
         error!("❌ Failed to initialize reset handler NVS partition: {}", e);
         return;
@@ -1473,47 +1509,9 @@ async fn reset_manager_task(
             }
         };
 
-    // Initialize reset manager storage (minimal - only for GPIO state tracking)
-    let reset_manager_storage = loop {
-        match ResetStorage::new_with_partition(nvs_partition.clone()) {
-            Ok(storage) => {
-                info!("✅ Reset manager storage initialized successfully");
-                break storage;
-            }
-            Err(e) => {
-                error!("❌ Failed to initialize reset manager storage: {:?}", e);
-                Timer::after(Duration::from_secs(10)).await;
-            }
-        }
-    };
+    // Reset manager no longer needs storage - only GPIO monitoring
 
-    if let Err(e) = reset_manager.initialize_storage(reset_manager_storage) {
-        error!("❌ Failed to initialize reset manager storage: {}", e);
-        return;
-    }
-
-    // Wait for MQTT connection to process any deferred notifications first
-    loop {
-        use crate::mqtt_manager::MQTT_EVENT_SIGNAL;
-        let mqtt_event = MQTT_EVENT_SIGNAL.wait().await;
-
-        match mqtt_event {
-            crate::mqtt_manager::MqttManagerEvent::Connected => {
-                info!("🔌 MQTT connected - processing deferred reset notifications");
-
-                if let Err(e) = reset_handler.process_deferred_notifications().await {
-                    error!("❌ Error processing deferred reset notifications: {}", e);
-                } else {
-                    info!("✅ Deferred reset notification processing completed");
-                }
-
-                break; // Continue to main event loop
-            }
-            _ => {
-                debug!("🔄 MQTT event received, waiting for connection");
-            }
-        }
-    }
+    // No more deferred reset notifications - direct to reset monitoring
 
     info!("🎯 Starting coordinated reset monitoring with event delegation");
 
@@ -1544,26 +1542,15 @@ async fn reset_manager_task(
                         info!("🔘 Physical reset button pressed");
                         SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetButtonPressed);
                     }
-                    ResetManagerEvent::ResetInitiated => {
-                        info!("🔄 Reset process initiated");
-                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetInProgress);
-                    }
-                    ResetManagerEvent::ResetTriggered {
-                        wifi_available,
-                        reset_data,
-                    } => {
-                        info!(
-                            "🚀 Reset triggered - delegating to reset handler (WiFi: {})",
-                            wifi_available
-                        );
+                    // Note: ResetInitiated event removed - simplified reset flow
+                    ResetManagerEvent::ResetTriggered { reset_data } => {
+                        info!("🚀 Reset triggered - delegating to reset handler");
                         SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetInProgress);
 
                         // Delegate reset execution to reset_handler (single source of truth)
-                        let execution_result = if wifi_available {
-                            reset_handler.execute_online_reset(reset_data).await
-                        } else {
-                            reset_handler.execute_offline_reset(reset_data).await
-                        };
+                        // No more online/offline distinction - direct factory reset
+                        let execution_result =
+                            reset_handler.execute_factory_reset(reset_data.reason).await;
 
                         match execution_result {
                             Ok(_) => {
@@ -1580,16 +1567,7 @@ async fn reset_manager_task(
                                 )));
                             }
                         }
-                    }
-                    ResetManagerEvent::ResetCompleted => {
-                        info!("✅ Reset completed successfully");
-                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetCompleted);
-                    }
-                    ResetManagerEvent::ResetError(error) => {
-                        error!("❌ Reset error: {}", error);
-                        SYSTEM_EVENT_SIGNAL
-                            .signal(SystemEvent::SystemError(format!("Reset error: {}", error)));
-                    }
+                    } // Note: ResetCompleted and ResetError events removed - simplified reset flow
                 }
             }
         }

@@ -44,12 +44,6 @@ pub enum MqttMessage {
         volume: u8,
         source: String,
     },
-    ResetNotification {
-        device_id: String,
-        reset_timestamp: String,
-        old_cert_arn: String,
-        reason: String,
-    },
     Heartbeat,
     Connect,
     Disconnect,
@@ -210,22 +204,6 @@ impl MqttManager {
 
             MqttMessage::VolumeChange { volume, source } => {
                 self.client.publish_volume_change(volume, &source).await
-            }
-
-            MqttMessage::ResetNotification {
-                device_id,
-                reset_timestamp,
-                old_cert_arn,
-                reason,
-            } => {
-                self.client
-                    .publish_reset_notification(
-                        &device_id,
-                        &reset_timestamp,
-                        &old_cert_arn,
-                        &reason,
-                    )
-                    .await
             }
 
             MqttMessage::Heartbeat => self.client.publish_heartbeat().await,
@@ -413,7 +391,6 @@ impl MqttManager {
             }
             MqttMessage::DeviceStatus { .. } => format!("acorn-pups/status/{}", self.device_id),
             MqttMessage::VolumeChange { .. } => format!("acorn-pups/status/{}", self.device_id),
-            MqttMessage::ResetNotification { .. } => format!("acorn-pups/reset/{}", self.device_id),
             MqttMessage::Heartbeat => format!("acorn-pups/heartbeat/{}", self.device_id),
             _ => "system".to_string(),
         }

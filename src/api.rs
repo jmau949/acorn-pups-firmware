@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embedded_svc::http::Method;
-use embedded_svc::io::{Read, Write};
+use embedded_svc::io::Write;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};

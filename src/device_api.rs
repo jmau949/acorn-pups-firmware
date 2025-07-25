@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +11,9 @@ pub struct DeviceRegistration {
     /// Unique device identifier
     #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// UUID generated each factory reset cycle for security validation
+    #[serde(rename = "deviceInstanceId")]
+    pub device_instance_id: String,
     /// User-friendly device name
     #[serde(rename = "deviceName")]
     pub device_name: String,
@@ -20,6 +23,12 @@ pub struct DeviceRegistration {
     /// Device MAC address
     #[serde(rename = "macAddress")]
     pub mac_address: String,
+    /// Device state indicating if factory reset occurred
+    #[serde(rename = "deviceState")]
+    pub device_state: String,
+    /// Timestamp when factory reset occurred (ISO 8601 format)
+    #[serde(rename = "resetTimestamp", skip_serializing_if = "Option::is_none")]
+    pub reset_timestamp: Option<String>,
 }
 
 /// Device registration response from the backend
@@ -37,6 +46,9 @@ pub struct DeviceRegistrationData {
     /// Confirmed device ID
     #[serde(rename = "deviceId")]
     pub device_id: String,
+    /// Confirmed device instance ID
+    #[serde(rename = "deviceInstanceId")]
+    pub device_instance_id: String,
     /// User-friendly device name
     #[serde(rename = "deviceName")]
     pub device_name: String,
@@ -49,6 +61,12 @@ pub struct DeviceRegistrationData {
     /// Registration timestamp
     #[serde(rename = "registeredAt")]
     pub registered_at: String,
+    /// Timestamp of last factory reset
+    #[serde(rename = "lastResetAt", skip_serializing_if = "Option::is_none")]
+    pub last_reset_at: Option<String>,
+    /// Whether ownership was transferred from previous owner
+    #[serde(rename = "ownershipTransferred")]
+    pub ownership_transferred: bool,
     /// Device status
     pub status: String,
     /// Device certificates and IoT configuration
@@ -319,12 +337,18 @@ impl DeviceApiClient {
         serial_number: String,
         mac_address: String,
         device_name: String,
+        device_instance_id: String,
+        device_state: String,
+        reset_timestamp: Option<String>,
     ) -> DeviceRegistration {
         DeviceRegistration {
             device_id: self.device_id.clone(),
+            device_instance_id,
             device_name,
             serial_number,
             mac_address,
+            device_state,
+            reset_timestamp,
         }
     }
 }
