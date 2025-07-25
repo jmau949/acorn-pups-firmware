@@ -7,7 +7,7 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Timer};
 
 // Import logging macros
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 
 // Import Serde for JSON serialization
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,8 @@ static GATT_INTERFACE: AtomicU8 = AtomicU8::new(0);
 pub static BLE_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, BleEvent, 10> = Channel::new();
 
 // Global storage for BLE Long Write (Prepare Write) buffers per connection
-static PREPARE_WRITE_BUFFERS: OnceLock<Arc<Mutex<HashMap<u16, PrepareWriteBuffer>>>> = OnceLock::new();
+static PREPARE_WRITE_BUFFERS: OnceLock<Arc<Mutex<HashMap<u16, PrepareWriteBuffer>>>> =
+    OnceLock::new();
 
 // Maximum allowed payload size for long writes (2KB should be sufficient for WiFi credentials)
 const MAX_PREPARE_WRITE_BUFFER_SIZE: usize = 2048;
@@ -196,7 +197,7 @@ impl PrepareWriteBuffer {
             created_at: std::time::Instant::now(),
         }
     }
-    
+
     fn append_chunk(&mut self, offset: u16, chunk: &[u8]) -> Result<(), BleError> {
         // Validate offset for sequential writes
         if offset != self.last_offset {
@@ -205,7 +206,7 @@ impl PrepareWriteBuffer {
                 self.last_offset, offset
             )));
         }
-        
+
         // Check total size limit
         if self.data.len() + chunk.len() > MAX_PREPARE_WRITE_BUFFER_SIZE {
             return Err(BleError::InvalidState(format!(
@@ -213,14 +214,14 @@ impl PrepareWriteBuffer {
                 MAX_PREPARE_WRITE_BUFFER_SIZE
             )));
         }
-        
+
         // Append the chunk
         self.data.extend_from_slice(chunk);
         self.last_offset += chunk.len() as u16;
-        
+
         Ok(())
     }
-    
+
     fn is_expired(&self, timeout_seconds: u64) -> bool {
         self.created_at.elapsed().as_secs() > timeout_seconds
     }
@@ -357,19 +358,25 @@ where
 /// Clean up expired prepare write buffers to prevent memory leaks
 fn cleanup_expired_prepare_write_buffers() {
     const BUFFER_TIMEOUT_SECONDS: u64 = 30; // 30 second timeout for prepare write buffers
-    
+
     with_prepare_write_buffers(|buffers| {
         let initial_count = buffers.len();
         buffers.retain(|conn_id, buffer| {
             let is_expired = buffer.is_expired(BUFFER_TIMEOUT_SECONDS);
             if is_expired {
-                info!("🧹 LONG WRITE DEBUG: Cleaning up expired prepare write buffer for conn_id: {}", conn_id);
+                info!(
+                    "🧹 LONG WRITE DEBUG: Cleaning up expired prepare write buffer for conn_id: {}",
+                    conn_id
+                );
             }
             !is_expired
         });
         let cleaned_count = initial_count - buffers.len();
         if cleaned_count > 0 {
-            info!("🧹 LONG WRITE DEBUG: Cleaned up {} expired prepare write buffers", cleaned_count);
+            info!(
+                "🧹 LONG WRITE DEBUG: Cleaned up {} expired prepare write buffers",
+                cleaned_count
+            );
         }
     });
 }
@@ -1084,13 +1091,18 @@ fn gatts_event_handler_impl(
                 "📝 Characteristic added with handle: {}",
                 add_char_event.attr_handle
             );
-            info!("🔍 CHAR ADD DEBUG: Event details - service_handle: {}, attr_handle: {}", 
-                  add_char_event.service_handle, add_char_event.attr_handle);
+            info!(
+                "🔍 CHAR ADD DEBUG: Event details - service_handle: {}, attr_handle: {}",
+                add_char_event.service_handle, add_char_event.attr_handle
+            );
 
             // Store characteristic handle and check if all are added
             let should_start_service = with_ble_server_state(|state| {
-                info!("🔍 CHAR ADD DEBUG: Current char_handles count before adding: {}", state.char_handles.len());
-                
+                info!(
+                    "🔍 CHAR ADD DEBUG: Current char_handles count before adding: {}",
+                    state.char_handles.len()
+                );
+
                 // This is a simplified mapping - in production you'd track which char this is
                 let char_count = state.char_handles.len();
                 let char_name = if char_count == 0 {
@@ -1112,9 +1124,14 @@ fn gatts_event_handler_impl(
                     "unknown"
                 };
 
-                info!("🔍 CHAR ADD DEBUG: Mapped characteristic #{} to '{}' with handle {}", 
-                      char_count, char_name, add_char_event.attr_handle);
-                info!("🔍 CHAR ADD DEBUG: Total characteristics now: {}", state.char_handles.len());
+                info!(
+                    "🔍 CHAR ADD DEBUG: Mapped characteristic #{} to '{}' with handle {}",
+                    char_count, char_name, add_char_event.attr_handle
+                );
+                info!(
+                    "🔍 CHAR ADD DEBUG: Total characteristics now: {}",
+                    state.char_handles.len()
+                );
 
                 // List all current characteristic handles
                 for (key, handle) in &state.char_handles {
@@ -1123,7 +1140,10 @@ fn gatts_event_handler_impl(
 
                 // Return true if all 3 characteristics are now added
                 let all_chars_added = state.char_handles.len() == 3;
-                info!("🔍 CHAR ADD DEBUG: All characteristics added: {}", all_chars_added);
+                info!(
+                    "🔍 CHAR ADD DEBUG: All characteristics added: {}",
+                    all_chars_added
+                );
                 all_chars_added
             })
             .unwrap_or(false);
@@ -1136,7 +1156,10 @@ fn gatts_event_handler_impl(
 
                 if service_handle != 0 {
                     info!("🚀 All characteristics added - starting GATT service");
-                    info!("🔍 CHAR ADD DEBUG: Starting service with handle: {}", service_handle);
+                    info!(
+                        "🔍 CHAR ADD DEBUG: Starting service with handle: {}",
+                        service_handle
+                    );
                     let start_result = call_esp_api_with_context(
                         || unsafe { esp_idf_sys::esp_ble_gatts_start_service(service_handle) },
                         "GATT service start after characteristics",
@@ -1158,7 +1181,9 @@ fn gatts_event_handler_impl(
                     error!("🔍 CHAR ADD DEBUG: CRITICAL ERROR - service_handle is 0!");
                 }
             } else {
-                info!("🔍 CHAR ADD DEBUG: Waiting for more characteristics before starting service");
+                info!(
+                    "🔍 CHAR ADD DEBUG: Waiting for more characteristics before starting service"
+                );
             }
 
             send_ble_event_with_backpressure(BleEvent::CharacteristicAdded {
@@ -1169,9 +1194,11 @@ fn gatts_event_handler_impl(
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_CONNECT_EVT => {
             let connect_event = unsafe { &(*event_param).connect };
             info!("📱 BLE client connected");
-            info!("🔍 CONNECTION DEBUG: conn_id: {}, remote_bda: {:02x?}", 
-                  connect_event.conn_id, connect_event.remote_bda);
-            
+            info!(
+                "🔍 CONNECTION DEBUG: conn_id: {}, remote_bda: {:02x?}",
+                connect_event.conn_id, connect_event.remote_bda
+            );
+
             // Clean up any prepare write buffers for this connection (in case of reconnection)
             with_prepare_write_buffers(|buffers| {
                 if let Some(buffer) = buffers.remove(&connect_event.conn_id) {
@@ -1182,7 +1209,7 @@ fn gatts_event_handler_impl(
                           connect_event.conn_id);
                 }
             });
-            
+
             // Update connection state and start timeout tracking
             with_ble_server_state(|state| {
                 info!("🔍 CONNECTION DEBUG: Updating connection state");
@@ -1199,20 +1226,24 @@ fn gatts_event_handler_impl(
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_DISCONNECT_EVT => {
             let disconnect_event = unsafe { &(*event_param).disconnect };
             info!("📱 BLE client disconnected");
-            info!("🔍 DISCONNECT DEBUG: conn_id: {}, reason: {}", 
-                  disconnect_event.conn_id, disconnect_event.reason);
-            
+            info!(
+                "🔍 DISCONNECT DEBUG: conn_id: {}, reason: {}",
+                disconnect_event.conn_id, disconnect_event.reason
+            );
+
             // Clean up any prepare write buffers for this connection
             with_prepare_write_buffers(|buffers| {
                 if let Some(buffer) = buffers.remove(&disconnect_event.conn_id) {
                     info!("🧹 DISCONNECT: Cleaned up prepare write buffer for conn_id {} (was {} bytes)", 
                           disconnect_event.conn_id, buffer.data.len());
                 } else {
-                    info!("🔍 DISCONNECT DEBUG: No prepare write buffer to clean for conn_id: {}", 
-                          disconnect_event.conn_id);
+                    info!(
+                        "🔍 DISCONNECT DEBUG: No prepare write buffer to clean for conn_id: {}",
+                        disconnect_event.conn_id
+                    );
                 }
             });
-            
+
             // Update connection state and clear timeout tracking
             with_ble_server_state(|state| {
                 state.is_connected = false;
@@ -1224,27 +1255,37 @@ fn gatts_event_handler_impl(
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_WRITE_EVT => {
             let write_event = unsafe { &(*event_param).write };
             info!("🔍 GATT WRITE EVENT DEBUG: Received write event from mobile app");
-            info!("🔍 GATT WRITE EVENT DEBUG: Event details - conn_id: {}, trans_id: {}, handle: {}", 
-                  write_event.conn_id, write_event.trans_id, write_event.handle);
+            info!(
+                "🔍 GATT WRITE EVENT DEBUG: Event details - conn_id: {}, trans_id: {}, handle: {}",
+                write_event.conn_id, write_event.trans_id, write_event.handle
+            );
             info!("🔍 GATT WRITE EVENT DEBUG: Write details - offset: {}, need_rsp: {}, is_prep: {}, len: {}", 
                   write_event.offset, write_event.need_rsp, write_event.is_prep, write_event.len);
-            info!("🔍 GATT WRITE EVENT DEBUG: Data pointer null: {}", write_event.value.is_null());
-            
+            info!(
+                "🔍 GATT WRITE EVENT DEBUG: Data pointer null: {}",
+                write_event.value.is_null()
+            );
+
             if !write_event.value.is_null() && write_event.len > 0 {
                 let preview_len = std::cmp::min(50, write_event.len as usize);
-                let data_preview = unsafe { 
-                    std::slice::from_raw_parts(write_event.value, preview_len) 
-                };
-                info!("🔍 GATT WRITE EVENT DEBUG: First {} bytes (hex): {:02x?}", preview_len, data_preview);
-                
+                let data_preview =
+                    unsafe { std::slice::from_raw_parts(write_event.value, preview_len) };
+                info!(
+                    "🔍 GATT WRITE EVENT DEBUG: First {} bytes (hex): {:02x?}",
+                    preview_len, data_preview
+                );
+
                 if let Ok(utf8_preview) = std::str::from_utf8(data_preview) {
-                    info!("🔍 GATT WRITE EVENT DEBUG: First {} chars (UTF-8): '{}'", 
-                          utf8_preview.len(), utf8_preview);
+                    info!(
+                        "🔍 GATT WRITE EVENT DEBUG: First {} chars (UTF-8): '{}'",
+                        utf8_preview.len(),
+                        utf8_preview
+                    );
                 } else {
                     info!("🔍 GATT WRITE EVENT DEBUG: Data is not valid UTF-8 at start");
                 }
             }
-            
+
             // Check if this is a prepare write (part of long write sequence)
             if write_event.is_prep {
                 info!("🔍 GATT WRITE EVENT DEBUG: This is a prepare write (is_prep=true) - routing to prepare write handler");
@@ -1258,8 +1299,10 @@ fn gatts_event_handler_impl(
         esp_idf_sys::esp_gatts_cb_event_t_ESP_GATTS_EXEC_WRITE_EVT => {
             let exec_write_event = unsafe { &(*event_param).exec_write };
             info!("🔍 GATT EXEC WRITE EVENT DEBUG: Received execute write event from mobile app");
-            info!("🔍 GATT EXEC WRITE EVENT DEBUG: conn_id: {}, exec_write_flag: {}", 
-                  exec_write_event.conn_id, exec_write_event.exec_write_flag);
+            info!(
+                "🔍 GATT EXEC WRITE EVENT DEBUG: conn_id: {}, exec_write_flag: {}",
+                exec_write_event.conn_id, exec_write_event.exec_write_flag
+            );
             handle_execute_write(exec_write_event);
         }
         _ => {
@@ -1267,7 +1310,10 @@ fn gatts_event_handler_impl(
             if event == 21 {
                 info!("🔍 GATT EVENT 21 DEBUG: This might be ESP_GATTS_RESPONSE_EVT (response confirmation)");
             } else {
-                info!("🔍 GATT UNKNOWN EVENT DEBUG: Received unhandled GATT event: {}", event);
+                info!(
+                    "🔍 GATT UNKNOWN EVENT DEBUG: Received unhandled GATT event: {}",
+                    event
+                );
             }
         }
     }
@@ -1327,10 +1373,16 @@ fn gap_event_handler_impl(
 
 // Add characteristics to service
 fn add_service_characteristics(service_handle: u16) {
-    info!("🔍 ADD CHARS DEBUG: Starting to add characteristics to service handle: {}", service_handle);
-    
+    info!(
+        "🔍 ADD CHARS DEBUG: Starting to add characteristics to service handle: {}",
+        service_handle
+    );
+
     // Add SSID characteristic (writable)
-    info!("🔍 ADD CHARS DEBUG: Creating SSID characteristic with UUID: {}", SSID_CHAR_UUID);
+    info!(
+        "🔍 ADD CHARS DEBUG: Creating SSID characteristic with UUID: {}",
+        SSID_CHAR_UUID
+    );
     let ssid_uuid = parse_uuid(SSID_CHAR_UUID).unwrap();
     let ssid_uuid_struct = esp_idf_sys::esp_bt_uuid_t {
         len: esp_idf_sys::ESP_UUID_LEN_128 as u16,
@@ -1351,11 +1403,17 @@ fn add_service_characteristics(service_handle: u16) {
     );
     match ssid_result {
         Ok(_) => info!("🔍 ADD CHARS DEBUG: SSID characteristic creation initiated successfully"),
-        Err(e) => error!("🔍 ADD CHARS DEBUG: SSID characteristic creation failed: {:?}", e),
+        Err(e) => error!(
+            "🔍 ADD CHARS DEBUG: SSID characteristic creation failed: {:?}",
+            e
+        ),
     }
 
     // Add Password characteristic (writable)
-    info!("🔍 ADD CHARS DEBUG: Creating Password characteristic with UUID: {}", PASSWORD_CHAR_UUID);
+    info!(
+        "🔍 ADD CHARS DEBUG: Creating Password characteristic with UUID: {}",
+        PASSWORD_CHAR_UUID
+    );
     let password_uuid = parse_uuid(PASSWORD_CHAR_UUID).unwrap();
     let password_uuid_struct = esp_idf_sys::esp_bt_uuid_t {
         len: esp_idf_sys::ESP_UUID_LEN_128 as u16,
@@ -1377,12 +1435,20 @@ fn add_service_characteristics(service_handle: u16) {
         "Password characteristic creation",
     );
     match password_result {
-        Ok(_) => info!("🔍 ADD CHARS DEBUG: Password characteristic creation initiated successfully"),
-        Err(e) => error!("🔍 ADD CHARS DEBUG: Password characteristic creation failed: {:?}", e),
+        Ok(_) => {
+            info!("🔍 ADD CHARS DEBUG: Password characteristic creation initiated successfully")
+        }
+        Err(e) => error!(
+            "🔍 ADD CHARS DEBUG: Password characteristic creation failed: {:?}",
+            e
+        ),
     }
 
     // Add Status characteristic (readable + notifiable)
-    info!("🔍 ADD CHARS DEBUG: Creating Status characteristic with UUID: {}", STATUS_CHAR_UUID);
+    info!(
+        "🔍 ADD CHARS DEBUG: Creating Status characteristic with UUID: {}",
+        STATUS_CHAR_UUID
+    );
     let status_uuid = parse_uuid(STATUS_CHAR_UUID).unwrap();
     let status_uuid_struct = esp_idf_sys::esp_bt_uuid_t {
         len: esp_idf_sys::ESP_UUID_LEN_128 as u16,
@@ -1406,9 +1472,12 @@ fn add_service_characteristics(service_handle: u16) {
     );
     match status_result {
         Ok(_) => info!("🔍 ADD CHARS DEBUG: Status characteristic creation initiated successfully"),
-        Err(e) => error!("🔍 ADD CHARS DEBUG: Status characteristic creation failed: {:?}", e),
+        Err(e) => error!(
+            "🔍 ADD CHARS DEBUG: Status characteristic creation failed: {:?}",
+            e
+        ),
     }
-    
+
     info!("🔍 ADD CHARS DEBUG: All characteristic creation requests submitted - waiting for ESP-IDF callbacks");
 }
 
@@ -1419,25 +1488,32 @@ fn send_immediate_status_notification(message: &str) {
 
     // Get status characteristic handle from global state
     info!("🔍 STATUS NOTIFICATION DEBUG: Getting status characteristic handle from global state");
-    let status_handle =
-        with_ble_server_state(|state| {
-            info!("🔍 STATUS NOTIFICATION DEBUG: Accessing global state, char_handles count: {}", 
-                  state.char_handles.len());
-            for (key, handle) in &state.char_handles {
-                info!("🔍 STATUS NOTIFICATION DEBUG: char_handle: '{}' = {}", key, handle);
-            }
-            state.char_handles.get("status").copied().unwrap_or(0)
-        })
-        .unwrap_or(0);
+    let status_handle = with_ble_server_state(|state| {
+        info!(
+            "🔍 STATUS NOTIFICATION DEBUG: Accessing global state, char_handles count: {}",
+            state.char_handles.len()
+        );
+        for (key, handle) in &state.char_handles {
+            info!(
+                "🔍 STATUS NOTIFICATION DEBUG: char_handle: '{}' = {}",
+                key, handle
+            );
+        }
+        state.char_handles.get("status").copied().unwrap_or(0)
+    })
+    .unwrap_or(0);
 
-    info!("🔍 STATUS NOTIFICATION DEBUG: Status handle retrieved: {}", status_handle);
+    info!(
+        "🔍 STATUS NOTIFICATION DEBUG: Status handle retrieved: {}",
+        status_handle
+    );
 
     if status_handle != 0 {
         let data = message.as_bytes();
         let gatt_interface = GATT_INTERFACE.load(Ordering::SeqCst);
         info!("🔍 STATUS NOTIFICATION DEBUG: Preparing notification - interface: {}, handle: {}, data_len: {}, message: '{}'", 
               gatt_interface, status_handle, data.len(), message);
-        
+
         let result = call_esp_api_with_context(
             || unsafe {
                 esp_idf_sys::esp_ble_gatts_send_indicate(
@@ -1459,83 +1535,87 @@ fn send_immediate_status_notification(message: &str) {
             }
             Err(e) => {
                 warn!("⚠️ Failed to send immediate status notification: {:?}", e);
-                info!("🔍 STATUS NOTIFICATION DEBUG: Notification failed with error: {:?}", e);
+                info!(
+                    "🔍 STATUS NOTIFICATION DEBUG: Notification failed with error: {:?}",
+                    e
+                );
             }
         }
     } else {
         warn!("⚠️ Cannot send status notification - no status characteristic handle");
         info!("🔍 STATUS NOTIFICATION DEBUG: FAILURE - No status characteristic handle found");
-        info!("🔍 STATUS NOTIFICATION DEBUG: This means characteristics were not properly registered");
+        info!(
+            "🔍 STATUS NOTIFICATION DEBUG: This means characteristics were not properly registered"
+        );
     }
 }
 
 // Handle BLE Long Write - Prepare Write Event (ESP_GATTS_PREP_WRITE_EVT)
-fn handle_prepare_write(
-    param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param,
-) {
-    info!("🔍 PREP WRITE DEBUG: Starting prepare write handler");
-    info!("🔍 PREP WRITE DEBUG: conn_id: {}, handle: {}, offset: {}, len: {}", 
-          param.conn_id, param.handle, param.offset, param.len);
-    
+fn handle_prepare_write(param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param) {
+    // 🔧 STACK OVERFLOW FIX: Reduced debug logging to prevent BTC task stack exhaustion
+    debug!(
+        "🔍 PREP WRITE: Starting handler - conn_id: {}, len: {} bytes",
+        param.conn_id, param.len
+    );
+
     // Basic input validation
     if param.value.is_null() || param.len == 0 {
         warn!("❌ PREP WRITE: null or empty data received");
-        info!("🔍 PREP WRITE DEBUG: Validation failed - value null: {}, len: {}", 
-              param.value.is_null(), param.len);
         return;
     }
 
     // Validate offset and length bounds
     if param.offset > MAX_PREPARE_WRITE_BUFFER_SIZE as u16 {
-        warn!("❌ PREP WRITE: offset {} exceeds maximum buffer size {}", 
-              param.offset, MAX_PREPARE_WRITE_BUFFER_SIZE);
+        warn!(
+            "❌ PREP WRITE: offset {} exceeds maximum buffer size",
+            param.offset
+        );
         return;
     }
 
     if param.len > 512 {
-        warn!("❌ PREP WRITE: chunk length {} exceeds reasonable MTU size", param.len);
+        warn!(
+            "❌ PREP WRITE: chunk length {} exceeds reasonable MTU size",
+            param.len
+        );
         return;
     }
 
-    info!("🔍 PREP WRITE DEBUG: Validation passed, extracting chunk data...");
-
     let chunk_data = unsafe { std::slice::from_raw_parts(param.value, param.len as usize) };
-    
-    info!("🔍 PREP WRITE DEBUG: Chunk extracted - first 50 bytes: {:02x?}", 
-          &chunk_data[..std::cmp::min(50, chunk_data.len())]);
 
     // Access prepare write buffers and append this chunk
     let append_result = with_prepare_write_buffers(|buffers| {
-        info!("🔍 PREP WRITE DEBUG: Accessing prepare write buffers, current count: {}", buffers.len());
-        
         // Get or create buffer for this connection
         let buffer = buffers.entry(param.conn_id).or_insert_with(|| {
-            info!("🔍 PREP WRITE DEBUG: Creating new prepare write buffer for conn_id: {}", param.conn_id);
+            debug!(
+                "🔍 PREP WRITE: Creating new buffer for conn_id: {}",
+                param.conn_id
+            );
             PrepareWriteBuffer::new(param.handle)
         });
 
         // Verify the handle matches (all chunks should be for the same characteristic)
         if buffer.char_handle != param.handle {
-            warn!("❌ PREP WRITE: handle mismatch - buffer handle: {}, chunk handle: {}", 
-                  buffer.char_handle, param.handle);
+            warn!(
+                "❌ PREP WRITE: handle mismatch - buffer: {}, chunk: {}",
+                buffer.char_handle, param.handle
+            );
             return Err(BleError::InvalidState(
-                "Prepare write handle mismatch".to_string()
+                "Prepare write handle mismatch".to_string(),
             ));
         }
-
-        info!("🔍 PREP WRITE DEBUG: Appending chunk - buffer size before: {}, chunk size: {}, offset: {}", 
-              buffer.data.len(), chunk_data.len(), param.offset);
 
         // Append the chunk to the buffer
         match buffer.append_chunk(param.offset, chunk_data) {
             Ok(_) => {
-                info!("🔍 PREP WRITE DEBUG: Chunk appended successfully - buffer size now: {}, next expected offset: {}", 
-                      buffer.data.len(), buffer.last_offset);
+                debug!(
+                    "✅ PREP WRITE: Chunk appended - buffer size: {} bytes",
+                    buffer.data.len()
+                );
                 Ok(())
             }
             Err(e) => {
                 warn!("❌ PREP WRITE: failed to append chunk: {:?}", e);
-                info!("🔍 PREP WRITE DEBUG: Append failed - removing buffer for conn_id: {}", param.conn_id);
                 buffers.remove(&param.conn_id);
                 Err(e)
             }
@@ -1544,13 +1624,14 @@ fn handle_prepare_write(
 
     match append_result {
         Some(Ok(_)) => {
-            info!("✅ PREP WRITE: Chunk {} bytes at offset {} buffered successfully for conn_id {}", 
-                  param.len, param.offset, param.conn_id);
-            
+            info!(
+                "✅ PREP WRITE: Chunk {} bytes at offset {} buffered for conn_id {}",
+                param.len, param.offset, param.conn_id
+            );
+
             // Send prepare write response - this is REQUIRED for the mobile app to continue
-            info!("🔍 PREP WRITE DEBUG: Sending prepare write response to mobile app...");
             let gatt_interface = GATT_INTERFACE.load(Ordering::SeqCst);
-            
+
             // Create response structure that echoes back the prepare write data
             let mut response = esp_idf_sys::esp_gatt_rsp_t {
                 attr_value: esp_idf_sys::esp_gatt_value_t {
@@ -1561,7 +1642,7 @@ fn handle_prepare_write(
                     auth_req: 0,
                 },
             };
-            
+
             // Copy the received data into the response (echo back)
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -1570,9 +1651,7 @@ fn handle_prepare_write(
                     param.len as usize,
                 );
             }
-            
-            info!("🔍 PREP WRITE DEBUG: Response structure prepared - echoing back {} bytes", param.len);
-            
+
             let response_result = call_esp_api_with_context(
                 || unsafe {
                     esp_idf_sys::esp_ble_gatts_send_response(
@@ -1585,98 +1664,110 @@ fn handle_prepare_write(
                 },
                 "Prepare write response",
             );
-            
+
             match response_result {
                 Ok(_) => {
-                    info!("✅ PREP WRITE: Response sent successfully - mobile app can now send execute write");
-                    info!("✅ PREP WRITE: Data buffered successfully - waiting for execute write from mobile app");
+                    info!("✅ PREP WRITE: Response sent - waiting for execute write");
                 }
                 Err(e) => {
                     warn!("❌ PREP WRITE: Failed to send response: {:?}", e);
-                    info!("🔍 PREP WRITE DEBUG: Mobile app may timeout without response");
                 }
             }
         }
         Some(Err(e)) => {
             warn!("❌ PREP WRITE: Failed to buffer chunk: {:?}", e);
-            info!("🔍 PREP WRITE DEBUG: Letting ESP-IDF handle error response automatically");
         }
         None => {
             warn!("❌ PREP WRITE: Failed to access prepare write buffers");
-            info!("🔍 PREP WRITE DEBUG: Letting ESP-IDF handle error response automatically");
         }
     }
 
     // Clean up expired buffers periodically
     cleanup_expired_prepare_write_buffers();
-    
-    info!("🔍 PREP WRITE DEBUG: Prepare write handler completed");
+
+    debug!("✅ PREP WRITE: Handler completed");
 }
 
 // Handle BLE Long Write - Execute Write Event (ESP_GATTS_EXEC_WRITE_EVT)
-fn handle_execute_write(
-    param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_exec_write_evt_param,
-) {
+fn handle_execute_write(param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_exec_write_evt_param) {
     info!("🔍 EXEC WRITE DEBUG: Starting execute write handler");
-    info!("🔍 EXEC WRITE DEBUG: conn_id: {}, exec_write_flag: {}", 
-          param.conn_id, param.exec_write_flag);
+    info!(
+        "🔍 EXEC WRITE DEBUG: conn_id: {}, exec_write_flag: {}",
+        param.conn_id, param.exec_write_flag
+    );
 
     // Check if this is an execute (commit) or cancel operation
     if param.exec_write_flag as u32 == esp_idf_sys::ESP_GATT_PREP_WRITE_CANCEL {
         info!("🔍 EXEC WRITE DEBUG: Prepare write cancelled - cleaning up buffer");
         with_prepare_write_buffers(|buffers| {
             if let Some(buffer) = buffers.remove(&param.conn_id) {
-                info!("🧹 EXEC WRITE: Cancelled prepare write buffer for conn_id {} (was {} bytes)", 
-                      param.conn_id, buffer.data.len());
+                info!(
+                    "🧹 EXEC WRITE: Cancelled prepare write buffer for conn_id {} (was {} bytes)",
+                    param.conn_id,
+                    buffer.data.len()
+                );
             } else {
-                info!("🔍 EXEC WRITE DEBUG: No buffer found to cancel for conn_id: {}", param.conn_id);
+                info!(
+                    "🔍 EXEC WRITE DEBUG: No buffer found to cancel for conn_id: {}",
+                    param.conn_id
+                );
             }
         });
         return;
     }
 
     if param.exec_write_flag as u32 != esp_idf_sys::ESP_GATT_PREP_WRITE_EXEC {
-        warn!("❌ EXEC WRITE: Unknown exec_write_flag: {}", param.exec_write_flag);
+        warn!(
+            "❌ EXEC WRITE: Unknown exec_write_flag: {}",
+            param.exec_write_flag
+        );
         return;
     }
 
     info!("🔍 EXEC WRITE DEBUG: Execute write confirmed - processing buffered data");
 
     // Retrieve and remove the buffer for this connection
-    let buffer_data = with_prepare_write_buffers(|buffers| {
-        buffers.remove(&param.conn_id)
-    });
+    let buffer_data = with_prepare_write_buffers(|buffers| buffers.remove(&param.conn_id));
 
     match buffer_data {
         Some(Some(buffer)) => {
             info!("✅ EXEC WRITE: Retrieved prepare write buffer - total size: {} bytes, char_handle: {}", 
                   buffer.data.len(), buffer.char_handle);
-            info!("🔍 EXEC WRITE DEBUG: Buffer age: {:?}", buffer.created_at.elapsed());
+            info!(
+                "🔍 EXEC WRITE DEBUG: Buffer age: {:?}",
+                buffer.created_at.elapsed()
+            );
 
             // Create a synthetic write event parameter to reuse existing credential processing logic
-            let synthetic_write_param = esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param {
-                conn_id: param.conn_id,
-                trans_id: 0, // Not used in credential processing
-                bda: [0; 6], // Not used in credential processing
-                handle: buffer.char_handle,
-                offset: 0,
-                need_rsp: false, // Execute write doesn't need response
-                is_prep: false, // This is the final execution, not a prep
-                len: buffer.data.len() as u16,
-                value: buffer.data.as_ptr() as *mut u8,
-            };
+            let synthetic_write_param =
+                esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param {
+                    conn_id: param.conn_id,
+                    trans_id: 0, // Not used in credential processing
+                    bda: [0; 6], // Not used in credential processing
+                    handle: buffer.char_handle,
+                    offset: 0,
+                    need_rsp: false, // Execute write doesn't need response
+                    is_prep: false,  // This is the final execution, not a prep
+                    len: buffer.data.len() as u16,
+                    value: buffer.data.as_ptr() as *mut u8,
+                };
 
             info!("🔍 EXEC WRITE DEBUG: Created synthetic write param, calling credential processing...");
-            info!("🔍 EXEC WRITE DEBUG: Final payload first 100 bytes: {:02x?}", 
-                  &buffer.data[..std::cmp::min(100, buffer.data.len())]);
+            info!(
+                "🔍 EXEC WRITE DEBUG: Final payload first 100 bytes: {:02x?}",
+                &buffer.data[..std::cmp::min(100, buffer.data.len())]
+            );
 
             // Process the complete data as a normal write event
             handle_characteristic_write(&synthetic_write_param);
-            
+
             info!("🔍 EXEC WRITE DEBUG: Execute write processing completed");
         }
         Some(None) => {
-            warn!("❌ EXEC WRITE: No prepare write buffer found for conn_id: {}", param.conn_id);
+            warn!(
+                "❌ EXEC WRITE: No prepare write buffer found for conn_id: {}",
+                param.conn_id
+            );
             info!("🔍 EXEC WRITE DEBUG: This could indicate the buffer was already processed or timed out");
         }
         None => {
@@ -1690,25 +1781,35 @@ fn handle_characteristic_write(
     param: &esp_idf_sys::esp_ble_gatts_cb_param_t_gatts_write_evt_param,
 ) {
     info!("🔍 BLE WRITE DEBUG: Starting characteristic write handler");
-    info!("🔍 BLE WRITE DEBUG: Raw param details - handle: {}, offset: {}, need_rsp: {}, is_prep: {}", 
-          param.handle, param.offset, param.need_rsp, param.is_prep);
-    
+    info!(
+        "🔍 BLE WRITE DEBUG: Raw param details - handle: {}, offset: {}, need_rsp: {}, is_prep: {}",
+        param.handle, param.offset, param.need_rsp, param.is_prep
+    );
+
     // Basic input validation
     if param.value.is_null() || param.len == 0 {
         warn!("❌ BLE write: null or empty data received");
-        info!("🔍 BLE WRITE DEBUG: Validation failed - value null: {}, len: {}", 
-              param.value.is_null(), param.len);
+        info!(
+            "🔍 BLE WRITE DEBUG: Validation failed - value null: {}, len: {}",
+            param.value.is_null(),
+            param.len
+        );
         return;
     }
 
-    info!("🔍 BLE WRITE DEBUG: Initial validation passed - data pointer valid, len: {}", param.len);
+    info!(
+        "🔍 BLE WRITE DEBUG: Initial validation passed - data pointer valid, len: {}",
+        param.len
+    );
 
     // Validate data length bounds
     const MIN_DATA_LEN: u16 = 10; // Minimum for valid JSON: {"ssid":"x"}
     const MAX_DATA_LEN: u16 = MAX_PREPARE_WRITE_BUFFER_SIZE as u16; // Support long write payloads
 
-    info!("🔍 BLE WRITE DEBUG: Length validation - received: {} bytes, min: {}, max: {}", 
-          param.len, MIN_DATA_LEN, MAX_DATA_LEN);
+    info!(
+        "🔍 BLE WRITE DEBUG: Length validation - received: {} bytes, min: {}, max: {}",
+        param.len, MIN_DATA_LEN, MAX_DATA_LEN
+    );
 
     if param.len < MIN_DATA_LEN {
         warn!(
@@ -1725,7 +1826,10 @@ fn handle_characteristic_write(
             param.len, MAX_DATA_LEN
         );
         info!("🔍 BLE WRITE DEBUG: REJECTION REASON: Data too long");
-        info!("🔍 BLE WRITE DEBUG: Received {} bytes but max allowed is {} bytes", param.len, MAX_DATA_LEN);
+        info!(
+            "🔍 BLE WRITE DEBUG: Received {} bytes but max allowed is {} bytes",
+            param.len, MAX_DATA_LEN
+        );
         info!("🔍 BLE WRITE DEBUG: Large payloads should use BLE Long Write (prepare/execute write sequence)");
         return;
     }
@@ -1733,99 +1837,73 @@ fn handle_characteristic_write(
     info!("🔍 BLE WRITE DEBUG: Length validation passed, extracting data...");
 
     let data = unsafe { std::slice::from_raw_parts(param.value, param.len as usize) };
-    
-    info!("🔍 BLE WRITE DEBUG: Data extracted successfully, first 50 bytes as hex: {:02x?}", 
-          &data[..std::cmp::min(50, data.len())]);
+
+    // 🔧 STACK OVERFLOW FIX: Reduced debug logging to prevent BTC task stack exhaustion
+    debug!(
+        "🔍 BLE credential processing started, payload size: {} bytes",
+        data.len()
+    );
 
     // Validate UTF-8 first
-    info!("🔍 BLE WRITE DEBUG: Starting UTF-8 validation...");
     let json_str = match std::str::from_utf8(data) {
         Ok(s) => {
-            info!("🔍 BLE WRITE DEBUG: UTF-8 validation passed, string length: {}", s.len());
-            info!("🔍 BLE WRITE DEBUG: First 100 chars: {}", 
-                  &s[..std::cmp::min(100, s.len())]);
-            info!("🔍 BLE WRITE DEBUG: Last 100 chars: {}", 
-                  &s[std::cmp::max(0, s.len().saturating_sub(100))..]);
+            info!(
+                "✅ UTF-8 validation passed, credential size: {} bytes",
+                s.len()
+            );
             s
-        },
+        }
         Err(e) => {
             warn!(
-                "❌ BLE write: received invalid UTF-8 data ({} bytes)",
-                data.len()
+                "❌ BLE write: received invalid UTF-8 data ({} bytes): {:?}",
+                data.len(),
+                e
             );
-            info!("🔍 BLE WRITE DEBUG: REJECTION REASON: UTF-8 validation failed: {:?}", e);
-            info!("🔍 BLE WRITE DEBUG: Invalid UTF-8 at position: {:?}", e.valid_up_to());
             return;
         }
     };
 
-    info!("🔍 BLE WRITE DEBUG: UTF-8 validation completed successfully");
-
     // Basic JSON format validation
-    info!("🔍 BLE WRITE DEBUG: Starting JSON format validation...");
     let trimmed = json_str.trim();
-    info!("🔍 BLE WRITE DEBUG: Trimmed string length: {}, starts with '{{': {}, ends with '}}': {}", 
-          trimmed.len(), trimmed.starts_with('{'), trimmed.ends_with('}'));
-    
     if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
-        warn!("❌ BLE write: data doesn't look like JSON: {}", json_str);
-        info!("🔍 BLE WRITE DEBUG: REJECTION REASON: JSON format validation failed");
-        info!("🔍 BLE WRITE DEBUG: String starts with: '{}'", 
-              &trimmed[..std::cmp::min(10, trimmed.len())]);
-        info!("🔍 BLE WRITE DEBUG: String ends with: '{}'", 
-              &trimmed[std::cmp::max(0, trimmed.len().saturating_sub(10))..]);
+        warn!(
+            "❌ BLE write: invalid JSON format (size: {})",
+            trimmed.len()
+        );
         return;
     }
 
-    info!("🔍 BLE WRITE DEBUG: JSON format validation passed, attempting JSON parsing...");
+    info!("🔍 Parsing WiFi credentials JSON...");
 
     // Parse and validate WiFi credentials
-    info!("🔍 BLE WRITE DEBUG: Starting serde_json parsing for WiFiCredentials...");
     match serde_json::from_str::<WiFiCredentials>(json_str) {
         Ok(credentials) => {
             info!(
-                "🔑 Received WiFi credentials via real BLE: SSID={}",
-                credentials.ssid
+                "🔑 Received WiFi credentials via BLE: SSID='{}', auth_token_len={}",
+                credentials.ssid,
+                credentials.auth_token.len()
             );
-            info!("🔍 BLE WRITE DEBUG: JSON parsing successful!");
-            info!("🔍 BLE WRITE DEBUG: Parsed credentials - SSID: '{}', password_len: {}, auth_token_len: {}, device_name: '{}', timezone: '{}'", 
-                  credentials.ssid, 
-                  credentials.password.len(),
-                  credentials.auth_token.len(),
-                  credentials.device_name,
-                  credentials.user_timezone);
 
             // 🎯 STAGE 1: Send immediate acknowledgment to mobile app
-            info!("🔍 BLE WRITE DEBUG: Sending immediate acknowledgment to mobile app...");
             send_immediate_status_notification("RECEIVED");
 
             // Store in global state and clear timeout (credentials received!)
-            info!("🔍 BLE WRITE DEBUG: Storing credentials in global state...");
             with_ble_server_state(|state| {
                 state.received_credentials = Some(credentials.clone());
                 state.connection_time = None; // Clear timeout - credentials received
             });
 
-            info!("✅ Credentials received - timeout cleared");
-            info!("🔍 BLE WRITE DEBUG: Credentials stored successfully, sending event...");
+            info!("✅ Credentials stored - timeout cleared");
 
             // Send credentials received event for async processing
             send_ble_event_with_backpressure(BleEvent::CredentialsReceived(credentials));
-            
-            info!("🔍 BLE WRITE DEBUG: Characteristic write handling completed successfully");
+
+            info!("✅ BLE credential processing completed successfully");
         }
         Err(e) => {
-            warn!(
-                "❌ Failed to parse WiFi credentials from JSON: {} (error: {})",
-                json_str, e
-            );
-            info!("🔍 BLE WRITE DEBUG: REJECTION REASON: JSON parsing failed");
-            info!("🔍 BLE WRITE DEBUG: Serde error details: {:?}", e);
-            info!("🔍 BLE WRITE DEBUG: Failed JSON content (first 200 chars): {}", 
-                  &json_str[..std::cmp::min(200, json_str.len())]);
+            warn!("❌ Failed to parse WiFi credentials JSON: {}", e);
 
             // Send error response to mobile app
-            info!("🔍 BLE WRITE DEBUG: Sending error response to mobile app...");
             send_immediate_status_notification("ERROR_INVALID_JSON");
         }
     }
