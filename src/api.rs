@@ -200,6 +200,8 @@ impl ApiClient {
     ) -> Result<ResponseData> {
         use embedded_svc::http::client::Client;
 
+        debug!("Sending {:?} request to: {}", method, url);
+
         // Wrap the connection in a client
         let mut client = Client::wrap(connection);
 
@@ -305,6 +307,8 @@ impl ApiClient {
         // Add authorization header if token is set
         if let Some(ref token) = inner.token {
             headers.push(("Authorization".to_string(), format!("Bearer {}", token)));
+        } else {
+            error!("❌ No authentication token set - request will fail");
         }
 
         headers

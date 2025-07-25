@@ -2,6 +2,10 @@
 // Embassy is an async runtime for embedded systems, like Tokio but for microcontrollers
 use embassy_executor::Spawner;
 
+// FACTORY RESET FLAG - Set to true to trigger immediate factory reset on startup
+// This bypasses all normal initialization and performs a factory reset before WiFi/BLE
+const FORCE_FACTORY_RESET_ON_STARTUP: bool = false;
+
 // Import Embassy time utilities for delays and timers
 // Duration represents a time span, Timer provides async delays (non-blocking waits)
 use embassy_time::{Duration, Timer};
@@ -213,7 +217,7 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
             "auth_token",
             "device_name",
             "user_timezone",
-            "last_connected",
+            "timestamp",
         ],
         "reset_pending" => vec!["device_id", "reset_timestamp", "old_cert_arn", "reason"],
         "mqtt_certs" => vec![
@@ -336,6 +340,84 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
     }
 }
 
+/// Performs an early factory reset before normal system initialization
+/// This clears all stored data and prepares the device for fresh provisioning
+async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
+    info!("🔄 Starting early factory reset process...");
+
+    // Initialize minimal NVS partition access for data clearing
+    let nvs_partition = match EspDefaultNvsPartition::take() {
+        Ok(partition) => {
+            info!("✅ NVS partition initialized for factory reset");
+            partition
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to take NVS partition: {:?}", e));
+        }
+    };
+
+    // Step 1: Clear WiFi credentials
+    info!("🔧 Clearing WiFi credentials...");
+    match WiFiStorage::new_with_partition(nvs_partition.clone()) {
+        Ok(mut wifi_storage) => match wifi_storage.clear_credentials() {
+            Ok(_) => info!("✅ WiFi credentials cleared successfully"),
+            Err(e) => warn!("⚠️ Failed to clear WiFi credentials: {:?}", e),
+        },
+        Err(e) => warn!("⚠️ Failed to initialize WiFi storage for clearing: {:?}", e),
+    }
+
+    // Step 2: Clear MQTT certificates
+    info!("🔧 Clearing MQTT certificates...");
+    match MqttCertificateStorage::new() {
+        Ok(mut cert_storage) => match cert_storage.clear_certificates() {
+            Ok(_) => info!("✅ MQTT certificates cleared successfully"),
+            Err(e) => warn!("⚠️ Failed to clear MQTT certificates: {:?}", e),
+        },
+        Err(e) => warn!(
+            "⚠️ Failed to initialize certificate storage for clearing: {:?}",
+            e
+        ),
+    }
+
+    // Step 3: Clear reset storage (any pending reset notifications)
+    info!("🔧 Clearing reset storage...");
+    match ResetStorage::new_with_partition(nvs_partition.clone()) {
+        Ok(mut reset_storage) => match reset_storage.clear_reset_notification() {
+            Ok(_) => info!("✅ Reset storage cleared successfully"),
+            Err(e) => warn!("⚠️ Failed to clear reset storage: {:?}", e),
+        },
+        Err(e) => warn!(
+            "⚠️ Failed to initialize reset storage for clearing: {:?}",
+            e
+        ),
+    }
+
+    // Step 4: Clear any device-specific data
+    info!("🔧 Clearing device-specific data...");
+    match EspNvs::new(nvs_partition.clone(), "acorn_device", true) {
+        Ok(mut device_nvs) => {
+            // Clear known device keys
+            let device_keys = ["device_id", "serial_number", "firmware_version"];
+            for key in &device_keys {
+                match device_nvs.remove(key) {
+                    Ok(_) => debug!("✅ Cleared device key: {}", key),
+                    Err(_) => debug!("ℹ️ Device key not found: {}", key),
+                }
+            }
+            info!("✅ Device-specific data cleared");
+        }
+        Err(e) => warn!("⚠️ Failed to access device namespace for clearing: {:?}", e),
+    }
+
+    // Give time for all NVS operations to complete
+    Timer::after(Duration::from_millis(500)).await;
+
+    info!("✅ Early factory reset completed - all stored data cleared");
+    info!("📱 Device will restart in BLE provisioning mode for fresh setup");
+
+    Ok(())
+}
+
 // The #[embassy_executor::main] attribute transforms this function into the main async runtime
 // This is similar to #[tokio::main] but optimized for embedded systems
 // It sets up the Embassy executor and starts our async main function
@@ -352,6 +434,24 @@ async fn main(spawner: Spawner) {
     // Log a startup message - this will appear in the serial monitor
     info!("Starting Embassy-based Application with BLE status LED indicator!");
     info!("Starting Embassy-based Application with BLE status LED indicator!22");
+
+    // Check for factory reset flag
+    if FORCE_FACTORY_RESET_ON_STARTUP {
+        info!("🔄 FACTORY RESET FLAG ENABLED - Performing immediate factory reset");
+        info!("🚨 This will erase all stored WiFi credentials, certificates, and device data");
+
+        // Perform early factory reset before any other initialization
+        if let Err(e) = perform_early_factory_reset().await {
+            error!("❌ Early factory reset failed: {:?}", e);
+            error!("💥 Device may be in an inconsistent state - manual intervention required");
+        } else {
+            info!("✅ Early factory reset completed successfully");
+            info!("🔄 Restarting device to enter BLE provisioning mode...");
+        }
+
+        restart_device("Early factory reset completed").await;
+    }
+
     // Take ownership of all ESP32 peripherals (GPIO, SPI, I2C, etc.)
     // .unwrap() panics if peripherals are already taken (only one instance allowed)
     // This is the embedded equivalent of getting exclusive hardware access
@@ -427,74 +527,6 @@ async fn main(spawner: Spawner) {
             return;
         }
     };
-
-    // // ========================================================================
-    // // 🧪 TEMPORARY TEST CODE - REMOVE AFTER HARDWARE TESTING
-    // // ========================================================================
-    // info!("🧪 TEMPORARY: Starting immediate factory reset test");
-
-    // // Initialize reset storage for the test using existing NVS partition
-    // let reset_storage = match ResetStorage::new_with_partition(nvs.clone()) {
-    //     Ok(storage) => {
-    //         info!("✅ Test reset storage initialized");
-    //         storage
-    //     }
-    //     Err(e) => {
-    //         error!("❌ Failed to initialize test reset storage: {:?}", e);
-    //         return;
-    //     }
-    // };
-
-    // // Generate device ID for reset handler
-    // let test_device_id = generate_device_id();
-
-    // // Initialize reset handler
-    // let mut reset_handler = ResetHandler::new(test_device_id.clone());
-    // if let Err(e) = reset_handler.initialize_storage(reset_storage) {
-    //     error!("❌ Failed to initialize test reset handler storage: {}", e);
-    //     return;
-    // }
-
-    // // Initialize NVS partition for selective erasure
-    // if let Err(e) = reset_handler.initialize_nvs_partition(nvs.clone()) {
-    //     error!("❌ Failed to initialize reset handler NVS partition: {}", e);
-    //     return;
-    // }
-
-    // info!("🧪 Test reset handler initialized successfully");
-
-    // // Create dummy reset data for testing
-    // use reset_storage::ResetNotificationData;
-    // let test_reset_data = ResetNotificationData {
-    //     device_id: test_device_id.clone(),
-    //     reset_timestamp: std::time::SystemTime::now()
-    //         .duration_since(std::time::UNIX_EPOCH)
-    //         .unwrap_or_default()
-    //         .as_secs()
-    //         .to_string(),
-    //     old_cert_arn: "arn:aws:iot:us-west-2:123456789012:cert/test-hardware-reset".to_string(),
-    //     reason: "hardware_test_factory_reset".to_string(),
-    // };
-
-    // info!("🧪 Executing test factory reset...");
-
-    // // Execute offline reset (since we're testing early in startup before WiFi)
-    // match reset_handler.execute_offline_reset(test_reset_data).await {
-    //     Ok(_) => {
-    //         info!("✅ Test factory reset completed successfully");
-    //         info!("🔄 Device should reboot now...");
-    //         // Device will restart, so execution stops here
-    //         return;
-    //     }
-    //     Err(e) => {
-    //         error!("❌ Test factory reset failed: {}", e);
-    //         info!("🧪 Continuing with normal startup...");
-    //     }
-    // }
-
-    // // ========================================================================
-    // // 🧪 END TEMPORARY TEST CODE
-    // // ========================================================================
 
     // Check WiFi credentials to determine device mode
     info!("🔧 Checking WiFi credentials to determine device mode...");
@@ -700,9 +732,14 @@ async fn register_device_with_backend(
 ) -> Result<String, anyhow::Error> {
     info!("🔧 Starting device registration process");
 
+    if auth_token.is_empty() {
+        error!("❌ Auth token is empty - authentication will fail");
+        return Err(anyhow::anyhow!("Auth token is empty"));
+    }
+
     // Create device API client
     // Use development endpoint for testing, production for release builds
-    let base_url = "https://utpfo2x8f6.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
+    let base_url = "https://uoaq40ff4b.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
 
     let firmware_version = "1.0.0".to_string();
     let device_id = generate_device_id();
@@ -710,8 +747,8 @@ async fn register_device_with_backend(
         DeviceApiClient::new(base_url, device_id.clone(), firmware_version.clone());
 
     // Use authentication token from BLE provisioning
-    info!("🔐 Setting authentication token from BLE provisioning");
-    device_api_client.set_auth_token(auth_token).await;
+    info!("🔐 Setting authentication token");
+    device_api_client.set_auth_token(auth_token.clone()).await;
 
     // Get real device information
     let serial_number = get_device_serial_number();
@@ -786,6 +823,14 @@ async fn register_device_with_backend(
 
             info!("🎯 Device registration completed successfully!");
 
+            // Clear auth token from storage to save space (no longer needed)
+            info!("🧹 Clearing auth token from storage to save space");
+            if let Ok(mut wifi_storage) = crate::wifi_storage::WiFiStorage::new() {
+                if let Err(e) = wifi_storage.clear_auth_token() {
+                    warn!("Failed to clear auth token: {:?}", e);
+                }
+            }
+
             Ok(response.data.device_id)
         }
         Err(e) => {
@@ -841,11 +886,7 @@ async fn wifi_only_mode_task(
                 "📶 Connecting to WiFi with stored credentials: {}",
                 credentials.ssid
             );
-            info!("🔍 DEBUG: WiFi SSID: '{}'", credentials.ssid);
-            info!("🔍 DEBUG: WiFi Password: '{}'", credentials.password);
-
-            // 🔍 DEBUG: Dump all persistent storage contents after loading
-            wifi_storage.debug_dump_storage();
+            info!("📶 Using stored credentials from NVS");
 
             let wifi_config = Configuration::Client(ClientConfiguration {
                 ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
@@ -910,9 +951,7 @@ async fn wifi_only_mode_task(
                     if let Err(e) = wifi_storage.clear_credentials() {
                         error!("Failed to clear credentials: {:?}", e);
                     } else {
-                        info!("🔍 DEBUG: Credentials cleared successfully");
-                        // 🔍 DEBUG: Dump storage contents after clearing
-                        wifi_storage.debug_dump_storage();
+                        info!("✅ WiFi credentials cleared successfully");
                     }
 
                     // Restart device to enter BLE provisioning mode
@@ -1003,11 +1042,12 @@ async fn ble_provisioning_mode_task(
         // Check for received credentials (take to prevent repeated processing)
         if let Some(credentials) = ble_server.take_received_credentials() {
             info!("📱 WiFi credentials received via BLE");
-            info!("🔍 DEBUG: Received WiFi SSID: '{}'", credentials.ssid);
-            info!(
-                "🔍 DEBUG: Received WiFi Password: '{}'",
-                credentials.password
-            );
+            info!("📱 WiFi credentials received from BLE");
+            info!("  SSID: {}", credentials.ssid);
+            info!("  Password: {}", credentials.password);
+            info!("  Auth Token: {} characters", credentials.auth_token.len());
+            info!("  Device Name: {}", credentials.device_name);
+            info!("  User Timezone: {}", credentials.user_timezone);
 
             // 🎯 STAGE 2: Send processing status (if still connected)
             if ble_server.is_client_connected() {
@@ -1020,10 +1060,9 @@ async fn ble_provisioning_mode_task(
             match wifi_storage.store_credentials(&credentials) {
                 Ok(()) => {
                     info!("💾 WiFi credentials stored successfully");
-                    info!("🔍 DEBUG: Stored WiFi SSID: '{}'", credentials.ssid);
-                    info!("🔍 DEBUG: Stored WiFi Password: '{}'", credentials.password);
+                    info!("💾 WiFi credentials stored to NVS flash");
 
-                    // 🔍 DEBUG: Dump all persistent storage contents after storing
+                    // Dump storage contents after successful storage
                     wifi_storage.debug_dump_storage();
 
                     // Send storage success notification (if still connected)
@@ -1138,13 +1177,6 @@ async fn test_connectivity_and_register(
         }
     }
 
-    // Step 5: Send periodic heartbeat (optional)
-    info!("💓 Sending initial heartbeat...");
-    match send_heartbeat(&device_id).await {
-        Ok(_) => info!("✅ Initial heartbeat sent successfully"),
-        Err(e) => warn!("⚠️ Heartbeat failed: {:?}", e),
-    }
-
     info!("🎉 Connectivity testing and device registration completed");
     info!("🌟 Acorn Pups device is fully online and operational");
 
@@ -1190,54 +1222,6 @@ async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         let error_msg = format!("HTTP request failed with status: {}", response.status());
-        Err(error_msg.into())
-    }
-}
-
-// Send heartbeat to backend to indicate device is alive
-async fn send_heartbeat(device_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    info!("💓 Sending heartbeat for device: {}", device_id);
-
-    let heartbeat_data = format!(
-        r#"{{
-            "device_id": "{}",
-            "timestamp": "{}",
-            "status": "online",
-            "uptime_seconds": 60,
-            "memory_free": "200KB",
-            "wifi_signal_strength": -45
-        }}"#,
-        device_id,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    );
-
-    let config = esp_idf_svc::http::client::Configuration {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        ..Default::default()
-    };
-
-    let mut client = Client::wrap(EspHttpConnection::new(&config)?);
-    let backend_url = "https://api.acornpups.com/devices/heartbeat";
-
-    let headers = [
-        ("Content-Type", "application/json"),
-        ("User-Agent", "AcornPups-ESP32/1.0.0"),
-    ];
-
-    let mut request = client.post(backend_url, &headers)?;
-    request.write_all(heartbeat_data.as_bytes())?;
-    request.flush()?;
-
-    let response = request.submit()?;
-
-    if response.status() == 200 {
-        info!("✅ Heartbeat sent successfully");
-        Ok(())
-    } else {
-        let error_msg = format!("Heartbeat failed with status: {}", response.status());
         Err(error_msg.into())
     }
 }

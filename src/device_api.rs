@@ -70,7 +70,6 @@ pub struct DeviceCertificates {
 
 /// MQTT topic configuration for the device
 
-
 /// Device reset request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceResetRequest {
@@ -143,9 +142,9 @@ impl DeviceApiClient {
     /// Create a new device API client
     pub fn new(base_url: String, device_id: String, firmware_version: String) -> Self {
         let api_client = ApiClient::new(base_url);
-        
+
         info!("Initialized device API client for device: {}", device_id);
-        
+
         Self {
             api_client,
             device_id,
@@ -166,21 +165,24 @@ impl DeviceApiClient {
     }
 
     /// Register this device with the backend API
-    /// 
+    ///
     /// This method is authenticated and requires a valid JWT token
     /// from AWS Cognito to be set via set_auth_token()
-    pub async fn register_device(&self, device_info: &DeviceRegistration) -> Result<DeviceRegistrationResponse> {
+    pub async fn register_device(
+        &self,
+        device_info: &DeviceRegistration,
+    ) -> Result<DeviceRegistrationResponse> {
         info!("Registering device: {}", device_info.device_id);
-        
+
         // Validate device info
         if device_info.device_id.is_empty() {
             return Err(anyhow!("Device ID cannot be empty"));
         }
-        
+
         if device_info.serial_number.is_empty() {
             return Err(anyhow!("Serial number cannot be empty"));
         }
-        
+
         if device_info.mac_address.is_empty() {
             return Err(anyhow!("MAC address cannot be empty"));
         }
@@ -190,19 +192,28 @@ impl DeviceApiClient {
         }
 
         debug!("Device registration details: {:?}", device_info);
-        
+
         // Make authenticated API call
         match self.api_client.post("/devices/register", device_info).await {
             Ok(response) => {
                 // Parse the registration response
                 match serde_json::from_str::<DeviceRegistrationResponse>(&response.body) {
                     Ok(registration_response) => {
-                        info!("Device registered successfully: {}", registration_response.data.device_id);
+                        info!(
+                            "Device registered successfully: {}",
+                            registration_response.data.device_id
+                        );
                         info!("Owner ID: {}", registration_response.data.owner_id);
-                        info!("IoT endpoint: {}", registration_response.data.certificates.iot_endpoint);
-                        info!("Registration timestamp: {}", registration_response.data.registered_at);
+                        info!(
+                            "IoT endpoint: {}",
+                            registration_response.data.certificates.iot_endpoint
+                        );
+                        info!(
+                            "Registration timestamp: {}",
+                            registration_response.data.registered_at
+                        );
                         info!("Request ID: {}", registration_response.request_id);
-                        
+
                         Ok(registration_response)
                     }
                     Err(e) => {
@@ -220,14 +231,18 @@ impl DeviceApiClient {
     }
 
     /// Reset device and notify backend
-    /// 
+    ///
     /// This method is unauthenticated and can be called without a token
-    pub async fn reset_device(&self, reason: &str, context: Option<String>) -> Result<DeviceResetResponse> {
+    pub async fn reset_device(
+        &self,
+        reason: &str,
+        context: Option<String>,
+    ) -> Result<DeviceResetResponse> {
         info!("Initiating device reset. Reason: {}", reason);
-        
+
         // Clear any existing auth token since this endpoint is unauthenticated
         self.api_client.clear_token().await;
-        
+
         let reset_request = DeviceResetRequest {
             device_id: self.device_id.clone(),
             reason: reason.to_string(),
@@ -235,35 +250,38 @@ impl DeviceApiClient {
             firmware_version: self.firmware_version.clone(),
             context,
         };
-        
+
         debug!("Device reset request: {:?}", reset_request);
-        
+
         let endpoint = format!("/devices/{}/reset", self.device_id);
-        
+
         match self.api_client.post(&endpoint, &reset_request).await {
-            Ok(response) => {
-                match serde_json::from_str::<DeviceResetResponse>(&response.body) {
-                    Ok(reset_response) => {
-                        info!("Device reset processed successfully: {}", reset_response.data.message);
-                        info!("Device ID: {}", reset_response.data.device_id);
-                        info!("Reset initiated at: {}", reset_response.data.reset_initiated_at);
-                        info!("Request ID: {}", reset_response.request_id);
-                        Ok(reset_response)
-                    }
-                    Err(e) => {
-                        error!("Failed to parse device reset response: {}", e);
-                        error!("Response body: {}", response.body);
-                        Err(anyhow!("Invalid reset response format: {}", e))
-                    }
+            Ok(response) => match serde_json::from_str::<DeviceResetResponse>(&response.body) {
+                Ok(reset_response) => {
+                    info!(
+                        "Device reset processed successfully: {}",
+                        reset_response.data.message
+                    );
+                    info!("Device ID: {}", reset_response.data.device_id);
+                    info!(
+                        "Reset initiated at: {}",
+                        reset_response.data.reset_initiated_at
+                    );
+                    info!("Request ID: {}", reset_response.request_id);
+                    Ok(reset_response)
                 }
-            }
+                Err(e) => {
+                    error!("Failed to parse device reset response: {}", e);
+                    error!("Response body: {}", response.body);
+                    Err(anyhow!("Invalid reset response format: {}", e))
+                }
+            },
             Err(e) => {
                 error!("Device reset request failed: {}", e);
                 Err(anyhow!("Device reset failed: {}", e))
             }
         }
     }
-
 
     /// Get device ID
     pub fn get_device_id(&self) -> &str {
@@ -277,7 +295,10 @@ impl DeviceApiClient {
 
     /// Update firmware version
     pub fn update_firmware_version(&mut self, version: String) {
-        info!("Updating firmware version from {} to {}", self.firmware_version, version);
+        info!(
+            "Updating firmware version from {} to {}",
+            self.firmware_version, version
+        );
         self.firmware_version = version;
     }
 
@@ -289,8 +310,6 @@ impl DeviceApiClient {
             .as_secs()
     }
 }
-
-
 
 /// Helper functions for device information gathering
 impl DeviceApiClient {
@@ -308,12 +327,4 @@ impl DeviceApiClient {
             mac_address,
         }
     }
-
-
 }
-
-
-
-
-
- 
