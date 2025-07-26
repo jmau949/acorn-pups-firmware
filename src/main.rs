@@ -215,7 +215,7 @@ fn dump_entire_nvs_storage(nvs_partition: &EspDefaultNvsPartition) {
     let known_namespaces = [
         "nvs.net80211",  // WiFi system data
         "wifi_config",   // Our WiFi credentials
-        "reset_pending", // Reset notification data
+        "reset_state",   // Device instance ID and reset state (Echo/Nest-style)
         "mqtt_certs",    // MQTT certificates
         "acorn_device",  // Device-specific data
         "nvs",           // Default namespace
@@ -259,7 +259,12 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
             "user_timezone",
             "timestamp",
         ],
-        "reset_pending" => vec!["device_id", "reset_timestamp", "old_cert_arn", "reason"],
+        "reset_state" => vec![
+            "device_instance_id",
+            "device_state",
+            "reset_timestamp",
+            "reset_reason",
+        ],
         "mqtt_certs" => vec![
             "device_cert",
             "private_key",
@@ -386,85 +391,34 @@ fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
 /// Performs an early factory reset using the proper physical reset workflow
 /// This simulates pressing the physical pinhole reset button at startup
 async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
-    info!("🔄 TESTING: Starting early factory reset using physical reset workflow...");
-    info!("🎯 TESTING: This simulates pressing the physical pinhole reset button");
+    info!("🔄 Starting early factory reset using Echo/Nest-style reset security...");
 
-    // Initialize minimal NVS partition access for reset system
-    let nvs_partition = match EspDefaultNvsPartition::take() {
-        Ok(partition) => {
-            info!("✅ TESTING: NVS partition initialized for reset system");
-            partition
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "TESTING: Failed to take NVS partition: {:?}",
-                e
-            ));
-        }
-    };
+    // Initialize NVS partition for reset handler
+    let nvs_partition = EspDefaultNvsPartition::take()
+        .map_err(|e| anyhow::anyhow!("Failed to take NVS partition: {:?}", e))?;
 
-    // Generate device ID (needed for reset notification)
+    // Generate device ID for reset handler
     let device_id = generate_device_id();
-    info!("🆔 TESTING: Generated device ID for reset: {}", device_id);
+    info!("🆔 Generated device ID for reset: {}", device_id);
 
-    // Check WiFi connectivity status from system state
-    let _wifi_available = {
-        // Prefixed with _ to indicate intentionally unused
-        // Since we're early in startup, WiFi likely isn't connected yet
-        // But we check the system state to follow the same pattern as physical reset
-        let system_state = SYSTEM_STATE.lock().await;
-        let wifi_connected = system_state.wifi_connected;
-        drop(system_state);
-
-        info!("🌐 TESTING: WiFi connectivity status: {}", wifi_connected);
-        wifi_connected
-    };
-
-    // Create reset notification data (same as physical button press)
-    let reset_data = ResetNotificationData {
-        device_id: device_id.clone(),
-        reset_timestamp: get_iso8601_timestamp(), // Use local function instead of ResetStorage
-        old_cert_arn: "early-startup-no-cert".to_string(), // No cert available at startup
-        reason: "startup_flag_reset".to_string(), // Different reason to distinguish from physical
-    };
-
-    info!("📊 TESTING: Reset notification data created:");
-    info!("  Device ID: {}", reset_data.device_id);
-    info!("  Timestamp: {}", reset_data.reset_timestamp);
-    info!("  Cert ARN: {}", reset_data.old_cert_arn);
-    info!("  Reason: {}", reset_data.reason);
-
-    // Initialize reset handler for factory reset execution
+    // Initialize reset handler with Echo/Nest-style security
     let mut reset_handler = ResetHandler::new(device_id.clone());
+    reset_handler
+        .initialize_nvs_partition(nvs_partition)
+        .map_err(|e| anyhow::anyhow!("Failed to initialize reset handler: {:?}", e))?;
 
-    if let Err(e) = reset_handler.initialize_nvs_partition(nvs_partition.clone()) {
-        return Err(anyhow::anyhow!(
-            "TESTING: Failed to initialize reset handler NVS partition: {:?}",
-            e
-        ));
-    }
+    info!("✅ Reset handler initialized successfully");
 
-    info!("✅ TESTING: Reset handler initialized successfully");
+    // Execute factory reset with device instance ID security
+    info!("🔥 Executing factory reset with device instance ID generation...");
+    reset_handler
+        .execute_factory_reset("startup_flag_reset".to_string())
+        .await?;
 
-    // Execute factory reset (no more online/offline distinction)
-    info!("🔥 TESTING: Executing factory reset with device instance ID security");
-    let execution_result = reset_handler.execute_factory_reset(reset_data.reason).await;
-
-    match execution_result {
-        Ok(_) => {
-            info!("✅ TESTING: Factory reset executed successfully using physical reset workflow");
-            info!("🔄 TESTING: System should restart automatically from reset handler");
-            Ok(())
-        }
-        Err(e) => {
-            error!("❌ TESTING: Factory reset execution failed: {}", e);
-            Err(e)
-        }
-    }
+    info!("✅ Factory reset executed successfully - system will restart");
+    Ok(())
 }
-// ============================================================================
-// ⚠️ END TEST CODE - REMOVE AFTER TESTING ⚠️
-// ============================================================================
+// Factory reset function using Echo/Nest-style security (device instance ID generation)
 
 // The #[embassy_executor::main] attribute transforms this function into the main async runtime
 // This is similar to #[tokio::main] but optimized for embedded systems
@@ -483,33 +437,24 @@ async fn main(spawner: Spawner) {
     info!("Starting Embassy-based Application with BLE status LED indicator!");
     info!("Starting Embassy-based Application with BLE status LED indicator!22");
 
-    // ============================================================================
-    // ⚠️ TEST CODE - REMOVE AFTER TESTING ⚠️
-    // ============================================================================
-    // Check for factory reset flag
+    // Check for factory reset flag (startup-time reset using Echo/Nest-style security)
     if FORCE_FACTORY_RESET_ON_STARTUP {
-        info!("🔄 TESTING: FACTORY RESET FLAG ENABLED - Performing immediate factory reset");
-        info!("🚨 TESTING: This will simulate physical pinhole reset button press");
-        info!("🎯 TESTING: Using proper reset system workflow instead of manual NVS clearing");
+        info!("🔄 FACTORY RESET FLAG ENABLED - Performing Echo/Nest-style factory reset");
+        info!("🚨 This will generate new device instance ID and reset device state");
 
-        // Perform early factory reset using physical reset workflow
+        // Perform factory reset using Echo/Nest-style reset security
         if let Err(e) = perform_early_factory_reset().await {
-            error!("❌ TESTING: Early factory reset failed: {:?}", e);
-            error!(
-                "💥 TESTING: Device may be in an inconsistent state - manual intervention required"
-            );
+            error!("❌ Early factory reset failed: {:?}", e);
+            error!("💥 Device may be in an inconsistent state - manual intervention required");
         } else {
-            info!("✅ TESTING: Early factory reset completed successfully");
-            info!("🔄 TESTING: System should restart automatically from reset handler");
+            info!("✅ Early factory reset completed successfully");
+            info!("🔄 System should restart automatically from reset handler");
         }
 
         // The reset handler should restart the device automatically
         // But if we reach here, something went wrong, so restart manually
-        restart_device("TESTING: Early factory reset completed").await;
+        restart_device("Early factory reset completed").await;
     }
-    // ============================================================================
-    // ⚠️ END TEST CODE - REMOVE AFTER TESTING ⚠️
-    // ============================================================================
 
     // Take ownership of all ESP32 peripherals (GPIO, SPI, I2C, etc.)
     // .unwrap() panics if peripherals are already taken (only one instance allowed)
@@ -1511,23 +1456,20 @@ async fn reset_manager_task(
 
     // Reset manager no longer needs storage - only GPIO monitoring
 
-    // No more deferred reset notifications - direct to reset monitoring
+    // Echo/Nest-style reset: Direct reset monitoring with device instance ID security
 
     info!("🎯 Starting coordinated reset monitoring with event delegation");
 
     // Main event loop: coordinate between reset_manager GPIO monitoring and reset_handler execution
     loop {
         use crate::reset_manager::RESET_MANAGER_EVENT_SIGNAL;
-        use embassy_futures::select::{select, Either};
+        // Run GPIO monitoring and handle reset events
+        let reset_event_future = RESET_MANAGER_EVENT_SIGNAL.wait();
+        let manager_run_future = reset_manager.run();
 
-        // Run GPIO monitoring and listen for reset events concurrently
-        match select(
-            reset_manager.run(),               // GPIO monitoring (non-blocking)
-            RESET_MANAGER_EVENT_SIGNAL.wait(), // Reset events from manager
-        )
-        .await
-        {
-            Either::First(manager_result) => {
+        // Use tokio::select! equivalent for embedded systems
+        tokio::select! {
+            manager_result = manager_run_future => {
                 // Reset manager encountered an error
                 if let Err(e) = manager_result {
                     error!("❌ Reset manager GPIO monitoring failed: {}", e);
@@ -1535,7 +1477,7 @@ async fn reset_manager_task(
                     continue;
                 }
             }
-            Either::Second(reset_event) => {
+            reset_event = reset_event_future => {
                 // Handle reset events from reset_manager
                 match reset_event {
                     ResetManagerEvent::ResetButtonPressed => {
