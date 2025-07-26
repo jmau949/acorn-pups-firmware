@@ -1463,13 +1463,16 @@ async fn reset_manager_task(
     // Main event loop: coordinate between reset_manager GPIO monitoring and reset_handler execution
     loop {
         use crate::reset_manager::RESET_MANAGER_EVENT_SIGNAL;
-        // Run GPIO monitoring and handle reset events
-        let reset_event_future = RESET_MANAGER_EVENT_SIGNAL.wait();
-        let manager_run_future = reset_manager.run();
+        use embassy_futures::select::{select, Either};
 
-        // Use tokio::select! equivalent for embedded systems
-        tokio::select! {
-            manager_result = manager_run_future => {
+        // Run GPIO monitoring and listen for reset events concurrently
+        match select(
+            reset_manager.run(),               // GPIO monitoring (non-blocking)
+            RESET_MANAGER_EVENT_SIGNAL.wait(), // Reset events from manager
+        )
+        .await
+        {
+            Either::First(manager_result) => {
                 // Reset manager encountered an error
                 if let Err(e) = manager_result {
                     error!("❌ Reset manager GPIO monitoring failed: {}", e);
@@ -1477,7 +1480,7 @@ async fn reset_manager_task(
                     continue;
                 }
             }
-            reset_event = reset_event_future => {
+            Either::Second(reset_event) => {
                 // Handle reset events from reset_manager
                 match reset_event {
                     ResetManagerEvent::ResetButtonPressed => {
