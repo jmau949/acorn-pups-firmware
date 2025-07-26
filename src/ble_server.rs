@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 // Import ESP-IDF BLE functionality
 use esp_idf_svc::bt::{Ble, BtDriver};
-use esp_idf_svc::hal::modem::Modem;
+// Note: Modem import removed - not used in current BLE implementation
 use esp_idf_svc::sys as esp_idf_sys;
 
 // Standard library imports
