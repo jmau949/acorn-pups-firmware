@@ -175,13 +175,13 @@ pub struct ResetState {
 ```rust
 /// Phase 1: Mark reset as starting (for power-loss recovery)
 fn set_reset_in_progress_marker(&self) -> Result<()> {
-    nvs.set_str("reset_in_progress", "true")?;
+    nvs.set_str("reset_pending", "true")?;
     info!("🚨 Set reset-in-progress marker for power-loss recovery");
 }
 
 /// Phase 5: Clear marker after successful reset
 fn clear_reset_in_progress_marker(&self) -> Result<()> {
-    nvs.remove("reset_in_progress")?;
+    nvs.remove("reset_pending")?;
     info!("✅ Cleared reset-in-progress marker");
 }
 ```
@@ -190,7 +190,7 @@ fn clear_reset_in_progress_marker(&self) -> Result<()> {
 ```rust
 /// Check for incomplete reset and automatically complete it
 fn check_and_recover_from_power_loss(&self) -> Result<()> {
-    if nvs.get_str("reset_in_progress")? == Some("true") {
+    if nvs.get_str("reset_pending")? == Some("true") {
         warn!("⚠️ Found incomplete reset - power lost during reset!");
         warn!("🔄 Attempting to complete interrupted factory reset");
         
@@ -217,7 +217,7 @@ async fn store_reset_state(&self, instance_id: &str, reason: &str) -> Result<()>
     let reset_state_json = serde_json::to_string(&reset_state)?;
 
     // Single atomic write (prevents corruption on power loss)
-    nvs.set_str("reset_state_json", &reset_state_json)?;
+    nvs.set_str("reset_json", &reset_state_json)?;
     
     info!("✅ Reset state stored atomically");
 }
@@ -227,13 +227,13 @@ async fn store_reset_state(&self, instance_id: &str, reason: &str) -> Result<()>
 ```rust
 /// Load reset state with comprehensive validation
 pub fn load_reset_state(&self) -> Result<Option<ResetState>> {
-    const MAX_RESET_STATE_JSON_SIZE: usize = 512;
-    let mut json_buf = vec![0u8; MAX_RESET_STATE_JSON_SIZE];
+    const MAX_RESET_JSON_SIZE: usize = 512;
+    let mut json_buf = vec![0u8; MAX_RESET_JSON_SIZE];
 
-    let reset_state_json = nvs.get_str("reset_state_json", &mut json_buf)?;
+    let reset_state_json = nvs.get_str("reset_json", &mut json_buf)?;
     
     // Validate JSON size before parsing (prevents deserialization attacks)
-    if reset_state_json.len() > MAX_RESET_STATE_JSON_SIZE - 100 {
+    if reset_state_json.len() > MAX_RESET_JSON_SIZE - 100 {
         warn!("Reset state JSON too large: {} bytes", reset_state_json.len());
         self.clear_reset_state()?;
         return Ok(None);
@@ -478,7 +478,7 @@ fn check_and_recover_from_power_loss(&self) -> Result<()> {
     let nvs = EspNvs::new(nvs_partition.clone(), "reset_state", false)?;
     
     // Check for reset-in-progress marker
-    if nvs.get_str("reset_in_progress")? == Some("true") {
+    if nvs.get_str("reset_pending")? == Some("true") {
         warn!("⚠️ Found incomplete reset - power lost during reset!");
         warn!("🔄 Attempting to complete interrupted factory reset");
         
@@ -499,7 +499,7 @@ fn check_and_recover_from_power_loss(&self) -> Result<()> {
 ### Atomic Operations and Race Prevention
 ```rust
 // Single atomic JSON write prevents partial state corruption
-nvs.set_str("reset_state_json", &json_data)?;  // All-or-nothing
+nvs.set_str("reset_json", &json_data)?;  // All-or-nothing
 
 // Critical section protection for reset state
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -559,7 +559,7 @@ nvs.set_str("reset_timestamp", &timestamp)?;
 nvs.set_str("reset_reason", reason)?;
 
 // After: 1 atomic JSON write (75% less flash wear)
-nvs.set_str("reset_state_json", &json_data)?;
+nvs.set_str("reset_json", &json_data)?;
 ```
 
 ## Testing and Validation

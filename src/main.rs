@@ -4,7 +4,7 @@ use embassy_executor::Spawner;
 
 // FACTORY RESET FLAG - Set to true to trigger immediate factory reset on startup
 // This bypasses all normal initialization and performs a factory reset before WiFi/BLE
-const FORCE_FACTORY_RESET_ON_STARTUP: bool = false;
+const FORCE_FACTORY_RESET_ON_STARTUP: bool = true;
 
 // Import Embassy time utilities for delays and timers
 // Duration represents a time span, Timer provides async delays (non-blocking waits)
