@@ -8,7 +8,7 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 
 // Import Embassy time utilities for debouncing and timeouts
-use embassy_time::{with_timeout, Duration, Timer};
+use embassy_time::{Duration, Timer};
 
 // Import ESP-IDF GPIO functionality for reset button input
 use esp_idf_svc::hal::gpio::{Gpio0, Input, PinDriver, Pull};
@@ -23,37 +23,51 @@ use anyhow::{anyhow, Result};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 // Import our reset storage module and system events
-use crate::reset_storage::{ResetNotificationData, ResetStorage};
-use crate::SYSTEM_STATE;
+// Note: SYSTEM_STATE import removed - no longer used in simplified reset architecture
+
+// Import Serde traits for JSON serialization
+use serde::{Deserialize, Serialize};
+
+/// Reset notification data structure for event communication
+/// Used to pass reset information between reset manager and reset handler
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetNotificationData {
+    pub device_id: String,
+    pub reset_timestamp: String, // ISO 8601 format
+    pub old_cert_arn: String,
+    pub reason: String,
+}
+
+/// Get current timestamp in proper ISO 8601 format using chrono
+fn get_iso8601_timestamp() -> String {
+    use chrono::Utc;
+
+    // Use proper RFC3339/ISO8601 timestamp generation
+    // This handles timezones, leap years, calendar correctness, etc.
+    Utc::now().to_rfc3339()
+}
 
 // Reset button configuration constants
 const RESET_BUTTON_GPIO: u32 = 0; // GPIO0 is commonly used for reset/boot button on ESP32
 const BUTTON_DEBOUNCE_MS: u64 = 50; // Debounce delay in milliseconds
 const BUTTON_HOLD_TIME_MS: u64 = 3000; // Hold time required for reset (3 seconds)
 const RESET_CHECK_INTERVAL_MS: u64 = 10; // Check interval during button hold
-const WIFI_CHECK_TIMEOUT_MS: u64 = 5000; // Timeout for WiFi connectivity check
+                                         // Note: WIFI_CHECK_TIMEOUT_MS removed - no WiFi checking needed in new architecture
 
-// Reset event types for internal communication
+// Reset event types for internal communication (simplified)
 #[derive(Debug, Clone)]
 pub enum ResetEvent {
-    ButtonPressed,
-    ButtonReleased,
-    ResetTriggered { wifi_available: bool },
-    ResetCompleted,
-    ResetError(String),
+    ResetTriggered, // Physical reset button triggered (no WiFi distinction needed)
 }
 
-// Reset manager events for external communication
+// Reset manager events for external communication (simplified)
 #[derive(Debug, Clone)]
 pub enum ResetManagerEvent {
-    ResetButtonPressed,
-    ResetInitiated,
+    ResetButtonPressed, // Physical button was pressed
     ResetTriggered {
-        wifi_available: bool,
+        // Reset process initiated (delegated to reset_handler)
         reset_data: ResetNotificationData,
     },
-    ResetCompleted,
-    ResetError(String),
 }
 
 // Global reset event channel for task communication
@@ -75,7 +89,7 @@ static RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Reset button manager - handles GPIO monitoring and reset coordination
 pub struct ResetManager {
     reset_button: PinDriver<'static, Gpio0, Input>,
-    reset_storage: Option<ResetStorage>,
+    // Note: reset_storage removed - no longer needed for GPIO-only monitoring
     device_id: String,
     certificate_arn: String,
 }
@@ -104,34 +118,25 @@ impl ResetManager {
 
         Ok(Self {
             reset_button,
-            reset_storage: None,
             device_id,
             certificate_arn,
         })
     }
 
-    /// Initialize reset storage component
-    pub fn initialize_storage(&mut self, reset_storage: ResetStorage) -> Result<()> {
-        info!("🔧 Initializing reset storage for reset manager");
-        self.reset_storage = Some(reset_storage);
-        info!("✅ Reset storage initialized successfully");
-        Ok(())
-    }
+    // Note: initialize_storage removed - reset manager no longer needs storage
 
     /// Main reset monitoring task - monitors button state and manages resets
     pub async fn run(&mut self) -> Result<()> {
         info!("🚀 Starting reset manager monitoring task");
 
         // Signal that reset manager is active
-        RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetInitiated);
+        info!("🎯 Reset manager monitoring started");
 
         loop {
             // Monitor button state and handle events
             if let Err(e) = self.monitor_reset_button().await {
                 error!("❌ Reset button monitoring error: {}", e);
-                RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetError(e.to_string()));
-
-                // Wait before retrying to avoid rapid error loops
+                // Error handling simplified - just log and retry
                 Timer::after(Duration::from_secs(5)).await;
                 continue;
             }
@@ -139,9 +144,7 @@ impl ResetManager {
             // Process reset events from the channel
             if let Err(e) = self.process_reset_events().await {
                 error!("❌ Reset event processing error: {}", e);
-                RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetError(e.to_string()));
-
-                // Wait before retrying
+                // Error handling simplified - just log and retry
                 Timer::after(Duration::from_secs(1)).await;
             }
 
@@ -203,11 +206,8 @@ impl ResetManager {
         // Button held for required duration - trigger reset
         info!("🔥 Reset button held for required time - triggering reset");
 
-        // Check WiFi connectivity
-        let wifi_available = self.check_wifi_connectivity().await;
-
-        // Send reset event
-        let reset_event = ResetEvent::ResetTriggered { wifi_available };
+        // Send reset event (no WiFi check needed in new architecture)
+        let reset_event = ResetEvent::ResetTriggered;
         RESET_EVENT_CHANNEL
             .sender()
             .try_send(reset_event)
@@ -216,23 +216,7 @@ impl ResetManager {
         Ok(())
     }
 
-    /// Check current WiFi connectivity status
-    async fn check_wifi_connectivity(&self) -> bool {
-        debug!("🌐 Checking WiFi connectivity status");
-
-        // Get current system state
-        let system_state = SYSTEM_STATE.lock().await;
-        let wifi_connected = system_state.wifi_connected;
-        drop(system_state);
-
-        if wifi_connected {
-            debug!("✅ WiFi is connected");
-            true
-        } else {
-            debug!("❌ WiFi is not connected");
-            false
-        }
-    }
+    // Note: check_wifi_connectivity method removed - no WiFi checking needed in new architecture
 
     /// Process reset events from the channel
     async fn process_reset_events(&mut self) -> Result<()> {
@@ -255,27 +239,9 @@ impl ResetManager {
     /// Handle specific reset events
     async fn handle_reset_event(&mut self, event: ResetEvent) -> Result<()> {
         match event {
-            ResetEvent::ResetTriggered { wifi_available } => {
-                info!(
-                    "🔥 Processing reset trigger - WiFi available: {}",
-                    wifi_available
-                );
-                self.execute_reset(wifi_available).await?;
-            }
-
-            ResetEvent::ResetCompleted => {
-                info!("✅ Reset completed successfully");
-                // Reset completion is now handled by reset_handler directly
-            }
-
-            ResetEvent::ResetError(error) => {
-                error!("❌ Reset error occurred: {}", error);
-                // Reset errors are now handled by reset_handler directly
-            }
-
-            ResetEvent::ButtonPressed | ResetEvent::ButtonReleased => {
-                // These events are handled in the monitoring loop
-                debug!("🔘 Button state event: {:?}", event);
+            ResetEvent::ResetTriggered => {
+                info!("🔥 Processing reset trigger");
+                self.execute_reset().await?;
             }
         }
 
@@ -283,31 +249,25 @@ impl ResetManager {
     }
 
     /// Execute the reset process based on WiFi availability
-    async fn execute_reset(&mut self, wifi_available: bool) -> Result<()> {
+    async fn execute_reset(&mut self) -> Result<()> {
         // Check if reset is already in progress to prevent concurrent resets
         if RESET_IN_PROGRESS.swap(true, Ordering::SeqCst) {
             warn!("⚠️ Reset already in progress, ignoring duplicate request");
             return Ok(());
         }
 
-        info!(
-            "🚀 Triggering reset process - WiFi available: {}",
-            wifi_available
-        );
+        info!("🚀 Triggering reset process");
 
         // Create reset notification data
         let reset_data = ResetNotificationData {
             device_id: self.device_id.clone(),
-            reset_timestamp: ResetStorage::generate_reset_timestamp(),
+            reset_timestamp: get_iso8601_timestamp(), // Use local function instead of ResetStorage
             old_cert_arn: self.certificate_arn.clone(),
             reason: "physical_button_reset".to_string(),
         };
 
         // Signal that reset is triggered - delegate execution to reset_handler
-        RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetTriggered {
-            wifi_available,
-            reset_data,
-        });
+        RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetTriggered { reset_data });
 
         info!("📡 Reset trigger signal sent to reset handler");
 
@@ -318,14 +278,5 @@ impl ResetManager {
         Ok(())
     }
 
-    /// Get current certificate ARN for reset notifications
-    pub fn update_certificate_arn(&mut self, new_arn: String) {
-        self.certificate_arn = new_arn;
-        debug!("🔄 Updated certificate ARN for reset manager");
-    }
-
-    /// Check if reset storage is properly initialized
-    pub fn is_storage_initialized(&self) -> bool {
-        self.reset_storage.is_some()
-    }
+    // Note: update_certificate_arn and is_storage_initialized removed - no longer needed
 }
