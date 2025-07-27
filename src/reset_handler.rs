@@ -331,45 +331,53 @@ impl ResetHandler {
         Ok(())
     }
 
-    /// Store reset state in separate namespace that survives data wipe
+    /// Store reset state as single atomic JSON blob to prevent partial writes and NVS wear
     async fn store_reset_state(&self, instance_id: &str, reason: &str) -> Result<()> {
-        info!("💾 Storing reset state for instance ID: {}", instance_id);
+        info!(
+            "💾 Storing reset state atomically for instance ID: {}",
+            instance_id
+        );
 
         let nvs_partition = self
             .nvs_partition
             .as_ref()
             .ok_or_else(|| anyhow!("NVS partition not initialized"))?;
 
+        // Create reset state structure
+        let reset_state = ResetState {
+            device_instance_id: instance_id.to_string(),
+            device_state: "factory_reset".to_string(),
+            reset_timestamp: self.get_iso8601_timestamp(),
+            reset_reason: reason.to_string(),
+        };
+
+        // Serialize to JSON for atomic storage (prevents partial writes)
+        let reset_state_json = serde_json::to_string(&reset_state)
+            .map_err(|e| anyhow!("Failed to serialize reset state: {}", e))?;
+
         // Open reset_state namespace (survives main data wipe)
         let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
-        // Store device instance ID
-        nvs.set_str("device_instance_id", instance_id)
-            .map_err(|e| anyhow!("Failed to store device instance ID: {:?}", e))?;
+        // Store as single atomic operation to prevent corruption
+        match nvs.set_str("reset_state_json", &reset_state_json) {
+            Ok(()) => {
+                info!("✅ Reset state stored atomically");
+                debug!("📝 Instance ID: {}", reset_state.device_instance_id);
+                debug!("📝 State: {}", reset_state.device_state);
+                debug!("📝 Timestamp: {}", reset_state.reset_timestamp);
+                debug!("📝 Reason: {}", reset_state.reset_reason);
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to store reset state: {:?}", e);
+                error!("💥 This could leave device in inconsistent state!");
 
-        // Store device state
-        nvs.set_str("device_state", "factory_reset")
-            .map_err(|e| anyhow!("Failed to store device state: {:?}", e))?;
-
-        // Store reset timestamp (ISO 8601)
-        let reset_timestamp = self.get_iso8601_timestamp();
-        nvs.set_str("reset_timestamp", &reset_timestamp)
-            .map_err(|e| anyhow!("Failed to store reset timestamp: {:?}", e))?;
-
-        // Store reset reason
-        nvs.set_str("reset_reason", reason)
-            .map_err(|e| anyhow!("Failed to store reset reason: {:?}", e))?;
-
-        // Note: ESP-IDF NVS automatically commits changes
-
-        info!("✅ Reset state stored successfully");
-        debug!("📝 Instance ID: {}", instance_id);
-        debug!("📝 State: factory_reset");
-        debug!("📝 Timestamp: {}", reset_timestamp);
-        debug!("📝 Reason: {}", reason);
-
-        Ok(())
+                // TODO: Consider implementing rollback or alternative storage
+                // For now, we'll error out to prevent silent failures
+                Err(anyhow!("Critical: Reset state storage failed: {:?}", e))
+            }
+        }
     }
 
     /// Get current timestamp in proper ISO 8601 format using chrono
