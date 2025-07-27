@@ -55,18 +55,110 @@ impl ResetHandler {
         }
     }
 
-    /// Initialize NVS partition for data erasure
+    /// Initialize NVS partition for data erasure and check for power-loss recovery
     pub fn initialize_nvs_partition(
         &mut self,
         nvs_partition: EspDefaultNvsPartition,
     ) -> Result<()> {
         info!("🔧 Initializing NVS partition for reset handler");
         self.nvs_partition = Some(nvs_partition);
+
+        // Check for incomplete reset on boot and recover
+        if let Err(e) = self.check_and_recover_from_power_loss() {
+            error!(
+                "❌ Failed to recover from potential power-loss during reset: {}",
+                e
+            );
+            // Continue anyway - device should still be functional
+        }
+
         info!("✅ NVS partition initialized for reset handler");
         Ok(())
     }
 
-    /// Execute factory reset with Echo/Nest-style security
+    /// Check for incomplete reset and recover from power-loss scenarios
+    fn check_and_recover_from_power_loss(&self) -> Result<()> {
+        info!("🔍 Checking for incomplete reset state after boot");
+
+        let nvs_partition = match &self.nvs_partition {
+            Some(partition) => partition,
+            None => {
+                debug!("📝 No NVS partition - skipping power-loss recovery check");
+                return Ok(());
+            }
+        };
+
+        // Check for "reset in progress" marker
+        let nvs = match EspNvs::new(nvs_partition.clone(), "reset_state", false) {
+            Ok(nvs) => nvs,
+            Err(_) => {
+                debug!("📝 No reset_state namespace - normal boot");
+                return Ok(());
+            }
+        };
+
+        // Check for reset-in-progress marker
+        let mut marker_buf = [0u8; 32];
+        match nvs.get_str("reset_in_progress", &mut marker_buf) {
+            Ok(Some("true")) => {
+                warn!("⚠️ Found incomplete reset - power lost during reset!");
+                warn!("🔄 Attempting to complete interrupted factory reset");
+
+                // Complete the interrupted reset
+                self.complete_interrupted_reset()?;
+            }
+            Ok(Some(_)) | Ok(None) => {
+                debug!("📝 No reset-in-progress marker found");
+            }
+            Err(e) => {
+                debug!("📝 Could not check reset-in-progress marker: {:?}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Complete an interrupted factory reset after power loss
+    fn complete_interrupted_reset(&self) -> Result<()> {
+        info!("🔄 Completing interrupted factory reset");
+
+        // Generate new instance ID and complete reset
+        let new_instance_id = self.generate_device_instance_id();
+
+        // Store the reset state properly this time - create sync version for recovery
+        self.store_reset_state_sync(&new_instance_id, "power_loss_recovery")?;
+
+        // Ensure main device credentials are wiped
+        self.wipe_main_device_credentials()?;
+
+        // Clear the in-progress marker
+        self.clear_reset_in_progress_marker()?;
+
+        info!("✅ Successfully completed interrupted factory reset");
+        warn!("⚠️ Device will now enter BLE setup mode on next reboot");
+
+        Ok(())
+    }
+
+    /// Clear the reset-in-progress marker
+    fn clear_reset_in_progress_marker(&self) -> Result<()> {
+        let nvs_partition = self
+            .nvs_partition
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVS partition not initialized"))?;
+
+        let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
+            .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
+
+        match nvs.remove("reset_in_progress") {
+            Ok(_) => info!("✅ Cleared reset-in-progress marker"),
+            Err(e) => warn!("⚠️ Failed to clear reset-in-progress marker: {:?}", e),
+        }
+
+        Ok(())
+    }
+
+    /// Execute factory reset with Echo/Nest-style security and power-loss resilience
     /// Generates new device instance ID and wipes device data
     pub async fn execute_factory_reset(&mut self, reason: String) -> Result<()> {
         info!("🔥 Executing factory reset with device instance ID security");
@@ -74,7 +166,10 @@ impl ResetHandler {
 
         RESET_HANDLER_EVENT_SIGNAL.signal(ResetHandlerEvent::ResetStarted);
 
-        // Generate new device instance ID for reset security
+        // Step 1: Mark reset as in progress for power-loss recovery
+        self.set_reset_in_progress_marker()?;
+
+        // Step 2: Generate new device instance ID for reset security
         let new_instance_id = self.generate_device_instance_id();
         info!("🆔 Generated new device instance ID: {}", new_instance_id);
 
@@ -82,31 +177,43 @@ impl ResetHandler {
             new_instance_id.clone(),
         ));
 
-        // Store reset state that survives the data wipe
+        // Step 3: Store reset state that survives the data wipe
         match self.store_reset_state(&new_instance_id, &reason).await {
             Ok(_) => {
                 info!("✅ Reset state stored successfully");
             }
             Err(e) => {
                 error!("❌ Failed to store reset state: {}", e);
+                // Clear the in-progress marker since we failed
+                let _ = self.clear_reset_in_progress_marker();
                 RESET_HANDLER_EVENT_SIGNAL.signal(ResetHandlerEvent::ResetError(e.to_string()));
                 return Err(e);
             }
         }
 
-        // Perform selective NVS erasure (preserving reset state)
+        // Step 4: Perform selective NVS erasure (preserving reset state)
         match self.perform_factory_reset().await {
             Ok(_) => {
                 info!("✅ Factory reset completed successfully");
-                RESET_HANDLER_EVENT_SIGNAL.signal(ResetHandlerEvent::ResetCompleted);
+
+                // Step 5: Clear the in-progress marker - reset is complete
+                if let Err(e) = self.clear_reset_in_progress_marker() {
+                    warn!("⚠️ Failed to clear reset-in-progress marker: {}", e);
+                    // Continue anyway - reset was successful
+                }
+
+                RESET_HANDLER_EVENT_SIGNAL.signal(ResetHandlerEvent::DataErased);
             }
             Err(e) => {
                 error!("❌ Factory reset failed: {}", e);
+                // Leave the in-progress marker - power-loss recovery will handle this
+                warn!("🚨 Reset-in-progress marker left for recovery");
                 RESET_HANDLER_EVENT_SIGNAL.signal(ResetHandlerEvent::ResetError(e.to_string()));
                 return Err(e);
             }
         }
 
+        info!("🎯 Factory reset completed - device ready for re-registration");
         Ok(())
     }
 
@@ -118,6 +225,110 @@ impl ResetHandler {
         // This changes every factory reset to prove physical access
         // Uses proper cryptographic randomness instead of predictable timestamp
         Uuid::new_v4().to_string()
+    }
+
+    /// Synchronous version of store_reset_state for power-loss recovery
+    fn store_reset_state_sync(&self, instance_id: &str, reason: &str) -> Result<()> {
+        info!(
+            "💾 Storing reset state synchronously for recovery: {}",
+            instance_id
+        );
+
+        let nvs_partition = self
+            .nvs_partition
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVS partition not initialized"))?;
+
+        // Create reset state structure
+        let reset_state = ResetState {
+            device_instance_id: instance_id.to_string(),
+            device_state: "factory_reset".to_string(),
+            reset_timestamp: self.get_iso8601_timestamp(),
+            reset_reason: reason.to_string(),
+        };
+
+        // Serialize to JSON for atomic storage
+        let reset_state_json = serde_json::to_string(&reset_state)
+            .map_err(|e| anyhow!("Failed to serialize reset state: {}", e))?;
+
+        // Open reset_state namespace
+        let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
+            .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
+
+        // Store as single atomic operation
+        nvs.set_str("reset_state_json", &reset_state_json)
+            .map_err(|e| anyhow!("Failed to store reset state: {:?}", e))?;
+
+        info!("✅ Reset state stored synchronously");
+        Ok(())
+    }
+
+    /// Wipe main device credentials to ensure clean slate
+    fn wipe_main_device_credentials(&self) -> Result<()> {
+        info!("🧹 Wiping main device credentials");
+
+        let nvs_partition = self
+            .nvs_partition
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVS partition not initialized"))?;
+
+        // List of namespaces to wipe for main device credentials
+        let namespaces_to_wipe = [
+            "acorn_device",  // Main device namespace
+            "wifi_creds",    // WiFi credentials
+            "mqtt_certs",    // MQTT certificates
+            "device_config", // Device configuration
+        ];
+
+        for namespace in &namespaces_to_wipe {
+            match EspNvs::new(nvs_partition.clone(), namespace, true) {
+                Ok(mut nvs) => {
+                    // Get all keys in this namespace
+                    let keys_to_remove = [
+                        "device_id",
+                        "device_cert",
+                        "device_key",
+                        "ca_cert",
+                        "iot_endpoint",
+                        "wifi_ssid",
+                        "wifi_password",
+                        "owner_user_id",
+                    ];
+
+                    for key in &keys_to_remove {
+                        match nvs.remove(key) {
+                            Ok(_) => debug!("🗑️ Removed key: {}/{}", namespace, key),
+                            Err(_) => debug!("📝 Key not found: {}/{}", namespace, key),
+                        }
+                    }
+
+                    info!("✅ Wiped namespace: {}", namespace);
+                }
+                Err(_) => {
+                    debug!("📝 Namespace not found: {}", namespace);
+                }
+            }
+        }
+
+        info!("✅ Main device credentials wiped");
+        Ok(())
+    }
+
+    /// Set the reset-in-progress marker for power-loss recovery
+    fn set_reset_in_progress_marker(&self) -> Result<()> {
+        let nvs_partition = self
+            .nvs_partition
+            .as_ref()
+            .ok_or_else(|| anyhow!("NVS partition not initialized"))?;
+
+        let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
+            .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
+
+        nvs.set_str("reset_in_progress", "true")
+            .map_err(|e| anyhow!("Failed to set reset-in-progress marker: {:?}", e))?;
+
+        info!("🚨 Set reset-in-progress marker for power-loss recovery");
+        Ok(())
     }
 
     /// Store reset state in separate namespace that survives data wipe
@@ -275,7 +486,7 @@ impl ResetHandler {
         Ok(())
     }
 
-    /// Load reset state from single JSON blob to prevent buffer overflows
+    /// Load reset state from single JSON blob with enhanced validation
     pub fn load_reset_state(&self) -> Result<Option<ResetState>> {
         info!("📖 Loading reset state atomically from NVS");
 
@@ -293,12 +504,21 @@ impl ResetHandler {
             }
         };
 
-        // Use heap-allocated buffer to prevent stack overflow
-        // Max JSON size for reset state should be < 1KB
-        let mut json_buf = vec![0u8; 1024];
+        // Conservative buffer size with safety margin
+        const MAX_RESET_STATE_JSON_SIZE: usize = 512;
+        let mut json_buf = vec![0u8; MAX_RESET_STATE_JSON_SIZE];
 
         let reset_state_json = match nvs.get_str("reset_state_json", &mut json_buf) {
-            Ok(Some(json_str)) => json_str,
+            Ok(Some(json_str)) => {
+                // Validate JSON size before parsing
+                if json_str.len() > MAX_RESET_STATE_JSON_SIZE - 100 {
+                    warn!("Reset state JSON too large: {} bytes", json_str.len());
+                    error!("🗑️ Oversized reset state - clearing for safety");
+                    let _ = self.clear_reset_state();
+                    return Ok(None);
+                }
+                json_str
+            }
             Ok(None) => {
                 info!("📝 No reset state JSON found - normal operation");
                 return Ok(None);
@@ -309,10 +529,47 @@ impl ResetHandler {
             }
         };
 
-        // Deserialize from JSON with error handling
+        // Deserialize from JSON with comprehensive error handling
         match serde_json::from_str::<ResetState>(reset_state_json) {
             Ok(reset_state) => {
-                info!("✅ Reset state loaded successfully");
+                // Validate field sizes to prevent corruption attacks
+                if reset_state.device_instance_id.len() > 64 {
+                    warn!(
+                        "Device instance ID too large: {} chars",
+                        reset_state.device_instance_id.len()
+                    );
+                    let _ = self.clear_reset_state();
+                    return Ok(None);
+                }
+
+                if reset_state.device_state.len() > 32 {
+                    warn!(
+                        "Device state too large: {} chars",
+                        reset_state.device_state.len()
+                    );
+                    let _ = self.clear_reset_state();
+                    return Ok(None);
+                }
+
+                if reset_state.reset_timestamp.len() > 64 {
+                    warn!(
+                        "Reset timestamp too large: {} chars",
+                        reset_state.reset_timestamp.len()
+                    );
+                    let _ = self.clear_reset_state();
+                    return Ok(None);
+                }
+
+                if reset_state.reset_reason.len() > 128 {
+                    warn!(
+                        "Reset reason too large: {} chars",
+                        reset_state.reset_reason.len()
+                    );
+                    let _ = self.clear_reset_state();
+                    return Ok(None);
+                }
+
+                info!("✅ Reset state loaded and validated successfully");
                 debug!("📝 Instance ID: {}", reset_state.device_instance_id);
                 debug!("📝 State: {}", reset_state.device_state);
                 debug!("📝 Timestamp: {}", reset_state.reset_timestamp);
@@ -321,8 +578,8 @@ impl ResetHandler {
                 Ok(Some(reset_state))
             }
             Err(e) => {
-                error!("❌ Failed to deserialize reset state JSON: {}", e);
-                error!("🗑️ Corrupted reset state - clearing for safety");
+                warn!("Failed to parse reset state JSON: {}", e);
+                warn!("🗑️ Corrupted reset state - clearing for safety");
 
                 // Clear corrupted data to prevent repeated failures
                 if let Err(clear_err) = self.clear_reset_state() {
