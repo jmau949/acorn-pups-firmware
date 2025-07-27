@@ -265,16 +265,17 @@ pub fn load_reset_state(&self) -> Result<Option<ResetState>> {
 fn wipe_main_device_credentials(&self) -> Result<()> {
     let namespaces_to_wipe = [
         "acorn_device",     // Main device namespace
-        "wifi_creds",       // WiFi credentials
+        "wifi_config",      // WiFi credentials (CORRECT namespace name)
         "mqtt_certs",       // MQTT certificates
-        "device_config",    // Device configuration
     ];
 
     for namespace in &namespaces_to_wipe {
-        let keys_to_remove = [
-            "device_id", "device_cert", "device_key", "ca_cert",
-            "iot_endpoint", "wifi_ssid", "wifi_password", "owner_user_id"
-        ];
+        let keys_to_remove = match *namespace {
+            "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
+            "wifi_config" => vec!["ssid", "password", "auth_token", "device_name", "user_timezone", "timestamp"],
+            "mqtt_certs" => vec!["device_cert", "private_key", "ca_cert", "iot_endpoint", "device_id"],
+            _ => vec![],
+        };
         
         for key in &keys_to_remove {
             nvs.remove(key)?; // Remove each credential
@@ -291,9 +292,8 @@ const RESET_STATE_NAMESPACE: &str = "reset_state";  // Survives reset
 
 // Main device credentials completely wiped
 const ACORN_DEVICE_NAMESPACE: &str = "acorn_device"; // Wiped
-const WIFI_CREDS_NAMESPACE: &str = "wifi_creds";     // Wiped  
+const WIFI_CONFIG_NAMESPACE: &str = "wifi_config";   // Wiped (CORRECT name)
 const MQTT_CERTS_NAMESPACE: &str = "mqtt_certs";     // Wiped
-const DEVICE_CONFIG_NAMESPACE: &str = "device_config"; // Wiped
 ```
 
 ## HTTP Registration API Integration

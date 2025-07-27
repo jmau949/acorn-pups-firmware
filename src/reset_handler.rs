@@ -274,26 +274,34 @@ impl ResetHandler {
 
         // List of namespaces to wipe for main device credentials
         let namespaces_to_wipe = [
-            "acorn_device",  // Main device namespace
-            "wifi_creds",    // WiFi credentials
-            "mqtt_certs",    // MQTT certificates
-            "device_config", // Device configuration
+            "acorn_device", // Main device namespace
+            "wifi_config",  // WiFi credentials (CORRECT namespace name)
+            "mqtt_certs",   // MQTT certificates
         ];
 
         for namespace in &namespaces_to_wipe {
             match EspNvs::new(nvs_partition.clone(), namespace, true) {
                 Ok(mut nvs) => {
                     // Get all keys in this namespace
-                    let keys_to_remove = [
-                        "device_id",
-                        "device_cert",
-                        "device_key",
-                        "ca_cert",
-                        "iot_endpoint",
-                        "wifi_ssid",
-                        "wifi_password",
-                        "owner_user_id",
-                    ];
+                    let keys_to_remove = match *namespace {
+                        "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
+                        "wifi_config" => vec![
+                            "ssid",
+                            "password",
+                            "auth_token",
+                            "device_name",
+                            "user_timezone",
+                            "timestamp",
+                        ],
+                        "mqtt_certs" => vec![
+                            "device_cert",
+                            "private_key",
+                            "ca_cert",
+                            "iot_endpoint",
+                            "device_id",
+                        ],
+                        _ => vec![],
+                    };
 
                     for key in &keys_to_remove {
                         match nvs.remove(key) {
@@ -439,10 +447,9 @@ impl ResetHandler {
 
         // List of namespaces to erase (main device data)
         let namespaces_to_erase = [
-            "acorn_device",    // Main device configuration
-            "wifi_storage",    // WiFi credentials
-            "mqtt_certs",      // MQTT certificates
-            "device_identity", // Device identity
+            "acorn_device", // Main device configuration
+            "wifi_config",  // WiFi credentials (CORRECT namespace name)
+            "mqtt_certs",   // MQTT certificates
         ];
 
         let mut erasure_errors = Vec::new();
@@ -454,10 +461,22 @@ impl ResetHandler {
                 Ok(mut nvs) => {
                     // Erase all keys by removing known keys
                     let keys_to_remove = match *namespace {
-                        "acorn_device" => vec!["device_id", "config", "settings"],
-                        "wifi_storage" => vec!["ssid", "password", "auth_token"],
-                        "mqtt_certs" => vec!["device_cert", "private_key", "ca_cert"],
-                        "device_identity" => vec!["serial", "mac_address"],
+                        "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
+                        "wifi_config" => vec![
+                            "ssid",
+                            "password",
+                            "auth_token",
+                            "device_name",
+                            "user_timezone",
+                            "timestamp",
+                        ],
+                        "mqtt_certs" => vec![
+                            "device_cert",
+                            "private_key",
+                            "ca_cert",
+                            "iot_endpoint",
+                            "device_id",
+                        ],
                         _ => vec![],
                     };
 
