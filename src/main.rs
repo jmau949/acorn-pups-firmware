@@ -56,44 +56,15 @@ use embassy_time::with_timeout;
 // error! = critical errors, info! = general information, warn! = warnings
 use log::{debug, error, info, warn};
 
-/// Get current timestamp in ISO 8601 format
-fn get_iso8601_timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+// Note: Timestamp generation moved to individual modules using chrono::Utc::now().to_rfc3339()
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Simple ISO 8601 timestamp generation
-    format!(
-        "2025-01-{:02}T{:02}:{:02}:{:02}Z",
-        ((timestamp / 86400) % 31) + 1, // Day
-        ((timestamp / 3600) % 24),      // Hour
-        ((timestamp / 60) % 60),        // Minute
-        (timestamp % 60)                // Second
-    )
-}
-
-/// Generate new device instance ID (UUID v4) for registration security
+/// Generate new device instance ID (proper UUID v4) for registration security
 fn generate_device_instance_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Simple UUID-like generation using timestamp
-    // In production, use a proper UUID library
-    format!(
-        "inst-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (timestamp & 0xFFFFFFFF) as u32,
-        ((timestamp >> 32) & 0xFFFF) as u16,
-        0x4000 | ((timestamp >> 16) & 0x0FFF) as u16, // Version 4
-        0x8000 | ((timestamp >> 8) & 0x3FFF) as u16,  // Variant
-        timestamp & 0xFFFFFFFFFFFF
-    )
+    // Generate proper RFC-compliant UUID v4 (random)
+    // This ensures compatibility with backend validation and uniqueness
+    Uuid::new_v4().to_string()
 }
 
 // Import anyhow for error handling
@@ -119,7 +90,7 @@ use device_api::DeviceApiClient; // Device-specific API client for registration
 use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
 use reset_handler::ResetHandler; // Reset behavior execution
-use reset_manager::ResetNotificationData; // Reset notification data structure for events
+                                 // Note: ResetNotificationData no longer needed with new architecture
 use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 

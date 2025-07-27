@@ -112,25 +112,12 @@ impl ResetHandler {
 
     /// Generate new device instance ID (UUID v4)
     fn generate_device_instance_id(&self) -> String {
-        // Generate a UUID v4 for device instance ID
+        use uuid::Uuid;
+
+        // Generate proper RFC-compliant UUID v4 (random)
         // This changes every factory reset to prove physical access
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Simple UUID-like generation using timestamp and device info
-        // In production, use a proper UUID library
-        format!(
-            "inst-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-            (timestamp & 0xFFFFFFFF) as u32,
-            ((timestamp >> 32) & 0xFFFF) as u16,
-            0x4000 | ((timestamp >> 16) & 0x0FFF) as u16, // Version 4
-            0x8000 | ((timestamp >> 8) & 0x3FFF) as u16,  // Variant
-            timestamp & 0xFFFFFFFFFFFF
-        )
+        // Uses proper cryptographic randomness instead of predictable timestamp
+        Uuid::new_v4().to_string()
     }
 
     /// Store reset state in separate namespace that survives data wipe
@@ -174,24 +161,13 @@ impl ResetHandler {
         Ok(())
     }
 
-    /// Get current timestamp in ISO 8601 format
+    /// Get current timestamp in proper ISO 8601 format using chrono
     fn get_iso8601_timestamp(&self) -> String {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use chrono::Utc;
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        // Simple ISO 8601 timestamp generation
-        // In production, use proper time formatting
-        format!(
-            "2025-01-{:02}T{:02}:{:02}:{:02}Z",
-            ((timestamp / 86400) % 31) + 1, // Day
-            ((timestamp / 3600) % 24),      // Hour
-            ((timestamp / 60) % 60),        // Minute
-            (timestamp % 60)                // Second
-        )
+        // Use proper RFC3339/ISO8601 timestamp generation
+        // This handles timezones, leap years, calendar correctness, etc.
+        Utc::now().to_rfc3339()
     }
 
     /// Perform factory reset with selective NVS erasure
@@ -299,9 +275,9 @@ impl ResetHandler {
         Ok(())
     }
 
-    /// Load reset state after system restart (for registration)
+    /// Load reset state from single JSON blob to prevent buffer overflows
     pub fn load_reset_state(&self) -> Result<Option<ResetState>> {
-        info!("📖 Loading reset state from NVS");
+        info!("📖 Loading reset state atomically from NVS");
 
         let nvs_partition = self
             .nvs_partition
@@ -317,45 +293,45 @@ impl ResetHandler {
             }
         };
 
-        // Load reset state components with proper buffer management
-        let mut instance_id_buf = [0u8; 64];
-        let device_instance_id = nvs
-            .get_str("device_instance_id", &mut instance_id_buf)
-            .map_err(|e| anyhow!("Failed to load device instance ID: {:?}", e))?
-            .ok_or_else(|| anyhow!("Device instance ID not found"))?;
+        // Use heap-allocated buffer to prevent stack overflow
+        // Max JSON size for reset state should be < 1KB
+        let mut json_buf = vec![0u8; 1024];
 
-        let mut device_state_buf = [0u8; 32];
-        let device_state = nvs
-            .get_str("device_state", &mut device_state_buf)
-            .map_err(|e| anyhow!("Failed to load device state: {:?}", e))?
-            .ok_or_else(|| anyhow!("Device state not found"))?;
-
-        let mut reset_timestamp_buf = [0u8; 32];
-        let reset_timestamp = nvs
-            .get_str("reset_timestamp", &mut reset_timestamp_buf)
-            .map_err(|e| anyhow!("Failed to load reset timestamp: {:?}", e))?
-            .ok_or_else(|| anyhow!("Reset timestamp not found"))?;
-
-        let mut reset_reason_buf = [0u8; 128];
-        let reset_reason = nvs
-            .get_str("reset_reason", &mut reset_reason_buf)
-            .map_err(|e| anyhow!("Failed to load reset reason: {:?}", e))?
-            .unwrap_or("Unknown");
-
-        let reset_state = ResetState {
-            device_instance_id: device_instance_id.to_string(),
-            device_state: device_state.to_string(),
-            reset_timestamp: reset_timestamp.to_string(),
-            reset_reason: reset_reason.to_string(),
+        let reset_state_json = match nvs.get_str("reset_state_json", &mut json_buf) {
+            Ok(Some(json_str)) => json_str,
+            Ok(None) => {
+                info!("📝 No reset state JSON found - normal operation");
+                return Ok(None);
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to load reset state JSON: {:?}", e);
+                return Ok(None);
+            }
         };
 
-        info!("✅ Reset state loaded successfully");
-        debug!("📝 Instance ID: {}", reset_state.device_instance_id);
-        debug!("📝 State: {}", reset_state.device_state);
-        debug!("📝 Timestamp: {}", reset_state.reset_timestamp);
-        debug!("📝 Reason: {}", reset_state.reset_reason);
+        // Deserialize from JSON with error handling
+        match serde_json::from_str::<ResetState>(reset_state_json) {
+            Ok(reset_state) => {
+                info!("✅ Reset state loaded successfully");
+                debug!("📝 Instance ID: {}", reset_state.device_instance_id);
+                debug!("📝 State: {}", reset_state.device_state);
+                debug!("📝 Timestamp: {}", reset_state.reset_timestamp);
+                debug!("📝 Reason: {}", reset_state.reset_reason);
 
-        Ok(Some(reset_state))
+                Ok(Some(reset_state))
+            }
+            Err(e) => {
+                error!("❌ Failed to deserialize reset state JSON: {}", e);
+                error!("🗑️ Corrupted reset state - clearing for safety");
+
+                // Clear corrupted data to prevent repeated failures
+                if let Err(clear_err) = self.clear_reset_state() {
+                    error!("❌ Failed to clear corrupted reset state: {}", clear_err);
+                }
+
+                Ok(None)
+            }
+        }
     }
 
     /// Clear reset state after successful registration
@@ -370,19 +346,23 @@ impl ResetHandler {
         let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
-        // Update device state to normal
-        nvs.set_str("device_state", "normal")
-            .map_err(|e| anyhow!("Failed to update device state: {:?}", e))?;
-
-        // Note: ESP-IDF NVS automatically commits changes
-
-        info!("✅ Reset state cleared - device now in normal operation");
-        Ok(())
+        // Remove the JSON blob completely
+        match nvs.remove("reset_state_json") {
+            Ok(_) => {
+                info!("✅ Reset state cleared completely - device now in normal operation");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to clear reset state (may not exist): {:?}", e);
+                // Don't error out - clearing non-existent state is OK
+                Ok(())
+            }
+        }
     }
 }
 
-/// Reset state structure for registration API
-#[derive(Debug, Clone)]
+/// Reset state structure for registration API and JSON serialization
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResetState {
     pub device_instance_id: String,
     pub device_state: String,

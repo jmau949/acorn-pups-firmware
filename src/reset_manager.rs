@@ -38,23 +38,13 @@ pub struct ResetNotificationData {
     pub reason: String,
 }
 
-/// Get current timestamp in ISO 8601 format
+/// Get current timestamp in proper ISO 8601 format using chrono
 fn get_iso8601_timestamp() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use chrono::Utc;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    // Simple ISO 8601 timestamp generation
-    format!(
-        "2025-01-{:02}T{:02}:{:02}:{:02}Z",
-        ((timestamp / 86400) % 31) + 1, // Day
-        ((timestamp / 3600) % 24),      // Hour
-        ((timestamp / 60) % 60),        // Minute
-        (timestamp % 60)                // Second
-    )
+    // Use proper RFC3339/ISO8601 timestamp generation
+    // This handles timezones, leap years, calendar correctness, etc.
+    Utc::now().to_rfc3339()
 }
 
 // Reset button configuration constants
