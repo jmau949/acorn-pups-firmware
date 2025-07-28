@@ -99,7 +99,7 @@ impl ResetHandler {
 
         // Check for reset-in-progress marker
         let mut marker_buf = [0u8; 32];
-        match nvs.get_str("reset_in_progress", &mut marker_buf) {
+        match nvs.get_str("reset_pending", &mut marker_buf) {
             Ok(Some("true")) => {
                 warn!("⚠️ Found incomplete reset - power lost during reset!");
                 warn!("🔄 Attempting to complete interrupted factory reset");
@@ -150,7 +150,7 @@ impl ResetHandler {
         let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
-        match nvs.remove("reset_in_progress") {
+        match nvs.remove("reset_pending") {
             Ok(_) => info!("✅ Cleared reset-in-progress marker"),
             Err(e) => warn!("⚠️ Failed to clear reset-in-progress marker: {:?}", e),
         }
@@ -256,7 +256,7 @@ impl ResetHandler {
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
         // Store as single atomic operation
-        nvs.set_str("reset_state_json", &reset_state_json)
+        nvs.set_str("reset_json", &reset_state_json)
             .map_err(|e| anyhow!("Failed to store reset state: {:?}", e))?;
 
         info!("✅ Reset state stored synchronously");
@@ -274,26 +274,34 @@ impl ResetHandler {
 
         // List of namespaces to wipe for main device credentials
         let namespaces_to_wipe = [
-            "acorn_device",  // Main device namespace
-            "wifi_creds",    // WiFi credentials
-            "mqtt_certs",    // MQTT certificates
-            "device_config", // Device configuration
+            "acorn_device", // Main device namespace
+            "wifi_config",  // WiFi credentials (CORRECT namespace name)
+            "mqtt_certs",   // MQTT certificates
         ];
 
         for namespace in &namespaces_to_wipe {
             match EspNvs::new(nvs_partition.clone(), namespace, true) {
                 Ok(mut nvs) => {
                     // Get all keys in this namespace
-                    let keys_to_remove = [
-                        "device_id",
-                        "device_cert",
-                        "device_key",
-                        "ca_cert",
-                        "iot_endpoint",
-                        "wifi_ssid",
-                        "wifi_password",
-                        "owner_user_id",
-                    ];
+                    let keys_to_remove = match *namespace {
+                        "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
+                        "wifi_config" => vec![
+                            "ssid",
+                            "password",
+                            "auth_token",
+                            "device_name",
+                            "user_timezone",
+                            "timestamp",
+                        ],
+                        "mqtt_certs" => vec![
+                            "device_cert",
+                            "private_key",
+                            "ca_cert",
+                            "iot_endpoint",
+                            "device_id",
+                        ],
+                        _ => vec![],
+                    };
 
                     for key in &keys_to_remove {
                         match nvs.remove(key) {
@@ -324,7 +332,7 @@ impl ResetHandler {
         let mut nvs = EspNvs::new(nvs_partition.clone(), "reset_state", true)
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
-        nvs.set_str("reset_in_progress", "true")
+        nvs.set_str("reset_pending", "true")
             .map_err(|e| anyhow!("Failed to set reset-in-progress marker: {:?}", e))?;
 
         info!("🚨 Set reset-in-progress marker for power-loss recovery");
@@ -360,7 +368,7 @@ impl ResetHandler {
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
         // Store as single atomic operation to prevent corruption
-        match nvs.set_str("reset_state_json", &reset_state_json) {
+        match nvs.set_str("reset_json", &reset_state_json) {
             Ok(()) => {
                 info!("✅ Reset state stored atomically");
                 debug!("📝 Instance ID: {}", reset_state.device_instance_id);
@@ -439,10 +447,9 @@ impl ResetHandler {
 
         // List of namespaces to erase (main device data)
         let namespaces_to_erase = [
-            "acorn_device",    // Main device configuration
-            "wifi_storage",    // WiFi credentials
-            "mqtt_certs",      // MQTT certificates
-            "device_identity", // Device identity
+            "acorn_device", // Main device configuration
+            "wifi_config",  // WiFi credentials (CORRECT namespace name)
+            "mqtt_certs",   // MQTT certificates
         ];
 
         let mut erasure_errors = Vec::new();
@@ -454,10 +461,22 @@ impl ResetHandler {
                 Ok(mut nvs) => {
                     // Erase all keys by removing known keys
                     let keys_to_remove = match *namespace {
-                        "acorn_device" => vec!["device_id", "config", "settings"],
-                        "wifi_storage" => vec!["ssid", "password", "auth_token"],
-                        "mqtt_certs" => vec!["device_cert", "private_key", "ca_cert"],
-                        "device_identity" => vec!["serial", "mac_address"],
+                        "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
+                        "wifi_config" => vec![
+                            "ssid",
+                            "password",
+                            "auth_token",
+                            "device_name",
+                            "user_timezone",
+                            "timestamp",
+                        ],
+                        "mqtt_certs" => vec![
+                            "device_cert",
+                            "private_key",
+                            "ca_cert",
+                            "iot_endpoint",
+                            "device_id",
+                        ],
                         _ => vec![],
                     };
 
@@ -513,13 +532,13 @@ impl ResetHandler {
         };
 
         // Conservative buffer size with safety margin
-        const MAX_RESET_STATE_JSON_SIZE: usize = 512;
-        let mut json_buf = vec![0u8; MAX_RESET_STATE_JSON_SIZE];
+        const MAX_RESET_JSON_SIZE: usize = 512;
+        let mut json_buf = vec![0u8; MAX_RESET_JSON_SIZE];
 
-        let reset_state_json = match nvs.get_str("reset_state_json", &mut json_buf) {
+        let reset_state_json = match nvs.get_str("reset_json", &mut json_buf) {
             Ok(Some(json_str)) => {
                 // Validate JSON size before parsing
-                if json_str.len() > MAX_RESET_STATE_JSON_SIZE - 100 {
+                if json_str.len() > MAX_RESET_JSON_SIZE - 100 {
                     warn!("Reset state JSON too large: {} bytes", json_str.len());
                     error!("🗑️ Oversized reset state - clearing for safety");
                     let _ = self.clear_reset_state();
@@ -612,7 +631,7 @@ impl ResetHandler {
             .map_err(|e| anyhow!("Failed to open reset_state namespace: {:?}", e))?;
 
         // Remove the JSON blob completely
-        match nvs.remove("reset_state_json") {
+        match nvs.remove("reset_json") {
             Ok(_) => {
                 info!("✅ Reset state cleared completely - device now in normal operation");
                 Ok(())
