@@ -94,6 +94,29 @@ impl MqttCertificateStorage {
             device_id
         );
 
+        // Debug: Log certificate details before validation
+        info!("📋 Certificate details from backend:");
+        info!(
+            "  📜 Device certificate: {} bytes",
+            certificates.device_certificate.len()
+        );
+        info!("  🔑 Private key: {} bytes", certificates.private_key.len());
+        info!("  🌐 IoT endpoint: {}", certificates.iot_endpoint);
+
+        // Show first 100 characters of each certificate for debugging
+        let cert_preview = certificates
+            .device_certificate
+            .chars()
+            .take(100)
+            .collect::<String>();
+        let key_preview = certificates
+            .private_key
+            .chars()
+            .take(100)
+            .collect::<String>();
+        info!("  📜 Cert preview: {}", cert_preview);
+        info!("  🔑 Key preview: {}", key_preview);
+
         // Validate certificate format before storage
         if let Err(validation_result) = self.validate_certificate_format(certificates) {
             error!("❌ Certificate validation failed: {:?}", validation_result);
@@ -392,6 +415,52 @@ impl MqttCertificateStorage {
         &self,
         certificates: &DeviceCertificates,
     ) -> Result<(), CertificateValidation> {
+        info!("🔍 Validating certificate format...");
+        info!(
+            "📜 Device certificate length: {} bytes",
+            certificates.device_certificate.len()
+        );
+        info!(
+            "🔑 Private key length: {} bytes",
+            certificates.private_key.len()
+        );
+        info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
+
+        // Debug: Show first and last 50 characters of each certificate
+        let cert_start = certificates
+            .device_certificate
+            .chars()
+            .take(50)
+            .collect::<String>();
+        let cert_end = if certificates.device_certificate.len() > 50 {
+            certificates
+                .device_certificate
+                .chars()
+                .skip(certificates.device_certificate.len() - 50)
+                .collect::<String>()
+        } else {
+            certificates.device_certificate.clone()
+        };
+        let key_start = certificates
+            .private_key
+            .chars()
+            .take(50)
+            .collect::<String>();
+        let key_end = if certificates.private_key.len() > 50 {
+            certificates
+                .private_key
+                .chars()
+                .skip(certificates.private_key.len() - 50)
+                .collect::<String>()
+        } else {
+            certificates.private_key.clone()
+        };
+
+        info!("📜 Device cert starts with: {}", cert_start);
+        info!("📜 Device cert ends with: {}", cert_end);
+        info!("🔑 Private key starts with: {}", key_start);
+        info!("🔑 Private key ends with: {}", key_end);
+
         // Validate device certificate PEM format
         if !certificates
             .device_certificate
@@ -400,17 +469,32 @@ impl MqttCertificateStorage {
                 .device_certificate
                 .ends_with("-----END CERTIFICATE-----")
         {
+            error!("❌ Device certificate PEM format validation failed");
+            error!("❌ Expected to start with: -----BEGIN CERTIFICATE-----");
+            error!("❌ Expected to end with: -----END CERTIFICATE-----");
             return Err(CertificateValidation::InvalidFormat);
         }
 
-        // Validate private key PEM format
-        if !certificates
+        // Validate private key PEM format (accept both RSA and PKCS#8 formats)
+        let has_rsa_format = certificates
+            .private_key
+            .starts_with("-----BEGIN RSA PRIVATE KEY-----")
+            && certificates
+                .private_key
+                .ends_with("-----END RSA PRIVATE KEY-----");
+        let has_pkcs8_format = certificates
             .private_key
             .starts_with("-----BEGIN PRIVATE KEY-----")
-            || !certificates
+            && certificates
                 .private_key
-                .ends_with("-----END PRIVATE KEY-----")
-        {
+                .ends_with("-----END PRIVATE KEY-----");
+
+        if !has_rsa_format && !has_pkcs8_format {
+            error!("❌ Private key PEM format validation failed");
+            error!("❌ Expected RSA format: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----");
+            error!(
+                "❌ Or PKCS#8 format: -----BEGIN PRIVATE KEY----- ... -----END PRIVATE KEY-----"
+            );
             return Err(CertificateValidation::InvalidFormat);
         }
 
@@ -418,14 +502,26 @@ impl MqttCertificateStorage {
         if !certificates.iot_endpoint.contains(".iot.")
             || !certificates.iot_endpoint.contains(".amazonaws.com")
         {
+            error!("❌ IoT endpoint format validation failed");
+            error!("❌ Expected to contain: .iot. and .amazonaws.com");
             return Err(CertificateValidation::InvalidContent);
         }
 
         // Check minimum size requirements
         if certificates.device_certificate.len() < 500 || certificates.private_key.len() < 500 {
+            error!("❌ Certificate size validation failed");
+            error!(
+                "❌ Device cert size: {} (min 500)",
+                certificates.device_certificate.len()
+            );
+            error!(
+                "❌ Private key size: {} (min 500)",
+                certificates.private_key.len()
+            );
             return Err(CertificateValidation::InvalidContent);
         }
 
+        info!("✅ Certificate format validation passed");
         Ok(())
     }
 
