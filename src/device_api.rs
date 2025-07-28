@@ -55,7 +55,7 @@ pub struct DeviceRegistrationData {
     /// Hardware serial number
     #[serde(rename = "serialNumber")]
     pub serial_number: String,
-    /// Device owner user ID
+    /// Device owner user ID (Cognito Sub UUID)
     #[serde(rename = "ownerId")]
     pub owner_id: String,
     /// Registration timestamp

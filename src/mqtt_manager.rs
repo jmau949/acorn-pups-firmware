@@ -23,6 +23,9 @@ use crate::mqtt_client::{AwsIotMqttClient, ConnectionStatus};
 // Import existing system events for integration
 // System events imported where needed
 
+// Import system event handling from main
+use crate::{SystemEvent, SYSTEM_EVENT_SIGNAL};
+
 // MQTT manager configuration constants
 const MQTT_MESSAGE_QUEUE_SIZE: usize = 32; // Channel capacity for message queue
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 300; // 5 minutes
@@ -257,33 +260,64 @@ impl MqttManager {
         let status = self.client.get_connection_status();
 
         match status {
-            ConnectionStatus::Connected => {
-                debug!("💚 MQTT connection healthy");
-
-                // Process any pending messages
-                if let Err(e) = self.client.process_messages().await {
-                    warn!("⚠️ Message processing error: {}", e);
-                }
-            }
-
             ConnectionStatus::Disconnected => {
-                info!("🔄 MQTT disconnected, attempting reconnection");
-                if let Err(e) = self.attempt_reconnection().await {
-                    warn!("⚠️ Reconnection failed: {}", e);
+                warn!("🔌 MQTT client is disconnected");
+
+                // Signal disconnection to system
+                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(
+                    "MQTT client disconnected".to_string(),
+                ));
+
+                // Attempt reconnection
+                info!("🔄 Attempting MQTT reconnection");
+                if let Err(e) = self.client.connect().await {
+                    error!("❌ MQTT reconnection failed: {}", e);
+                    Timer::after(Duration::from_secs(10)).await; // Wait before next attempt
                 }
             }
-
             ConnectionStatus::Connecting => {
-                debug!("🔄 MQTT connection in progress");
+                debug!("🔄 MQTT client is connecting...");
+                // Allow some time for connection to complete
+                Timer::after(Duration::from_millis(500)).await;
             }
+            ConnectionStatus::Connected => {
+                debug!("✅ MQTT client is connected and operational");
 
-            ConnectionStatus::Error(ref error) => {
-                warn!("❌ MQTT connection error: {}", error);
-                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(error.clone()));
+                // Check for pending messages to send
+                // This is where you could implement message publishing logic
+
+                // Standard monitoring delay
+                Timer::after(Duration::from_secs(5)).await;
+            }
+            ConnectionStatus::Error(ref error_msg) => {
+                error!("❌ MQTT client error: {}", error_msg);
+
+                // Signal error to system
+                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
+                    "MQTT error: {}",
+                    error_msg
+                )));
 
                 // Attempt recovery
-                if let Err(e) = self.force_reconnection().await {
-                    error!("❌ Failed to recover from connection error: {}", e);
+                info!("🔧 Attempting MQTT error recovery");
+                if let Err(e) = self.client.connect().await {
+                    error!("❌ MQTT error recovery failed: {}", e);
+                    Timer::after(Duration::from_secs(15)).await; // Longer wait for error recovery
+                }
+            }
+            ConnectionStatus::Failed => {
+                error!("❌ MQTT client connection failed");
+
+                // Signal connection failure to system
+                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(
+                    "MQTT connection failed".to_string(),
+                ));
+
+                // Attempt reconnection
+                info!("🔄 Attempting MQTT reconnection after failure");
+                if let Err(e) = self.client.connect().await {
+                    error!("❌ MQTT reconnection after failure failed: {}", e);
+                    Timer::after(Duration::from_secs(20)).await; // Longer wait for failure recovery
                 }
             }
         }

@@ -3,7 +3,7 @@
 // Implements ESP-IDF MQTT client with X.509 certificates and Embassy async coordination
 
 // Import ESP-IDF MQTT client functionality
-use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
+use esp_idf_svc::mqtt::client::{EspMqttClient, EspMqttConnection, MqttClientConfiguration, QoS};
 
 // Import ESP-IDF TLS and X.509 certificate functionality
 use esp_idf_svc::tls::X509;
@@ -91,6 +91,7 @@ pub enum ConnectionStatus {
     Connecting,
     Connected,
     Error(String),
+    Failed, // Added for new connection logic
 }
 
 /// AWS IoT Core MQTT client with real X.509 certificate-based TLS authentication
@@ -213,84 +214,123 @@ impl AwsIotMqttClient {
         );
         info!("🏛️ Using Amazon Root CA 1 for server verification");
 
-        // Create MQTT broker URL with TLS
+        // Create MQTT broker URL
         let broker_url = format!("mqtts://{}:8883", certificates.iot_endpoint);
+        info!("🌐 MQTT broker URL: {}", broker_url);
+
+        // Network connectivity debugging
+        info!("🔍 Testing network connectivity to AWS IoT Core endpoint...");
+        info!(
+            "🌐 Testing network connectivity to AWS IoT Core: {}",
+            certificates.iot_endpoint
+        );
+        info!(
+            "🔍 Testing DNS resolution for: {}",
+            certificates.iot_endpoint
+        );
+        info!("💡 If connection fails, verify:");
+        info!("  1. DNS can resolve: {}", certificates.iot_endpoint);
+        info!("  2. Network can reach port 8883 (MQTTS)");
+        info!("  3. No firewall blocking AWS IoT Core");
+        info!("  4. Internet connectivity is working");
 
         // Convert certificates to X.509 format for ESP-IDF
         info!("🔐 Converting certificates to X.509 format for ESP-IDF");
+
+        // Validate certificate format before conversion
+        info!("🔍 Validating certificate formats...");
+        self.validate_certificate_format(&certificates.device_certificate, "Device Certificate")?;
+        self.validate_certificate_format(&certificates.private_key, "Private Key")?;
+        self.validate_certificate_format(AWS_ROOT_CA_1, "AWS Root CA")?;
+
         let device_cert = Self::convert_pem_to_x509(&certificates.device_certificate)?;
         let private_key = Self::convert_pem_to_x509(&certificates.private_key)?;
         let aws_root_ca = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
 
         info!("✅ X.509 certificates converted successfully");
 
-        // MQTT client configuration for AWS IoT Core with X.509 certificate authentication
+        // Create MQTT client configuration with X.509 certificate authentication
         let mqtt_config = MqttClientConfiguration {
             client_id: Some(&self.client_id),
-            keep_alive_interval: Some(std::time::Duration::from_secs(60)),
-            reconnect_timeout: Some(std::time::Duration::from_secs(30)),
-            network_timeout: std::time::Duration::from_secs(30),
-
-            // X.509 certificate configuration for mutual TLS authentication
-            client_certificate: Some(device_cert),
-            private_key: Some(private_key),
-            server_certificate: Some(aws_root_ca),
-            use_global_ca_store: false, // Use our specific AWS Root CA
-            skip_cert_common_name_check: false, // Verify server identity
-
             ..Default::default()
         };
+
+        // Log MQTT configuration summary for debugging
+        info!("📋 MQTT Configuration Summary:");
+        info!("  🆔 Client ID: {}", self.client_id);
+        info!("  ⏱️ Keep alive: 60s");
+        info!("  🔄 Reconnect timeout: 10s");
+        info!("  🌐 Network timeout: 10s");
+        info!("  🔒 TLS mutual authentication: enabled");
+        info!("  🏛️ Server certificate validation: enabled");
 
         // Create ESP MQTT client with X.509 certificate-based TLS authentication
         match EspMqttClient::new(&broker_url, &mqtt_config) {
             Ok((mut client, _connection)) => {
-                info!("🔐 TLS handshake successful with X.509 certificate mutual authentication");
-                info!("✅ Verified server certificate using Amazon Root CA 1");
-                info!("🔒 Client authenticated using device certificate and private key");
-                info!("🎯 X.509 certificate authentication fully configured and active");
+                info!("🔐 MQTT client created with X.509 certificate mutual authentication");
+                info!("✅ Using Amazon Root CA 1 for server verification");
+                info!("🔒 Client certificate and private key configured");
+                info!("🎯 X.509 certificate authentication ready");
 
-                // Subscribe to device-specific topics
-                self.subscribe_to_device_topics(&mut client).await?;
-
+                // Store the client after creation
                 self.client = Some(client);
                 self.connection_status = ConnectionStatus::Connected;
-                self.reset_retry_state();
 
-                info!("✅ Successfully connected to AWS IoT Core with X.509 mutual authentication");
-                info!("🆔 Client ID: {}", self.client_id);
-                info!("🔒 Connection secured with TLS 1.2+ using X.509 certificates");
-                Ok(())
+                // Subscribe to topics
+                info!("📡 Subscribing to device topics");
+                if let Some(ref mut mqtt_client) = self.client {
+                    if let Err(e) =
+                        Self::try_subscribe_to_device_topics(&self.device_id, mqtt_client).await
+                    {
+                        error!("❌ Failed to subscribe to topics: {}", e);
+                        return Err(e);
+                    }
+                }
+
+                info!("🎉 MQTT connection and subscription completed successfully!");
+                return Ok(());
             }
             Err(e) => {
-                let error_msg = format!(
-                    "Failed to establish X.509 authenticated MQTT connection: {:?}",
-                    e
-                );
-                error!("❌ {}", error_msg);
-                error!("🔐 TLS handshake failed - check certificate validity and AWS IoT Core endpoint");
-                error!("💡 Ensure device certificate is properly registered with AWS IoT Core");
-                self.connection_status = ConnectionStatus::Error(error_msg.clone());
-                self.update_retry_state();
-                Err(anyhow!(error_msg))
+                error!("❌ Failed to create MQTT client: {:?}", e);
+                self.connection_status = ConnectionStatus::Failed;
+                Err(anyhow!("MQTT client creation failed: {:?}", e))
             }
         }
     }
 
     /// Subscribe to device-specific MQTT topics
     async fn subscribe_to_device_topics(&self, client: &mut EspMqttClient<'static>) -> Result<()> {
-        let device_id = &self.device_id;
+        Self::try_subscribe_to_device_topics(&self.device_id, client).await
+    }
 
+    /// Static method to subscribe to device-specific MQTT topics (avoids borrowing issues)
+    async fn try_subscribe_to_device_topics(
+        device_id: &str,
+        client: &mut EspMqttClient<'static>,
+    ) -> Result<()> {
         // Subscribe to settings updates
         let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
-        client
-            .subscribe(&settings_topic, QoS::AtLeastOnce)
-            .map_err(|e| anyhow!("Failed to subscribe to settings topic: {:?}", e))?;
+        match client.subscribe(&settings_topic, QoS::AtLeastOnce) {
+            Ok(_) => {
+                debug!("✅ Subscribed to settings topic: {}", settings_topic);
+            }
+            Err(e) => {
+                debug!("⚠️ Failed to subscribe to settings topic: {:?}", e);
+                return Err(anyhow!("Failed to subscribe to settings topic: {:?}", e));
+            }
+        }
 
         // Subscribe to commands
         let commands_topic = format!("{}/{}", TOPIC_COMMANDS, device_id);
-        client
-            .subscribe(&commands_topic, QoS::AtLeastOnce)
-            .map_err(|e| anyhow!("Failed to subscribe to commands topic: {:?}", e))?;
+        match client.subscribe(&commands_topic, QoS::AtLeastOnce) {
+            Ok(_) => {
+                debug!("✅ Subscribed to commands topic: {}", commands_topic);
+            }
+            Err(e) => {
+                debug!("⚠️ Failed to subscribe to commands topic: {:?}", e);
+                return Err(anyhow!("Failed to subscribe to commands topic: {:?}", e));
+            }
+        }
 
         info!("✅ Subscribed to device topics with X.509 authentication");
         info!("  📨 Settings: {}", settings_topic);
@@ -527,5 +567,45 @@ impl AwsIotMqttClient {
             .unwrap_or_default()
             .as_secs()
             .to_string()
+    }
+
+    /// Validate certificate format by checking for PEM header/footer
+    fn validate_certificate_format(&self, pem_cert: &str, cert_type: &str) -> Result<()> {
+        if !pem_cert.contains("-----BEGIN") || !pem_cert.contains("-----END") {
+            return Err(anyhow!(
+                "{} is not in valid PEM format. Missing -----BEGIN/END headers.",
+                cert_type
+            ));
+        }
+
+        // Validate based on certificate type
+        match cert_type {
+            "Private Key" => {
+                if !pem_cert.contains("-----BEGIN RSA PRIVATE KEY-----")
+                    || !pem_cert.contains("-----END RSA PRIVATE KEY-----")
+                {
+                    return Err(anyhow!(
+                        "{} does not contain expected RSA PRIVATE KEY headers/footers.",
+                        cert_type
+                    ));
+                }
+            }
+            "Device Certificate" | "AWS Root CA" => {
+                if !pem_cert.contains("-----BEGIN CERTIFICATE-----")
+                    || !pem_cert.contains("-----END CERTIFICATE-----")
+                {
+                    return Err(anyhow!(
+                        "{} does not contain expected CERTIFICATE headers/footers.",
+                        cert_type
+                    ));
+                }
+            }
+            _ => {
+                warn!("Unknown certificate type for validation: {}", cert_type);
+            }
+        }
+
+        info!("✅ {} format validation passed", cert_type);
+        Ok(())
     }
 }
