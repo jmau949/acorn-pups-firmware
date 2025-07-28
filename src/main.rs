@@ -714,7 +714,7 @@ async fn register_device_with_backend(
 
     // Create device API client
     // Use development endpoint for testing, production for release builds
-    let base_url = "https://uoaq40ff4b.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
+    let base_url = "https://1utz0mh8f7.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
 
     let firmware_version = "1.0.0".to_string();
     let device_id = generate_device_id();
