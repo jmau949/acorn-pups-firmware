@@ -809,7 +809,7 @@ async fn register_device_with_backend(
             );
 
             // Initialize certificate storage and store credentials
-            match MqttCertificateStorage::new() {
+            match MqttCertificateStorage::new_with_partition(nvs_partition) {
                 Ok(mut cert_storage) => {
                     match cert_storage
                         .store_certificates(&response.data.certificates, &response.data.device_id)
@@ -903,6 +903,7 @@ async fn wifi_only_mode_task(
             let wifi_config = Configuration::Client(ClientConfiguration {
                 ssid: credentials.ssid.as_str().try_into().unwrap_or_default(),
                 password: credentials.password.as_str().try_into().unwrap_or_default(),
+                auth_method: embedded_svc::wifi::AuthMethod::WPA2Personal,
                 ..Default::default()
             });
 
@@ -911,8 +912,8 @@ async fn wifi_only_mode_task(
                 return;
             }
 
-            // Connect to WiFi
-            match with_timeout(Duration::from_secs(30), wifi.connect()).await {
+            // Connect to WiFi with longer timeout for better reliability
+            match with_timeout(Duration::from_secs(60), wifi.connect()).await {
                 Ok(Ok(_)) => {
                     info!("✅ WiFi connected successfully!");
 
