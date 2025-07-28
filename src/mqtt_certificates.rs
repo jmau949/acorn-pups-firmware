@@ -426,74 +426,70 @@ impl MqttCertificateStorage {
         );
         info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
 
-        // Debug: Show first and last 50 characters of each certificate
-        let cert_start = certificates
-            .device_certificate
-            .chars()
-            .take(50)
-            .collect::<String>();
-        let cert_end = if certificates.device_certificate.len() > 50 {
-            certificates
-                .device_certificate
-                .chars()
-                .skip(certificates.device_certificate.len() - 50)
-                .collect::<String>()
-        } else {
-            certificates.device_certificate.clone()
-        };
-        let key_start = certificates
-            .private_key
-            .chars()
-            .take(50)
-            .collect::<String>();
-        let key_end = if certificates.private_key.len() > 50 {
-            certificates
-                .private_key
-                .chars()
-                .skip(certificates.private_key.len() - 50)
-                .collect::<String>()
-        } else {
-            certificates.private_key.clone()
-        };
+        // Full certificate logging for debugging (no truncation)
+        info!("📜 FULL DEVICE CERTIFICATE:");
+        info!("{}", certificates.device_certificate);
+        info!("🔑 FULL PRIVATE KEY:");
+        info!("{}", certificates.private_key);
 
-        info!("📜 Device cert starts with: {}", cert_start);
-        info!("📜 Device cert ends with: {}", cert_end);
-        info!("🔑 Private key starts with: {}", key_start);
-        info!("🔑 Private key ends with: {}", key_end);
+        // Trim whitespace from certificates for validation
+        let device_cert = certificates.device_certificate.trim();
+        let private_key = certificates.private_key.trim();
 
-        // Validate device certificate PEM format
-        if !certificates
-            .device_certificate
-            .starts_with("-----BEGIN CERTIFICATE-----")
-            || !certificates
-                .device_certificate
-                .ends_with("-----END CERTIFICATE-----")
+        info!(
+            "📜 Device cert after trim - starts with: {}",
+            &device_cert[..50.min(device_cert.len())]
+        );
+        info!(
+            "📜 Device cert after trim - ends with: {}",
+            &device_cert[device_cert.len().saturating_sub(50)..]
+        );
+        info!(
+            "🔑 Private key after trim - starts with: {}",
+            &private_key[..50.min(private_key.len())]
+        );
+        info!(
+            "🔑 Private key after trim - ends with: {}",
+            &private_key[private_key.len().saturating_sub(50)..]
+        );
+
+        // Validate device certificate PEM format (with trimmed whitespace)
+        if !device_cert.starts_with("-----BEGIN CERTIFICATE-----")
+            || !device_cert.ends_with("-----END CERTIFICATE-----")
         {
             error!("❌ Device certificate PEM format validation failed");
             error!("❌ Expected to start with: -----BEGIN CERTIFICATE-----");
             error!("❌ Expected to end with: -----END CERTIFICATE-----");
+            error!(
+                "❌ Actual start: {}",
+                &device_cert[..50.min(device_cert.len())]
+            );
+            error!(
+                "❌ Actual end: {}",
+                &device_cert[device_cert.len().saturating_sub(50)..]
+            );
             return Err(CertificateValidation::InvalidFormat);
         }
 
-        // Validate private key PEM format (accept both RSA and PKCS#8 formats)
-        let has_rsa_format = certificates
-            .private_key
-            .starts_with("-----BEGIN RSA PRIVATE KEY-----")
-            && certificates
-                .private_key
-                .ends_with("-----END RSA PRIVATE KEY-----");
-        let has_pkcs8_format = certificates
-            .private_key
-            .starts_with("-----BEGIN PRIVATE KEY-----")
-            && certificates
-                .private_key
-                .ends_with("-----END PRIVATE KEY-----");
+        // Validate private key PEM format (accept both RSA and PKCS#8 formats, with trimmed whitespace)
+        let has_rsa_format = private_key.starts_with("-----BEGIN RSA PRIVATE KEY-----")
+            && private_key.ends_with("-----END RSA PRIVATE KEY-----");
+        let has_pkcs8_format = private_key.starts_with("-----BEGIN PRIVATE KEY-----")
+            && private_key.ends_with("-----END PRIVATE KEY-----");
 
         if !has_rsa_format && !has_pkcs8_format {
             error!("❌ Private key PEM format validation failed");
             error!("❌ Expected RSA format: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----");
             error!(
                 "❌ Or PKCS#8 format: -----BEGIN PRIVATE KEY----- ... -----END PRIVATE KEY-----"
+            );
+            error!(
+                "❌ Actual start: {}",
+                &private_key[..50.min(private_key.len())]
+            );
+            error!(
+                "❌ Actual end: {}",
+                &private_key[private_key.len().saturating_sub(50)..]
             );
             return Err(CertificateValidation::InvalidFormat);
         }
@@ -504,20 +500,15 @@ impl MqttCertificateStorage {
         {
             error!("❌ IoT endpoint format validation failed");
             error!("❌ Expected to contain: .iot. and .amazonaws.com");
+            error!("❌ Actual endpoint: {}", certificates.iot_endpoint);
             return Err(CertificateValidation::InvalidContent);
         }
 
-        // Check minimum size requirements
-        if certificates.device_certificate.len() < 500 || certificates.private_key.len() < 500 {
+        // Check minimum size requirements (use trimmed versions)
+        if device_cert.len() < 500 || private_key.len() < 500 {
             error!("❌ Certificate size validation failed");
-            error!(
-                "❌ Device cert size: {} (min 500)",
-                certificates.device_certificate.len()
-            );
-            error!(
-                "❌ Private key size: {} (min 500)",
-                certificates.private_key.len()
-            );
+            error!("❌ Device cert size: {} (min 500)", device_cert.len());
+            error!("❌ Private key size: {} (min 500)", private_key.len());
             return Err(CertificateValidation::InvalidContent);
         }
 

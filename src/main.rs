@@ -519,19 +519,15 @@ async fn main(spawner: Spawner) {
             timer_service,
             wifi_storage,
             nvs.clone(),
+            device_id.clone(),
+            spawner.clone(),
         )) {
             error!("Failed to spawn WiFi-only mode task");
             return;
         }
 
-        // Spawn the MQTT manager task - only for WiFi-only mode
-        if let Err(_) = spawner.spawn(mqtt_manager_task(device_id.clone(), nvs.clone())) {
-            error!("Failed to spawn MQTT manager task");
-            return;
-        }
-
-        info!("🔌 MQTT manager task spawned - will activate after device registration");
         info!("📶 Device operating in WiFi-only mode - BLE disabled");
+        info!("🔌 MQTT manager will be spawned after device registration")
     } else {
         info!("📻 No WiFi credentials found - Starting in BLE provisioning mode");
 
@@ -859,6 +855,8 @@ async fn wifi_only_mode_task(
     timer_service: EspTaskTimerService,
     mut wifi_storage: WiFiStorage,
     nvs_partition: EspDefaultNvsPartition,
+    device_id: String,
+    spawner: Spawner,
 ) {
     info!("📶 WiFi-Only Mode Task started - connecting with stored credentials");
 
@@ -935,11 +933,13 @@ async fn wifi_only_mode_task(
                                 state.provisioning_complete = true;
                             }
 
-                            // Test connectivity
+                            // Test connectivity and register device
                             if let Err(e) = test_connectivity_and_register(
                                 ip_address,
                                 &credentials,
                                 nvs_partition.clone(),
+                                device_id.clone(),
+                                spawner.clone(),
                             )
                             .await
                             {
@@ -1146,6 +1146,8 @@ async fn test_connectivity_and_register(
     ip_address: Ipv4Addr,
     credentials: &crate::ble_server::WiFiCredentials,
     nvs_partition: EspDefaultNvsPartition,
+    device_id: String,
+    spawner: Spawner,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("🌐 Testing internet connectivity and registering device...");
     info!("📍 Local IP: {}", ip_address);
@@ -1160,8 +1162,7 @@ async fn test_connectivity_and_register(
         }
     }
 
-    // Step 2: Generate device information for registration
-    let device_id = generate_device_id();
+    // Step 2: Use provided device ID
     info!("🆔 Device ID: {}", device_id);
 
     // Step 3: Register device with Acorn Pups backend using provided credentials
@@ -1174,7 +1175,7 @@ async fn test_connectivity_and_register(
         credentials.auth_token.clone(),
         credentials.device_name.clone(),
         credentials.user_timezone.clone(),
-        nvs_partition,
+        nvs_partition.clone(),
     )
     .await
     {
@@ -1183,16 +1184,56 @@ async fn test_connectivity_and_register(
             info!("🎯 Device is now registered and ready for Acorn Pups operations");
             info!("🔑 Registered device ID: {}", registered_device_id);
 
-            // IMPORTANT: Use the registered device_id for consistency with certificates
+            // Check if certificates were stored successfully before spawning MQTT
+            let cert_storage_result = {
+                match crate::mqtt_certificates::MqttCertificateStorage::new_with_partition(
+                    nvs_partition.clone(),
+                ) {
+                    Ok(mut storage) => storage.certificates_exist(),
+                    Err(_) => false,
+                }
+            };
 
-            info!("🔌 AWS IoT Core certificates should now be stored, spawning MQTT task...");
-            // Note: MQTT task will wait for certificates to be available
-            // The mqtt_manager_task will check for certificate availability in a loop
+            if cert_storage_result {
+                info!("🔌 AWS IoT Core certificates confirmed - spawning MQTT manager task");
+
+                // Spawn the MQTT manager task now that registration and certificates are complete
+                if let Err(_) = spawner.spawn(mqtt_manager_task(
+                    registered_device_id.clone(),
+                    nvs_partition.clone(),
+                )) {
+                    error!("❌ Failed to spawn MQTT manager task - triggering factory reset");
+
+                    // Factory reset on MQTT spawn failure
+                    perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone())
+                        .await;
+                    return Err("MQTT manager spawn failed - factory reset triggered".into());
+                }
+
+                info!("✅ MQTT manager task spawned successfully");
+
+                // Give MQTT manager time to initialize and test connection
+                Timer::after(Duration::from_secs(10)).await;
+
+                // Check if MQTT connection was successful by checking system state
+                // If MQTT fails to connect within timeout, trigger factory reset
+                // This will be implemented as a proper MQTT health check
+                info!("🔌 MQTT manager should now be active and connecting to AWS IoT Core");
+            } else {
+                error!("❌ AWS IoT Core certificates not found after registration - triggering factory reset");
+
+                // Factory reset on certificate storage failure
+                perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
+                return Err("Certificate storage failed - factory reset triggered".into());
+            }
         }
         Err(e) => {
             warn!("⚠️ Device registration failed: {:?}", e);
             info!("📲 Device will operate in standalone mode until next connection attempt");
             info!("🔌 MQTT functionality will not be available without device registration");
+
+            // Don't factory reset on registration failure - this could be temporary network issues
+            // Just continue without MQTT functionality
         }
     }
 
@@ -1493,4 +1534,42 @@ async fn reset_manager_task(
             }
         }
     }
+}
+
+// Factory reset function on MQTT initialization failure
+async fn perform_mqtt_failure_factory_reset(
+    device_id: String,
+    nvs_partition: EspDefaultNvsPartition,
+) {
+    info!(
+        "🔄 MQTT initialization failed - triggering factory reset for device: {}",
+        device_id
+    );
+    info!("💾 All data will be saved to NVS flash storage before restart");
+
+    // Initialize reset handler
+    let mut reset_handler = ResetHandler::new(device_id.clone());
+    if let Err(e) = reset_handler.initialize_nvs_partition(nvs_partition.clone()) {
+        error!(
+            "❌ Failed to initialize reset handler NVS partition for factory reset: {:?}",
+            e
+        );
+        return;
+    }
+
+    // Execute factory reset
+    if let Err(e) = reset_handler
+        .execute_factory_reset("MQTT initialization failed".to_string())
+        .await
+    {
+        error!(
+            "❌ Failed to execute factory reset after MQTT failure: {:?}",
+            e
+        );
+    } else {
+        info!("✅ Factory reset executed successfully after MQTT failure");
+    }
+
+    // Restart device
+    restart_device("MQTT initialization failed - factory reset triggered");
 }
