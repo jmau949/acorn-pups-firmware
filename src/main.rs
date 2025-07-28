@@ -4,7 +4,7 @@ use embassy_executor::Spawner;
 
 // FACTORY RESET FLAG - Set to true to trigger immediate factory reset on startup
 // This bypasses all normal initialization and performs a factory reset before WiFi/BLE
-const FORCE_FACTORY_RESET_ON_STARTUP: bool = true;
+const FORCE_FACTORY_RESET_ON_STARTUP: bool = false;
 
 // Import Embassy time utilities for delays and timers
 // Duration represents a time span, Timer provides async delays (non-blocking waits)
@@ -518,13 +518,14 @@ async fn main(spawner: Spawner) {
             sys_loop,
             timer_service,
             wifi_storage,
+            nvs.clone(),
         )) {
             error!("Failed to spawn WiFi-only mode task");
             return;
         }
 
         // Spawn the MQTT manager task - only for WiFi-only mode
-        if let Err(_) = spawner.spawn(mqtt_manager_task(device_id.clone())) {
+        if let Err(_) = spawner.spawn(mqtt_manager_task(device_id.clone(), nvs.clone())) {
             error!("Failed to spawn MQTT manager task");
             return;
         }
@@ -704,6 +705,7 @@ async fn register_device_with_backend(
     auth_token: String,
     device_name: String,
     user_timezone: String,
+    nvs_partition: EspDefaultNvsPartition,
 ) -> Result<String, anyhow::Error> {
     info!("🔧 Starting device registration process");
 
@@ -736,12 +738,7 @@ async fn register_device_with_backend(
     info!("  MAC Address: {}", mac_address);
 
     // Check for reset state first, then determine registration parameters
-    let nvs_partition = EspDefaultNvsPartition::take().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to take NVS partition for reset state check: {:?}",
-            e
-        )
-    })?;
+    // Use the provided NVS partition instead of taking a new one
 
     let mut reset_handler = ResetHandler::new(device_id.clone());
     reset_handler.initialize_nvs_partition(nvs_partition.clone())?;
@@ -861,6 +858,7 @@ async fn wifi_only_mode_task(
     sys_loop: EspSystemEventLoop,
     timer_service: EspTaskTimerService,
     mut wifi_storage: WiFiStorage,
+    nvs_partition: EspDefaultNvsPartition,
 ) {
     info!("📶 WiFi-Only Mode Task started - connecting with stored credentials");
 
@@ -937,8 +935,12 @@ async fn wifi_only_mode_task(
                             }
 
                             // Test connectivity
-                            if let Err(e) =
-                                test_connectivity_and_register(ip_address, &credentials).await
+                            if let Err(e) = test_connectivity_and_register(
+                                ip_address,
+                                &credentials,
+                                nvs_partition.clone(),
+                            )
+                            .await
                             {
                                 warn!("⚠️ Connectivity test failed: {:?}", e);
                             }
@@ -1142,6 +1144,7 @@ async fn restart_device(reason: &str) {
 async fn test_connectivity_and_register(
     ip_address: Ipv4Addr,
     credentials: &crate::ble_server::WiFiCredentials,
+    nvs_partition: EspDefaultNvsPartition,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("🌐 Testing internet connectivity and registering device...");
     info!("📍 Local IP: {}", ip_address);
@@ -1170,6 +1173,7 @@ async fn test_connectivity_and_register(
         credentials.auth_token.clone(),
         credentials.device_name.clone(),
         credentials.user_timezone.clone(),
+        nvs_partition,
     )
     .await
     {
@@ -1330,15 +1334,15 @@ async fn led_task(
 
 // MQTT MANAGER TASK - Handles AWS IoT Core communication with certificate-based authentication
 #[embassy_executor::task]
-async fn mqtt_manager_task(device_id: String) {
+async fn mqtt_manager_task(device_id: String, nvs_partition: EspDefaultNvsPartition) {
     info!("🔌 MQTT Manager Task started for device: {}", device_id);
 
     // Wait for certificates to be available before initializing MQTT
     info!("⏳ Waiting for AWS IoT Core certificates to be stored...");
 
-    // Initialize certificate storage
+    // Initialize certificate storage using provided NVS partition
     let cert_storage = loop {
-        match MqttCertificateStorage::new() {
+        match MqttCertificateStorage::new_with_partition(nvs_partition.clone()) {
             Ok(mut storage) => {
                 // Check if certificates are available
                 if storage.certificates_exist() {
