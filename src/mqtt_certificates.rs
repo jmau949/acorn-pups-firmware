@@ -341,9 +341,10 @@ impl MqttCertificateStorage {
             iot_endpoint: iot_endpoint.to_string(),
         };
 
+        info!("✅ Certificates loaded with optimized buffer sizes");
         info!(
-            "✅ Certificates loaded with optimized buffer sizes - saved {} bytes",
-            (2048 * 2 + 256) - (cert_size + key_size + endpoint_size)
+            "📏 Buffer usage: cert={} bytes, key={} bytes, endpoint={} bytes",
+            cert_size, key_size, endpoint_size
         );
 
         // Validate loaded certificates
@@ -365,16 +366,95 @@ impl MqttCertificateStorage {
 
     /// Check if certificates exist in storage
     pub fn certificates_exist(&mut self) -> bool {
-        match self.nvs.get_u8(CERT_VALIDATION_KEY) {
-            Ok(Some(1)) => {
-                // Check if all required components exist
-                let cert_exists = self.nvs.get_str(DEVICE_CERT_KEY, &mut [0u8; 1]).is_ok();
-                let key_exists = self.nvs.get_str(PRIVATE_KEY_KEY, &mut [0u8; 1]).is_ok();
-                let endpoint_exists = self.nvs.get_str(IOT_ENDPOINT_KEY, &mut [0u8; 1]).is_ok();
+        info!("🔍 Checking if certificates exist in NVS storage");
 
-                cert_exists && key_exists && endpoint_exists
+        // Check validation flag first
+        let validation_flag = match self.nvs.get_u8(CERT_VALIDATION_KEY) {
+            Ok(Some(value)) => {
+                info!("📋 Validation flag value: {}", value);
+                value
             }
-            _ => false,
+            Ok(None) => {
+                warn!("⚠️ Validation flag not found in storage");
+                0
+            }
+            Err(e) => {
+                error!("❌ Error reading validation flag: {:?}", e);
+                0
+            }
+        };
+
+        if validation_flag == 1 {
+            info!("✅ Validation flag indicates certificates should exist");
+
+            // Check if all required components exist by using proper buffer sizes
+            // Use larger buffers to avoid ESP_ERR_NVS_INVALID_LENGTH
+            let cert_exists = {
+                let mut buffer = vec![0u8; 2048]; // Large enough buffer for certificates
+                match self.nvs.get_str(DEVICE_CERT_KEY, &mut buffer) {
+                    Ok(Some(_)) => {
+                        info!("✅ Device certificate key exists");
+                        true
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ Device certificate key not found");
+                        false
+                    }
+                    Err(e) => {
+                        error!("❌ Error checking device certificate existence: {:?}", e);
+                        false
+                    }
+                }
+            };
+
+            let key_exists = {
+                let mut buffer = vec![0u8; 2048]; // Large enough buffer for private keys
+                match self.nvs.get_str(PRIVATE_KEY_KEY, &mut buffer) {
+                    Ok(Some(_)) => {
+                        info!("✅ Private key exists");
+                        true
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ Private key not found");
+                        false
+                    }
+                    Err(e) => {
+                        error!("❌ Error checking private key existence: {:?}", e);
+                        false
+                    }
+                }
+            };
+
+            let endpoint_exists = {
+                let mut buffer = [0u8; 256]; // Smaller buffer for endpoint URLs
+                match self.nvs.get_str(IOT_ENDPOINT_KEY, &mut buffer) {
+                    Ok(Some(_)) => {
+                        info!("✅ IoT endpoint exists");
+                        true
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ IoT endpoint not found");
+                        false
+                    }
+                    Err(e) => {
+                        error!("❌ Error checking IoT endpoint existence: {:?}", e);
+                        false
+                    }
+                }
+            };
+
+            let all_exist = cert_exists && key_exists && endpoint_exists;
+            info!(
+                "📊 Certificate existence summary: cert={}, key={}, endpoint={}, all={}",
+                cert_exists, key_exists, endpoint_exists, all_exist
+            );
+            all_exist
+        } else {
+            warn!(
+                "⚠️ Validation flag is {} (expected 1), certificates marked as invalid or missing",
+                validation_flag
+            );
+            false
         }
     }
 

@@ -623,7 +623,33 @@ async fn main(spawner: Spawner) {
 
             SystemEvent::SystemError(error) => {
                 error!("💥 System error: {}", error);
-                // Handle system errors gracefully
+
+                // Check if this is an MQTT-related error that requires factory reset
+                if error.contains("MQTT connection failed") {
+                    error!("🔄 MQTT connection failure detected - triggering factory reset");
+                    error!("📱 Device will reset to BLE provisioning mode");
+
+                    // Get device ID and NVS partition for factory reset
+                    let device_id = generate_device_id();
+
+                    // Take a new NVS partition for the reset
+                    match EspDefaultNvsPartition::take() {
+                        Ok(nvs_partition) => {
+                            // Perform factory reset directly
+                            perform_mqtt_failure_factory_reset(device_id, nvs_partition).await;
+
+                            // Restart device after reset
+                            restart_device("MQTT connection failed - factory reset completed")
+                                .await;
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to take NVS partition for reset: {:?}", e);
+                            restart_device("MQTT failure - forced restart").await;
+                        }
+                    }
+                } else {
+                    warn!("⚠️ Non-critical system error - continuing operation");
+                }
             }
 
             SystemEvent::TaskTerminating(task_name) => {
@@ -841,8 +867,17 @@ async fn register_device_with_backend(
             Ok(response.data.device_id)
         }
         Err(e) => {
-            error!("❌ Device registration failed: {}", e);
-            Err(e)
+            error!("❌ Device registration failed: {:?}", e);
+            error!(
+                "💥 Registration failures indicate device state issues - triggering factory reset"
+            );
+
+            // Factory reset on registration failure - device may be in inconsistent state
+            // This handles cases like 409 "already registered" or other registration errors
+            perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
+            return Err(anyhow::anyhow!(
+                "Device registration failed - factory reset triggered"
+            ));
         }
     }
 }
@@ -1185,12 +1220,31 @@ async fn test_connectivity_and_register(
             info!("🔑 Registered device ID: {}", registered_device_id);
 
             // Check if certificates were stored successfully before spawning MQTT
+            info!("🔍 Verifying AWS IoT Core certificates were stored successfully");
+
             let cert_storage_result = {
                 match crate::mqtt_certificates::MqttCertificateStorage::new_with_partition(
                     nvs_partition.clone(),
                 ) {
-                    Ok(mut storage) => storage.certificates_exist(),
-                    Err(_) => false,
+                    Ok(mut storage) => {
+                        let exists = storage.certificates_exist();
+                        if exists {
+                            info!("✅ Certificate existence check passed");
+                        } else {
+                            error!("❌ Certificate existence check failed");
+
+                            // Debug: Let's see what's in the NVS
+                            info!("🔍 Debugging certificate storage issue...");
+                        }
+                        exists
+                    }
+                    Err(e) => {
+                        error!(
+                            "❌ Failed to create certificate storage for verification: {:?}",
+                            e
+                        );
+                        false
+                    }
                 }
             };
 
@@ -1221,6 +1275,8 @@ async fn test_connectivity_and_register(
                 info!("🔌 MQTT manager should now be active and connecting to AWS IoT Core");
             } else {
                 error!("❌ AWS IoT Core certificates not found after registration - triggering factory reset");
+                error!("❌ Certificates were just stored successfully but verification failed");
+                error!("❌ This indicates a potential NVS or storage consistency issue");
 
                 // Factory reset on certificate storage failure
                 perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
@@ -1228,12 +1284,15 @@ async fn test_connectivity_and_register(
             }
         }
         Err(e) => {
-            warn!("⚠️ Device registration failed: {:?}", e);
-            info!("📲 Device will operate in standalone mode until next connection attempt");
-            info!("🔌 MQTT functionality will not be available without device registration");
+            error!("❌ Device registration failed: {:?}", e);
+            error!(
+                "💥 Registration failures indicate device state issues - triggering factory reset"
+            );
+            error!("🔄 This handles 409 'already registered' and other registration errors");
 
-            // Don't factory reset on registration failure - this could be temporary network issues
-            // Just continue without MQTT functionality
+            // Factory reset on registration failure - device may be in inconsistent state
+            perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
+            return Err("Device registration failed - factory reset triggered".into());
         }
     }
 

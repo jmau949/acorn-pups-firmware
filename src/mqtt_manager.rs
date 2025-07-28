@@ -147,9 +147,27 @@ impl MqttManager {
 
         info!("🚀 Starting MQTT manager main loop");
 
-        // Attempt initial connection
-        if let Err(e) = self.attempt_connection().await {
-            warn!("⚠️ Initial MQTT connection failed: {}", e);
+        // Attempt initial connection with detailed error handling
+        match self.attempt_connection().await {
+            Ok(_) => {
+                info!("✅ Initial MQTT connection successful - entering main loop");
+            }
+            Err(e) => {
+                error!("❌ Initial MQTT connection failed: {}", e);
+                error!("💥 MQTT connection is critical - triggering factory reset");
+                error!("🔄 Device will reset to BLE provisioning mode");
+
+                // Signal MQTT failure to trigger factory reset
+                crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(format!(
+                    "MQTT connection failed: {}",
+                    e
+                )));
+
+                // Give time for the signal to be processed
+                Timer::after(Duration::from_secs(2)).await;
+
+                return Err(anyhow!("MQTT connection failed - factory reset triggered"));
+            }
         }
 
         loop {
