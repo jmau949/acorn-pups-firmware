@@ -138,9 +138,27 @@ impl MqttManager {
 
         info!("🚀 Starting MQTT manager main loop");
 
-        // Attempt initial connection
-        if let Err(e) = self.attempt_connection().await {
-            warn!("⚠️ Initial MQTT connection failed: {}", e);
+        // Attempt initial connection with detailed error handling
+        match self.attempt_connection().await {
+            Ok(_) => {
+                info!("✅ Initial MQTT connection successful - entering main loop");
+            }
+            Err(e) => {
+                error!("❌ Initial MQTT connection failed: {}", e);
+                error!("💥 MQTT connection is critical - triggering factory reset");
+                error!("🔄 Device will reset to BLE provisioning mode");
+
+                // Signal MQTT failure to trigger factory reset
+                crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(format!(
+                    "MQTT connection failed: {}",
+                    e
+                )));
+
+                // Give time for the signal to be processed
+                Timer::after(Duration::from_secs(2)).await;
+
+                return Err(anyhow!("MQTT connection failed - factory reset triggered"));
+            }
         }
 
         loop {
@@ -335,6 +353,22 @@ impl MqttManager {
                 info!("✅ MQTT connected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
 
+                // Attempt topic subscriptions with retry logic
+                info!("📨 Starting topic subscriptions after successful connection");
+                match self.client.subscribe_to_device_topics().await {
+                    Ok(_) => {
+                        info!("✅ All MQTT topic subscriptions completed successfully");
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to subscribe to MQTT topics: {}", e);
+                        // This is a critical failure - trigger factory reset
+                        crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(
+                            format!("MQTT subscription failed: {}", e),
+                        ));
+                        return Err(anyhow!("MQTT subscription failed: {}", e));
+                    }
+                }
+
                 // Send initial device status
                 let _ = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::DeviceStatus {
                     status: "online".to_string(),
@@ -389,8 +423,12 @@ impl MqttManager {
             MqttMessage::ButtonPress { .. } => {
                 format!("acorn-pups/button-press/{}", self.device_id)
             }
-            MqttMessage::DeviceStatus { .. } => format!("acorn-pups/status/{}", self.device_id),
-            MqttMessage::VolumeChange { .. } => format!("acorn-pups/status/{}", self.device_id),
+            MqttMessage::DeviceStatus { .. } => {
+                format!("acorn-pups/status-response/{}", self.device_id)
+            }
+            MqttMessage::VolumeChange { .. } => {
+                format!("acorn-pups/status-response/{}", self.device_id)
+            }
             MqttMessage::Heartbeat => format!("acorn-pups/heartbeat/{}", self.device_id),
             _ => "system".to_string(),
         }

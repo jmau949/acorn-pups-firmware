@@ -94,6 +94,29 @@ impl MqttCertificateStorage {
             device_id
         );
 
+        // Debug: Log certificate details before validation
+        info!("📋 Certificate details from backend:");
+        info!(
+            "  📜 Device certificate: {} bytes",
+            certificates.device_certificate.len()
+        );
+        info!("  🔑 Private key: {} bytes", certificates.private_key.len());
+        info!("  🌐 IoT endpoint: {}", certificates.iot_endpoint);
+
+        // Show first 100 characters of each certificate for debugging
+        let cert_preview = certificates
+            .device_certificate
+            .chars()
+            .take(100)
+            .collect::<String>();
+        let key_preview = certificates
+            .private_key
+            .chars()
+            .take(100)
+            .collect::<String>();
+        info!("  📜 Cert preview: {}", cert_preview);
+        info!("  🔑 Key preview: {}", key_preview);
+
         // Validate certificate format before storage
         if let Err(validation_result) = self.validate_certificate_format(certificates) {
             error!("❌ Certificate validation failed: {:?}", validation_result);
@@ -308,9 +331,10 @@ impl MqttCertificateStorage {
             iot_endpoint: iot_endpoint.to_string(),
         };
 
+        info!("✅ Certificates loaded with optimized buffer sizes");
         info!(
-            "✅ Certificates loaded with optimized buffer sizes - saved {} bytes",
-            (2048 * 2 + 256) - (cert_size + key_size + endpoint_size)
+            "📏 Buffer usage: cert={} bytes, key={} bytes, endpoint={} bytes",
+            cert_size, key_size, endpoint_size
         );
 
         // Validate loaded certificates
@@ -332,16 +356,95 @@ impl MqttCertificateStorage {
 
     /// Check if certificates exist in storage
     pub fn certificates_exist(&mut self) -> bool {
-        match self.nvs.get_u8(CERT_VALIDATION_KEY) {
-            Ok(Some(1)) => {
-                // Check if all required components exist
-                let cert_exists = self.nvs.get_str(DEVICE_CERT_KEY, &mut [0u8; 1]).is_ok();
-                let key_exists = self.nvs.get_str(PRIVATE_KEY_KEY, &mut [0u8; 1]).is_ok();
-                let endpoint_exists = self.nvs.get_str(IOT_ENDPOINT_KEY, &mut [0u8; 1]).is_ok();
+        info!("🔍 Checking if certificates exist in NVS storage");
 
-                cert_exists && key_exists && endpoint_exists
+        // Check validation flag first
+        let validation_flag = match self.nvs.get_u8(CERT_VALIDATION_KEY) {
+            Ok(Some(value)) => {
+                info!("📋 Validation flag value: {}", value);
+                value
             }
-            _ => false,
+            Ok(None) => {
+                warn!("⚠️ Validation flag not found in storage");
+                0
+            }
+            Err(e) => {
+                error!("❌ Error reading validation flag: {:?}", e);
+                0
+            }
+        };
+
+        if validation_flag == 1 {
+            info!("✅ Validation flag indicates certificates should exist");
+
+            // Check if all required components exist by using proper buffer sizes
+            // Use larger buffers to avoid ESP_ERR_NVS_INVALID_LENGTH
+            let cert_exists = {
+                let mut buffer = vec![0u8; 2048]; // Large enough buffer for certificates
+                match self.nvs.get_str(DEVICE_CERT_KEY, &mut buffer) {
+                    Ok(Some(_)) => {
+                        info!("✅ Device certificate key exists");
+                        true
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ Device certificate key not found");
+                        false
+                    }
+                    Err(e) => {
+                        error!("❌ Error checking device certificate existence: {:?}", e);
+                        false
+                    }
+                }
+            };
+
+            let key_exists = {
+                let mut buffer = vec![0u8; 2048]; // Large enough buffer for private keys
+                match self.nvs.get_str(PRIVATE_KEY_KEY, &mut buffer) {
+                    Ok(Some(_)) => {
+                        info!("✅ Private key exists");
+                        true
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ Private key not found");
+                        false
+                    }
+                    Err(e) => {
+                        error!("❌ Error checking private key existence: {:?}", e);
+                        false
+                    }
+                }
+            };
+
+            let endpoint_exists = {
+                let mut buffer = [0u8; 256]; // Smaller buffer for endpoint URLs
+                match self.nvs.get_str(IOT_ENDPOINT_KEY, &mut buffer) {
+                    Ok(Some(_)) => {
+                        info!("✅ IoT endpoint exists");
+                        true
+                    }
+                    Ok(None) => {
+                        warn!("⚠️ IoT endpoint not found");
+                        false
+                    }
+                    Err(e) => {
+                        error!("❌ Error checking IoT endpoint existence: {:?}", e);
+                        false
+                    }
+                }
+            };
+
+            let all_exist = cert_exists && key_exists && endpoint_exists;
+            info!(
+                "📊 Certificate existence summary: cert={}, key={}, endpoint={}, all={}",
+                cert_exists, key_exists, endpoint_exists, all_exist
+            );
+            all_exist
+        } else {
+            warn!(
+                "⚠️ Validation flag is {} (expected 1), certificates marked as invalid or missing",
+                validation_flag
+            );
+            false
         }
     }
 
@@ -382,25 +485,82 @@ impl MqttCertificateStorage {
         &self,
         certificates: &DeviceCertificates,
     ) -> Result<(), CertificateValidation> {
-        // Validate device certificate PEM format
-        if !certificates
-            .device_certificate
-            .starts_with("-----BEGIN CERTIFICATE-----")
-            || !certificates
-                .device_certificate
-                .ends_with("-----END CERTIFICATE-----")
+        info!("🔍 Validating certificate format...");
+        info!(
+            "📜 Device certificate length: {} bytes",
+            certificates.device_certificate.len()
+        );
+        info!(
+            "🔑 Private key length: {} bytes",
+            certificates.private_key.len()
+        );
+        info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
+
+        // Full certificate logging for debugging (no truncation)
+        info!("📜 FULL DEVICE CERTIFICATE:");
+        info!("{}", certificates.device_certificate);
+        info!("🔑 FULL PRIVATE KEY:");
+        info!("{}", certificates.private_key);
+
+        // Trim whitespace from certificates for validation
+        let device_cert = certificates.device_certificate.trim();
+        let private_key = certificates.private_key.trim();
+
+        info!(
+            "📜 Device cert after trim - starts with: {}",
+            &device_cert[..50.min(device_cert.len())]
+        );
+        info!(
+            "📜 Device cert after trim - ends with: {}",
+            &device_cert[device_cert.len().saturating_sub(50)..]
+        );
+        info!(
+            "🔑 Private key after trim - starts with: {}",
+            &private_key[..50.min(private_key.len())]
+        );
+        info!(
+            "🔑 Private key after trim - ends with: {}",
+            &private_key[private_key.len().saturating_sub(50)..]
+        );
+
+        // Validate device certificate PEM format (with trimmed whitespace)
+        if !device_cert.starts_with("-----BEGIN CERTIFICATE-----")
+            || !device_cert.ends_with("-----END CERTIFICATE-----")
         {
+            error!("❌ Device certificate PEM format validation failed");
+            error!("❌ Expected to start with: -----BEGIN CERTIFICATE-----");
+            error!("❌ Expected to end with: -----END CERTIFICATE-----");
+            error!(
+                "❌ Actual start: {}",
+                &device_cert[..50.min(device_cert.len())]
+            );
+            error!(
+                "❌ Actual end: {}",
+                &device_cert[device_cert.len().saturating_sub(50)..]
+            );
             return Err(CertificateValidation::InvalidFormat);
         }
 
-        // Validate private key PEM format
-        if !certificates
-            .private_key
-            .starts_with("-----BEGIN PRIVATE KEY-----")
-            || !certificates
-                .private_key
-                .ends_with("-----END PRIVATE KEY-----")
-        {
+        // Validate private key PEM format (accept both RSA and PKCS#8 formats, with trimmed whitespace)
+        let has_rsa_format = private_key.starts_with("-----BEGIN RSA PRIVATE KEY-----")
+            && private_key.ends_with("-----END RSA PRIVATE KEY-----");
+        let has_pkcs8_format = private_key.starts_with("-----BEGIN PRIVATE KEY-----")
+            && private_key.ends_with("-----END PRIVATE KEY-----");
+
+        if !has_rsa_format && !has_pkcs8_format {
+            error!("❌ Private key PEM format validation failed");
+            error!("❌ Expected RSA format: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----");
+            error!(
+                "❌ Or PKCS#8 format: -----BEGIN PRIVATE KEY----- ... -----END PRIVATE KEY-----"
+            );
+            error!(
+                "❌ Actual start: {}",
+                &private_key[..50.min(private_key.len())]
+            );
+            error!(
+                "❌ Actual end: {}",
+                &private_key[private_key.len().saturating_sub(50)..]
+            );
             return Err(CertificateValidation::InvalidFormat);
         }
 
@@ -408,14 +568,21 @@ impl MqttCertificateStorage {
         if !certificates.iot_endpoint.contains(".iot.")
             || !certificates.iot_endpoint.contains(".amazonaws.com")
         {
+            error!("❌ IoT endpoint format validation failed");
+            error!("❌ Expected to contain: .iot. and .amazonaws.com");
+            error!("❌ Actual endpoint: {}", certificates.iot_endpoint);
             return Err(CertificateValidation::InvalidContent);
         }
 
-        // Check minimum size requirements
-        if certificates.device_certificate.len() < 500 || certificates.private_key.len() < 500 {
+        // Check minimum size requirements (use trimmed versions)
+        if device_cert.len() < 500 || private_key.len() < 500 {
+            error!("❌ Certificate size validation failed");
+            error!("❌ Device cert size: {} (min 500)", device_cert.len());
+            error!("❌ Private key size: {} (min 500)", private_key.len());
             return Err(CertificateValidation::InvalidContent);
         }
 
+        info!("✅ Certificate format validation passed");
         Ok(())
     }
 
