@@ -1630,5 +1630,5 @@ async fn perform_mqtt_failure_factory_reset(
     }
 
     // Restart device
-    restart_device("MQTT initialization failed - factory reset triggered");
+    restart_device("MQTT initialization failed - factory reset triggered").await;
 }

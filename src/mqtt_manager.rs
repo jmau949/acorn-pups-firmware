@@ -352,6 +352,22 @@ impl MqttManager {
                 info!("✅ MQTT connected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
 
+                // Attempt topic subscriptions with retry logic
+                info!("📨 Starting topic subscriptions after successful connection");
+                match self.client.subscribe_to_device_topics().await {
+                    Ok(_) => {
+                        info!("✅ All MQTT topic subscriptions completed successfully");
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to subscribe to MQTT topics: {}", e);
+                        // This is a critical failure - trigger factory reset
+                        crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(
+                            format!("MQTT subscription failed: {}", e),
+                        ));
+                        return Err(anyhow!("MQTT subscription failed: {}", e));
+                    }
+                }
+
                 // Send initial device status
                 let _ = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::DeviceStatus {
                     status: "online".to_string(),
@@ -407,8 +423,12 @@ impl MqttManager {
             MqttMessage::ButtonPress { .. } => {
                 format!("acorn-pups/button-press/{}", self.device_id)
             }
-            MqttMessage::DeviceStatus { .. } => format!("acorn-pups/status/{}", self.device_id),
-            MqttMessage::VolumeChange { .. } => format!("acorn-pups/status/{}", self.device_id),
+            MqttMessage::DeviceStatus { .. } => {
+                format!("acorn-pups/status-response/{}", self.device_id)
+            }
+            MqttMessage::VolumeChange { .. } => {
+                format!("acorn-pups/status-response/{}", self.device_id)
+            }
             MqttMessage::Heartbeat => format!("acorn-pups/heartbeat/{}", self.device_id),
             _ => "system".to_string(),
         }

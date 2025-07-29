@@ -2,7 +2,7 @@
 // Real AWS IoT Core communication with certificate-based TLS mutual authentication
 // Implements ESP-IDF MQTT client with X.509 certificates and Embassy async coordination
 
-// Import ESP-IDF MQTT client functionality
+// Import ESP-IDF MQTT client functionality for real MQTT connections
 use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
 
 // Import ESP-IDF TLS and X.509 certificate functionality
@@ -11,10 +11,10 @@ use esp_idf_svc::tls::X509;
 // Import Embassy time utilities for timeouts and delays
 use embassy_time::{Duration, Instant, Timer};
 
-// Import logging macros for debug output with consistent emoji prefixes
+// Import logging for detailed output
 use log::{debug, error, info, warn};
 
-// Import anyhow for error handling following existing patterns
+// Import anyhow for error handling
 use anyhow::{anyhow, Result};
 
 // Import Serde for message serialization
@@ -26,7 +26,8 @@ use crate::mqtt_certificates::MqttCertificateStorage;
 
 // MQTT topic patterns following technical documentation
 const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
-const TOPIC_DEVICE_STATUS: &str = "acorn-pups/status";
+const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
+const TOPIC_STATUS_REQUEST: &str = "acorn-pups/status-request";
 const TOPIC_HEARTBEAT: &str = "acorn-pups/heartbeat";
 const TOPIC_SETTINGS: &str = "acorn-pups/settings";
 const TOPIC_COMMANDS: &str = "acorn-pups/commands";
@@ -187,22 +188,15 @@ impl AwsIotMqttClient {
         }
     }
 
-    /// Connect to AWS IoT Core using stored X.509 certificates with TLS mutual authentication
+    /// Connect to AWS IoT Core using X.509 certificate mutual authentication
     pub async fn connect(&mut self) -> Result<()> {
-        if self.certificates.is_none() {
-            return Err(anyhow!(
-                "No X.509 certificates available for MQTT connection"
-            ));
-        }
-
-        let certificates = self.certificates.as_ref().unwrap();
-        self.connection_status = ConnectionStatus::Connecting;
-        self.last_connection_attempt = Some(Instant::now());
-
         info!(
             "🔌 Connecting to AWS IoT Core with X.509 certificate mutual authentication: {}",
-            certificates.iot_endpoint
+            self.certificates.as_ref().unwrap().iot_endpoint
         );
+
+        let certificates = self.certificates.as_ref().unwrap();
+
         info!(
             "🔐 Using device certificate: {} bytes",
             certificates.device_certificate.len()
@@ -213,243 +207,178 @@ impl AwsIotMqttClient {
         );
         info!("🏛️ Using Amazon Root CA 1 for server verification");
 
-        // Create secure MQTT broker URL
+        // Create secure MQTT broker URL for mutual TLS authentication
         let broker_url = format!("mqtts://{}:8883", certificates.iot_endpoint);
         info!("🌐 MQTT broker URL: {}", broker_url);
         info!("🆔 Client ID: {}", self.client_id);
 
-        // Convert certificates to X.509 format
-        info!("🔐 Converting certificates to X.509 format for ESP-IDF");
-        let device_cert = Self::convert_pem_to_x509(&certificates.device_certificate)?;
-        let private_key = Self::convert_pem_to_x509(&certificates.private_key)?;
-        let aws_root_ca = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
-        info!("✅ X.509 certificates converted successfully");
+        info!("🚀 Creating production-grade ESP-IDF MQTT client configuration");
 
-        info!("🎯 X.509 certificate authentication fully configured and active");
+        // Convert PEM strings held in NVS into esp-idf X509 structures with static lifetime.
+        // SAFETY: Box::leak inside convert_pem_to_x509 guarantees static lifetime required by ESP-IDF.
+        let device_cert_x509 = Self::convert_pem_to_x509(&certificates.device_certificate)?;
+        let private_key_x509 = Self::convert_pem_to_x509(&certificates.private_key)?;
+        let root_ca_x509 = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
 
-        // Create MQTT client configuration with X.509 certificates
+        // Create complete configuration enabling full mutual-TLS. Time-outs follow AWS best-practice.
         let mqtt_config = MqttClientConfiguration {
+            // MQTT client identification
             client_id: Some(&self.client_id),
-            client_certificate: Some(device_cert),
-            private_key: Some(private_key),
-            server_certificate: Some(aws_root_ca),
-            keep_alive_interval: Some(std::time::Duration::from_secs(60)),
-            reconnect_timeout: Some(std::time::Duration::from_secs(30)),
-            network_timeout: std::time::Duration::from_secs(30),
-            use_global_ca_store: false, // Use our specific AWS Root CA
-            skip_cert_common_name_check: false, // Verify server identity
+
+            // Transport-layer certificate setup
+            server_certificate: Some(root_ca_x509), // Validate AWS IoT Core certificate chain
+            client_certificate: Some(device_cert_x509),
+            private_key: Some(private_key_x509),
+
+            // Reasonable keep-alive/network settings
+            keep_alive_interval: Some(core::time::Duration::from_secs(60)),
+            reconnect_timeout: Some(core::time::Duration::from_secs(30)),
+            network_timeout: core::time::Duration::from_secs(30),
+
+            // Explicitly tell ESP-TLS to use the provided CA instead of global store
+            use_global_ca_store: false,
+            skip_cert_common_name_check: false,
+
             ..Default::default()
         };
 
-        info!("🔧 MQTT client configuration created with X.509 certificates");
-        info!("🔐 TLS mutual authentication enabled");
-        info!("📋 Configuration details:");
-        info!("  📋 Client ID: {}", self.client_id);
-        info!("  📋 TLS enabled: Yes (port 8883)");
-        info!("  📋 Certificate authentication: X.509 mutual TLS");
-        info!("  📋 Root CA: Amazon Root CA 1");
-
-        // Create ESP MQTT client with X.509 certificate-based TLS authentication
-        info!("🚀 Creating ESP-IDF MQTT client with X.509 authentication");
         match EspMqttClient::new(&broker_url, &mqtt_config) {
-            Ok((mut client, _connection)) => {
-                info!("🔐 TLS handshake successful with X.509 certificate mutual authentication");
-                info!("✅ Verified server certificate using Amazon Root CA 1");
-                info!("🔒 Client authenticated using device certificate and private key");
-                info!("🎯 X.509 certificate authentication fully configured and active");
+            Ok((client, _connection)) => {
+                info!("✅ MQTT client created with full X.509 mutual authentication");
 
-                // Store client first to enable connection status checking
+                // Store client
                 self.client = Some(client);
                 self.connection_status = ConnectionStatus::Connected;
                 self.reset_retry_state();
 
-                // Wait for connection to stabilize
-                info!("⏳ Allowing MQTT connection to stabilize...");
-                Timer::after(Duration::from_secs(3)).await;
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to create MQTT client: {:?}", e);
+                Err(anyhow!("MQTT client creation failed: {:?}", e))
+            }
+        }
+    }
 
-                // Attempt subscriptions with robust error handling
-                info!("📨 Starting topic subscriptions with retry logic...");
+    /// Subscribe to device-specific MQTT topics with retry logic for connection timing
+    pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
+        if let Some(client) = self.client.as_mut() {
+            let device_id = &self.device_id;
+            info!(
+                "🔗 Starting MQTT topic subscriptions for device: {}",
+                device_id
+            );
 
-                let max_subscription_attempts = 5;
-                let mut subscription_successful = false;
+            // Retry logic for subscription - ESP-IDF MQTT client needs time to establish connection
+            let max_attempts = 10;
+            let mut attempt = 1;
 
-                for attempt in 1..=max_subscription_attempts {
-                    info!(
-                        "🔄 Subscription attempt {} of {}",
-                        attempt, max_subscription_attempts
-                    );
+            while attempt <= max_attempts {
+                info!("📨 Subscription attempt {} of {}", attempt, max_attempts);
 
-                    match self.client.as_mut() {
-                        Some(client) => {
-                            // Inline subscription logic to avoid borrowing issues
-                            let device_id = &self.device_id;
-                            info!(
-                                "🔗 Starting MQTT topic subscriptions for device: {}",
-                                device_id
-                            );
+                // Subscribe to settings updates
+                let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
+                info!(
+                    "📨 Attempting to subscribe to settings topic: {}",
+                    settings_topic
+                );
 
-                            // Subscribe to settings updates
-                            let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
-                            info!(
-                                "📨 Attempting to subscribe to settings topic: {}",
-                                settings_topic
-                            );
+                match client.subscribe(&settings_topic, QoS::AtLeastOnce) {
+                    Ok(_) => {
+                        info!(
+                            "✅ Successfully subscribed to settings topic: {}",
+                            settings_topic
+                        );
 
-                            let mut subscription_error = None;
+                        // Subscribe to commands
+                        let commands_topic = format!("{}/{}", TOPIC_COMMANDS, device_id);
+                        info!(
+                            "📨 Attempting to subscribe to commands topic: {}",
+                            commands_topic
+                        );
 
-                            match client.subscribe(&settings_topic, QoS::AtLeastOnce) {
-                                Ok(_) => {
-                                    info!(
-                                        "✅ Successfully subscribed to settings topic: {}",
-                                        settings_topic
-                                    );
+                        match client.subscribe(&commands_topic, QoS::AtLeastOnce) {
+                            Ok(_) => {
+                                info!(
+                                    "✅ Successfully subscribed to commands topic: {}",
+                                    commands_topic
+                                );
 
-                                    // Subscribe to commands
-                                    let commands_topic =
-                                        format!("{}/{}", TOPIC_COMMANDS, device_id);
-                                    info!(
-                                        "📨 Attempting to subscribe to commands topic: {}",
-                                        commands_topic
-                                    );
+                                // Subscribe to status request topic
+                                let status_req_topic =
+                                    format!("{}/{}", TOPIC_STATUS_REQUEST, device_id);
+                                info!(
+                                    "📨 Attempting to subscribe to status request topic: {}",
+                                    status_req_topic
+                                );
 
-                                    match client.subscribe(&commands_topic, QoS::AtLeastOnce) {
-                                        Ok(_) => {
-                                            info!(
-                                                "✅ Successfully subscribed to commands topic: {}",
-                                                commands_topic
-                                            );
-                                            info!("✅ All MQTT topic subscriptions completed successfully");
-                                            info!("  📨 Settings: {}", settings_topic);
-                                            info!("  📨 Commands: {}", commands_topic);
-                                            info!("🔒 Subscriptions secured with X.509 certificate authentication");
-
-                                            subscription_successful = true;
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            subscription_error = Some(format!(
-                                                "Failed to subscribe to commands topic: {:?}",
+                                match client.subscribe(&status_req_topic, QoS::AtLeastOnce) {
+                                    Ok(_) => {
+                                        info!(
+                                            "✅ Successfully subscribed to status request topic: {}",
+                                            status_req_topic
+                                        );
+                                        info!("✅ All MQTT topic subscriptions completed successfully");
+                                        info!("  📨 Settings: {}", settings_topic);
+                                        info!("  📨 Commands: {}", commands_topic);
+                                        info!("  📨 Status Request: {}", status_req_topic);
+                                        return Ok(());
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "❌ Failed to subscribe to status request topic: {:?}",
+                                            e
+                                        );
+                                        if attempt >= max_attempts {
+                                            return Err(anyhow!(
+                                                "Failed to subscribe to status request topic after {} attempts: {:?}",
+                                                max_attempts,
                                                 e
                                             ));
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    subscription_error = Some(format!(
-                                        "Failed to subscribe to settings topic: {:?}",
-                                        e
-                                    ));
-                                }
                             }
-
-                            if let Some(error) = subscription_error {
-                                error!("❌ Subscription attempt {} failed: {}", attempt, error);
-
-                                if attempt < max_subscription_attempts {
-                                    let wait_time = Duration::from_secs(attempt as u64 * 2); // Exponential backoff
-                                    info!("⏳ Waiting {:?} before retry...", wait_time);
-                                    Timer::after(wait_time).await;
+                            Err(e) => {
+                                error!("❌ Failed to subscribe to commands topic: {:?}", e);
+                                if attempt >= max_attempts {
+                                    return Err(anyhow!("Failed to subscribe to commands topic after {} attempts: {:?}", max_attempts, e));
                                 }
                             }
                         }
-                        None => {
-                            error!("❌ Client is None during subscription attempt");
-                            break;
+                    }
+                    Err(e) => {
+                        error!(
+                            "❌ Failed to subscribe to settings topic on attempt {}: {:?}",
+                            attempt, e
+                        );
+                        if attempt >= max_attempts {
+                            return Err(anyhow!(
+                                "Failed to subscribe to settings topic after {} attempts: {:?}",
+                                max_attempts,
+                                e
+                            ));
                         }
                     }
                 }
 
-                if !subscription_successful {
-                    let error_msg = format!(
-                        "Failed to subscribe to topics after {} attempts",
-                        max_subscription_attempts
-                    );
-                    error!("❌ {}", error_msg);
-                    self.connection_status = ConnectionStatus::Error(error_msg.clone());
-                    return Err(anyhow!(error_msg));
-                }
-
-                info!("✅ Successfully connected to AWS IoT Core with X.509 mutual authentication");
-                info!("🆔 Client ID: {}", self.client_id);
-                info!("🔒 Connection secured with TLS 1.2+ using X.509 certificates");
-                info!("📨 All topic subscriptions active and confirmed");
-                Ok(())
-            }
-            Err(e) => {
-                let error_msg = format!(
-                    "Failed to establish X.509 authenticated MQTT connection: {:?}",
-                    e
-                );
-                error!("❌ {}", error_msg);
-                error!("🔐 TLS handshake failed - check certificate validity and AWS IoT Core endpoint");
-                error!("💡 Ensure device certificate is properly registered with AWS IoT Core");
-                self.connection_status = ConnectionStatus::Error(error_msg.clone());
-                self.update_retry_state();
-                Err(anyhow!(error_msg))
-            }
-        }
-    }
-
-    /// Subscribe to device-specific MQTT topics
-    async fn subscribe_to_device_topics(&self, client: &mut EspMqttClient<'static>) -> Result<()> {
-        let device_id = &self.device_id;
-        info!(
-            "🔗 Starting MQTT topic subscriptions for device: {}",
-            device_id
-        );
-
-        // Subscribe to settings updates
-        let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
-        info!(
-            "📨 Attempting to subscribe to settings topic: {}",
-            settings_topic
-        );
-
-        match client.subscribe(&settings_topic, QoS::AtLeastOnce) {
-            Ok(_) => {
+                // Wait before retry - give ESP-IDF MQTT client more time to establish connection
+                let delay_seconds = attempt * 2; // Progressive backoff: 2s, 4s, 6s, etc.
                 info!(
-                    "✅ Successfully subscribed to settings topic: {}",
-                    settings_topic
+                    "⏳ Waiting {} seconds before retry (attempt {}/{})",
+                    delay_seconds, attempt, max_attempts
                 );
+                Timer::after(Duration::from_secs(delay_seconds)).await;
+                attempt += 1;
             }
-            Err(e) => {
-                error!("❌ Failed to subscribe to settings topic: {:?}", e);
-                error!("🔍 Settings topic: {}", settings_topic);
-                error!("🔍 Device ID: {}", device_id);
-                error!("🔍 QoS: AtLeastOnce");
-                return Err(anyhow!("Failed to subscribe to settings topic: {:?}", e));
-            }
+
+            Err(anyhow!(
+                "Failed to subscribe to MQTT topics after {} attempts",
+                max_attempts
+            ))
+        } else {
+            Err(anyhow!("MQTT client not initialized"))
         }
-
-        // Subscribe to commands
-        let commands_topic = format!("{}/{}", TOPIC_COMMANDS, device_id);
-        info!(
-            "📨 Attempting to subscribe to commands topic: {}",
-            commands_topic
-        );
-
-        match client.subscribe(&commands_topic, QoS::AtLeastOnce) {
-            Ok(_) => {
-                info!(
-                    "✅ Successfully subscribed to commands topic: {}",
-                    commands_topic
-                );
-            }
-            Err(e) => {
-                error!("❌ Failed to subscribe to commands topic: {:?}", e);
-                error!("🔍 Commands topic: {}", commands_topic);
-                error!("🔍 Device ID: {}", device_id);
-                error!("🔍 QoS: AtLeastOnce");
-                return Err(anyhow!("Failed to subscribe to commands topic: {:?}", e));
-            }
-        }
-
-        info!("✅ All MQTT topic subscriptions completed successfully");
-        info!("  📨 Settings: {}", settings_topic);
-        info!("  📨 Commands: {}", commands_topic);
-        info!("🔒 Subscriptions secured with X.509 certificate authentication");
-
-        Ok(())
     }
 
     /// Publish button press event to AWS IoT Core
@@ -496,7 +425,7 @@ impl AwsIotMqttClient {
             firmware_version: "1.0.0".to_string(),
         };
 
-        let topic = format!("{}/{}", TOPIC_DEVICE_STATUS, self.device_id);
+        let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.device_id);
         self.publish_json_message(&topic, &message).await?;
 
         debug!("📊 Published authenticated device status: {}", status);
@@ -529,7 +458,7 @@ impl AwsIotMqttClient {
             return Err(anyhow!("MQTT client not connected"));
         }
 
-        let topic = format!("{}/{}", TOPIC_DEVICE_STATUS, self.device_id);
+        let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.device_id);
         let message = serde_json::json!({
             "deviceId": self.device_id,
             "timestamp": self.get_iso8601_timestamp(),
