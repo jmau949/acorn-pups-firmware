@@ -25,8 +25,7 @@ use crate::mqtt_client::{AwsIotMqttClient, MqttConnectionState};
 
 // MQTT manager configuration constants
 const MQTT_MESSAGE_QUEUE_SIZE: usize = 32; // Channel capacity for message queue
-const HEARTBEAT_INTERVAL_SECONDS: u64 = 300; // 5 minutes
-const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30; // 30 seconds
+const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30; // Check connection health every 30 seconds
 const MESSAGE_TIMEOUT_SECONDS: u64 = 10; // Timeout for message operations
 
 // MQTT message types for internal communication
@@ -44,7 +43,6 @@ pub enum MqttMessage {
         volume: u8,
         source: String,
     },
-    Heartbeat,
     Connect,
     Disconnect,
     ForceReconnect,
@@ -79,7 +77,6 @@ pub struct MqttManager {
     client: AwsIotMqttClient,
     cert_storage: Option<MqttCertificateStorage>,
     is_initialized: bool,
-    last_heartbeat: Option<embassy_time::Instant>,
     last_connection_check: Option<embassy_time::Instant>,
 }
 
@@ -95,7 +92,6 @@ impl MqttManager {
             client,
             cert_storage: None,
             is_initialized: false,
-            last_heartbeat: None,
             last_connection_check: None,
         }
     }
@@ -175,7 +171,6 @@ impl MqttManager {
             // This avoids multiple mutable borrow issues with select!
             self.process_message_queue().await;
             self.check_connection_health().await;
-            self.handle_periodic_heartbeat().await;
             self.handle_system_events().await;
         }
     }
@@ -223,8 +218,6 @@ impl MqttManager {
             MqttMessage::VolumeChange { volume, source } => {
                 self.client.publish_volume_change(volume, &source).await
             }
-
-            MqttMessage::Heartbeat => self.client.publish_heartbeat().await,
 
             MqttMessage::Connect => self.attempt_connection().await,
 
@@ -305,33 +298,6 @@ impl MqttManager {
                 if let Err(e) = self.force_reconnection().await {
                     error!("❌ Failed to recover from connection error: {}", e);
                 }
-            }
-        }
-    }
-
-    /// Handle periodic heartbeat messages
-    async fn handle_periodic_heartbeat(&mut self) {
-        let now = embassy_time::Instant::now();
-
-        // Check if it's time for a heartbeat
-        if let Some(last_heartbeat) = self.last_heartbeat {
-            if now.duration_since(last_heartbeat) < Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS)
-            {
-                // Not time for heartbeat yet, yield to avoid busy waiting
-                Timer::after(Duration::from_millis(100)).await;
-                return;
-            }
-        }
-
-        self.last_heartbeat = Some(now);
-
-        // Send heartbeat if connected
-        if self.client.is_connected() {
-            debug!("💓 Sending periodic heartbeat");
-
-            // Queue heartbeat message instead of blocking
-            if let Err(e) = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::Heartbeat) {
-                warn!("⚠️ Failed to queue heartbeat message: {:?}", e);
             }
         }
     }
@@ -431,7 +397,6 @@ impl MqttManager {
             MqttMessage::VolumeChange { .. } => {
                 format!("acorn-pups/status-response/{}", self.device_id)
             }
-            MqttMessage::Heartbeat => format!("acorn-pups/heartbeat/{}", self.device_id),
             _ => "system".to_string(),
         }
     }

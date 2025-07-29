@@ -24,10 +24,11 @@ use serde::{Deserialize, Serialize};
 use crate::device_api::DeviceCertificates;
 
 // MQTT Topic Constants - Centralized to prevent inconsistency
+pub const TOPIC_STATUS_REQUEST: &str = "acorn-pups/status-request";
+pub const TOPIC_SETTINGS: &str = "acorn-pups/settings";
+pub const TOPIC_COMMANDS: &str = "acorn-pups/commands";
 pub const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
 pub const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
-pub const TOPIC_HEARTBEAT: &str = "acorn-pups/heartbeat";
-pub const TOPIC_DEVICE_SHADOW: &str = "$aws/thing";
 
 // Static certificate holder for managing certificate lifetimes
 // This provides the static lifetime requirement without memory leaks
@@ -342,7 +343,7 @@ impl AwsIotMqttClient {
                 info!("📨 Subscription attempt {} of {}", attempt, max_attempts);
 
                 // Subscribe to settings updates
-                let settings_topic = format!("{}/{}", TOPIC_DEVICE_SHADOW, device_id);
+                let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
                 info!(
                     "📨 Attempting to subscribe to settings topic: {}",
                     settings_topic
@@ -356,7 +357,7 @@ impl AwsIotMqttClient {
                         );
 
                         // Subscribe to commands
-                        let commands_topic = format!("{}/{}", TOPIC_DEVICE_SHADOW, device_id);
+                        let commands_topic = format!("{}/{}", TOPIC_COMMANDS, device_id);
                         info!(
                             "📨 Attempting to subscribe to commands topic: {}",
                             commands_topic
@@ -371,7 +372,7 @@ impl AwsIotMqttClient {
 
                                 // Subscribe to status request topic
                                 let status_req_topic =
-                                    format!("{}/{}", TOPIC_DEVICE_SHADOW, device_id);
+                                    format!("{}/{}", TOPIC_STATUS_REQUEST, device_id);
                                 info!(
                                     "📨 Attempting to subscribe to status request topic: {}",
                                     status_req_topic
@@ -493,28 +494,6 @@ impl AwsIotMqttClient {
             self.publish_json_message(&topic, &message).await?;
 
             debug!("📊 Published authenticated device status: {}", status);
-            Ok(())
-        } else {
-            Err(anyhow!("MQTT client not initialized"))
-        }
-    }
-
-    /// Publish heartbeat message
-    pub async fn publish_heartbeat(&mut self) -> Result<()> {
-        if let Some(_client) = self.client.as_mut() {
-            let message = DeviceStatusMessage {
-                device_id: self.device_id.clone(),
-                status: "online".to_string(),
-                timestamp: self.get_current_timestamp_u64(),
-                uptime_seconds: 0, // Placeholder, needs actual uptime
-                free_heap: 0,      // Placeholder, needs actual free heap
-                wifi_rssi: 0,      // Placeholder, needs actual RSSI
-            };
-
-            let topic = format!("{}/{}", TOPIC_HEARTBEAT, self.device_id);
-            self.publish_json_message(&topic, &message).await?;
-
-            debug!("💓 Published authenticated heartbeat");
             Ok(())
         } else {
             Err(anyhow!("MQTT client not initialized"))
