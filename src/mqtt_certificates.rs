@@ -191,20 +191,46 @@ impl MqttCertificateStorage {
         Ok(Some(certificates))
     }
 
-    /// Efficiently check if certificates exist using small probe buffers
-    /// Avoids allocating large buffers for existence checks
+    /// Check if certificates exist by detecting "buffer too small" vs "not found" errors
+    /// Uses ESP-IDF error codes to distinguish between key existence and buffer size issues
     pub fn certificates_exist(&mut self) -> Result<bool, EspError> {
-        // Use small probe buffer to check key existence
-        const PROBE_BUFFER_SIZE: usize = 16;
-        let mut probe_buffer = [0u8; PROBE_BUFFER_SIZE];
+        // Check device certificate existence
+        let mut tiny_buffer = [0u8; 1];
+        let device_cert_exists = match self.nvs.get_str(DEVICE_CERT_KEY, &mut tiny_buffer) {
+            // Key exists but buffer too small - this means the key exists!
+            Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_INVALID_LENGTH => true,
+            // Key doesn't exist
+            Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND => false,
+            // Key exists and fits in tiny buffer (very unlikely for certs)
+            Ok(Some(_)) => true,
+            // Key doesn't exist (None variant)
+            Ok(None) => false,
+            // Other errors - assume key doesn't exist
+            Err(_) => false,
+        };
 
-        // Check if required certificate keys exist
-        let device_cert_exists = self.nvs.get_str(DEVICE_CERT_KEY, &mut probe_buffer).is_ok();
-        let private_key_exists = self.nvs.get_str(PRIVATE_KEY_KEY, &mut probe_buffer).is_ok();
-        let iot_endpoint_exists = self
-            .nvs
-            .get_str(IOT_ENDPOINT_KEY, &mut probe_buffer)
-            .is_ok();
+        // Check private key existence
+        let private_key_exists = match self.nvs.get_str(PRIVATE_KEY_KEY, &mut tiny_buffer) {
+            Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_INVALID_LENGTH => true,
+            Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND => false,
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => false,
+        };
+
+        // Check IoT endpoint existence
+        let iot_endpoint_exists = match self.nvs.get_str(IOT_ENDPOINT_KEY, &mut tiny_buffer) {
+            Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_INVALID_LENGTH => true,
+            Err(e) if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND => false,
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => false,
+        };
+
+        info!(
+            "📋 Certificate existence check: device_cert={}, private_key={}, endpoint={}",
+            device_cert_exists, private_key_exists, iot_endpoint_exists
+        );
 
         Ok(device_cert_exists && private_key_exists && iot_endpoint_exists)
     }
