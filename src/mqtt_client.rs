@@ -587,13 +587,59 @@ impl AwsIotMqttClient {
     }
 
     /// Process incoming MQTT messages
+    /// Note: ESP-IDF MQTT client uses event-driven callbacks for message reception
+    /// This method exists for compatibility but actual message handling happens in callbacks
     pub async fn process_messages(&mut self) -> Result<()> {
         if !self.is_connected() {
             debug!("📭 MQTT not connected, no messages to process");
             return Ok(());
         }
 
-        debug!("🔒 Processing messages on authenticated connection");
+        // ESP-IDF MQTT client handles messages via callbacks during connection setup
+        // For now, this method serves as a placeholder for message processing logic
+        // Actual message reception is handled by the MQTT event callback system
+        debug!("🔒 MQTT connection active, messages handled by event system");
+        Ok(())
+    }
+
+    /// Handle incoming settings update messages (called from MQTT event callback)
+    pub fn handle_settings_message(topic: &str, payload: &[u8]) -> Result<()> {
+        info!("🔧 Processing settings update from topic: {}", topic);
+
+        // Convert payload to string
+        let json_payload = std::str::from_utf8(payload)
+            .map_err(|e| anyhow!("Invalid UTF-8 in settings payload: {}", e))?;
+
+        debug!("📨 Settings JSON: {}", json_payload);
+
+        // Send settings update request to settings manager
+        crate::settings::request_mqtt_settings_update(json_payload.to_string());
+
+        info!("✅ Settings update request sent to settings manager");
+        Ok(())
+    }
+
+    /// Handle incoming command messages (called from MQTT event callback)
+    pub fn handle_command_message(topic: &str, payload: &[u8]) -> Result<()> {
+        info!("📋 Processing command from topic: {}", topic);
+
+        // Convert payload to string for processing
+        let command_payload = std::str::from_utf8(payload)
+            .map_err(|e| anyhow!("Invalid UTF-8 in command payload: {}", e))?;
+
+        debug!("📋 Command payload: {}", command_payload);
+
+        // For MVP, just log commands - could be extended for device control
+        info!("📋 Command received (not implemented): {}", command_payload);
+        Ok(())
+    }
+
+    /// Handle status request messages (called from MQTT event callback)
+    pub fn handle_status_request(topic: &str, payload: &[u8]) -> Result<()> {
+        info!("📊 Processing status request from topic: {}", topic);
+
+        // For MVP, just log status request - actual response would need client instance
+        info!("📊 Status request received (response not implemented in callback)");
         Ok(())
     }
 
