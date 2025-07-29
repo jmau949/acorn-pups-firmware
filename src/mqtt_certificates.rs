@@ -235,43 +235,35 @@ impl MqttCertificateStorage {
         Ok(device_cert_exists && private_key_exists && iot_endpoint_exists)
     }
 
-    /// Load certificate component with appropriate buffer sizing
+    /// Load certificate component with stack-allocated buffer for memory efficiency
     fn load_certificate_component(
         &mut self,
         key: &str,
         component_name: &str,
     ) -> Result<String, EspError> {
-        // Start with a reasonable buffer size and grow if needed
-        let mut buffer_size = 2048; // Most certificates fit in 2KB
-        loop {
-            let mut buffer = vec![0u8; buffer_size];
+        // Use stack-allocated array to prevent memory leaks from vector reallocation
+        const MAX_CERT_SIZE: usize = 4096; // 4KB should handle all certificate types
+        let mut buffer = [0u8; MAX_CERT_SIZE];
 
-            match self.nvs.get_str(key, &mut buffer) {
-                Ok(Some(value)) => {
-                    info!("📋 Loaded {}: {} bytes", component_name, value.len());
-                    return Ok(value.to_string());
-                }
-                Ok(None) => {
-                    error!("❌ {} not found in storage", component_name);
-                    return Err(EspError::from_infallible::<
-                        { esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND },
-                    >());
-                }
-                Err(_e) => {
-                    // Try with larger buffer if current one wasn't sufficient
-                    if buffer_size < 8192 {
-                        buffer_size *= 2;
-                        continue;
-                    } else {
-                        error!(
-                            "❌ Failed to load {} after trying up to {} bytes",
-                            component_name, buffer_size
-                        );
-                        return Err(EspError::from_infallible::<
-                            { esp_idf_svc::sys::ESP_ERR_NO_MEM },
-                        >());
-                    }
-                }
+        match self.nvs.get_str(key, &mut buffer) {
+            Ok(Some(value)) => {
+                info!("📋 Loaded {}: {} bytes", component_name, value.len());
+                Ok(value.to_string())
+            }
+            Ok(None) => {
+                error!("❌ {} not found in storage", component_name);
+                Err(EspError::from_infallible::<
+                    { esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND },
+                >())
+            }
+            Err(e) => {
+                error!(
+                    "❌ Failed to load {} (buffer size: {} bytes): {:?}",
+                    component_name, MAX_CERT_SIZE, e
+                );
+                Err(EspError::from_infallible::<
+                    { esp_idf_svc::sys::ESP_ERR_NO_MEM },
+                >())
             }
         }
     }
