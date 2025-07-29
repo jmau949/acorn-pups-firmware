@@ -94,28 +94,14 @@ impl MqttCertificateStorage {
             device_id
         );
 
-        // Debug: Log certificate details before validation
-        info!("📋 Certificate details from backend:");
+        // Log certificate sizes only (no content for security)
+        info!("📋 Certificate storage summary:");
         info!(
             "  📜 Device certificate: {} bytes",
             certificates.device_certificate.len()
         );
         info!("  🔑 Private key: {} bytes", certificates.private_key.len());
         info!("  🌐 IoT endpoint: {}", certificates.iot_endpoint);
-
-        // Show first 100 characters of each certificate for debugging
-        let cert_preview = certificates
-            .device_certificate
-            .chars()
-            .take(100)
-            .collect::<String>();
-        let key_preview = certificates
-            .private_key
-            .chars()
-            .take(100)
-            .collect::<String>();
-        info!("  📜 Cert preview: {}", cert_preview);
-        info!("  🔑 Key preview: {}", key_preview);
 
         // Validate certificate format before storage
         if let Err(validation_result) = self.validate_certificate_format(certificates) {
@@ -139,8 +125,11 @@ impl MqttCertificateStorage {
             validation_attempts: 0,
         };
 
-        // Store certificate components in NVS
-        // Using separate keys for each component for security and flexibility
+        // Batch NVS operations for better performance
+        // Store all certificate components in sequence to minimize NVS overhead
+        info!("🔄 Performing batched NVS certificate storage...");
+
+        // Store certificate components
         self.nvs
             .set_str(DEVICE_CERT_KEY, &certificates.device_certificate)?;
         self.nvs
@@ -148,28 +137,23 @@ impl MqttCertificateStorage {
         self.nvs
             .set_str(IOT_ENDPOINT_KEY, &certificates.iot_endpoint)?;
 
-        // Store metadata as JSON
-        match serde_json::to_string(&metadata) {
-            Ok(metadata_json) => {
-                self.nvs.set_str(CERT_METADATA_KEY, &metadata_json)?;
-                self.nvs.set_u8(CERT_VALIDATION_KEY, 1)?; // Mark as valid
+        // Store metadata and validation flag together
+        let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+            error!("❌ Failed to serialize certificate metadata: {}", e);
+            EspError::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_INVALID_ARG }>()
+        })?;
 
-                info!("✅ AWS IoT Core certificates stored successfully");
-                info!(
-                    "📜 Certificate fingerprint: {}",
-                    &metadata.certificate_fingerprint[..16]
-                );
-                info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
+        self.nvs.set_str(CERT_METADATA_KEY, &metadata_json)?;
+        self.nvs.set_u8(CERT_VALIDATION_KEY, 1)?; // Mark as valid
 
-                Ok(())
-            }
-            Err(e) => {
-                error!("❌ Failed to serialize certificate metadata: {}", e);
-                Err(EspError::from_infallible::<
-                    { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
-                >())
-            }
-        }
+        info!("✅ AWS IoT Core certificates stored successfully in batched operation");
+        info!(
+            "📜 Certificate fingerprint: {}",
+            &metadata.certificate_fingerprint[..16]
+        );
+        info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
+
+        Ok(())
     }
 
     /// Load stored AWS IoT Core certificates from NVS

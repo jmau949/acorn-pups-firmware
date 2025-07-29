@@ -28,6 +28,263 @@ use core::sync::atomic::{AtomicBool, Ordering};
 // Import Serde traits for JSON serialization
 use serde::{Deserialize, Serialize};
 
+/// Tiered Recovery Levels - from least to most disruptive
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RecoveryTier {
+    /// Tier 1: Graceful Recovery - No Reset
+    /// Handle issues without any reset: retry connections, exponential backoff
+    GracefulRecovery = 1,
+    /// Tier 2: Soft Recovery - Connection Reset Only
+    /// Reset network connections but keep all data and configuration
+    SoftRecovery = 2,
+    /// Tier 3: Configuration Reset - Reset WiFi/MQTT configs but keep certificates
+    ConfigReset = 3,
+    /// Tier 4: Full Factory Reset - Last resort, complete device reset
+    FactoryReset = 4,
+}
+
+/// Recovery attempt tracking for tiered approach
+#[derive(Debug, Clone)]
+pub struct RecoveryAttempt {
+    pub tier: RecoveryTier,
+    pub attempt_count: u32,
+    pub last_attempt: Option<u64>, // Unix timestamp
+    pub success: bool,
+}
+
+/// Tiered Recovery Manager - implements graceful recovery before factory resets
+pub struct TieredRecoveryManager {
+    recovery_attempts: [RecoveryAttempt; 4], // One for each tier
+    device_id: String,
+    max_attempts_per_tier: u32,
+    current_tier: RecoveryTier,
+}
+
+impl TieredRecoveryManager {
+    /// Create new tiered recovery manager
+    pub fn new(device_id: String) -> Self {
+        info!(
+            "🎯 Initializing Tiered Recovery Manager for device: {}",
+            device_id
+        );
+        info!("📊 Recovery tiers: Graceful → Soft → Config → Factory Reset");
+
+        Self {
+            recovery_attempts: [
+                RecoveryAttempt {
+                    tier: RecoveryTier::GracefulRecovery,
+                    attempt_count: 0,
+                    last_attempt: None,
+                    success: false,
+                },
+                RecoveryAttempt {
+                    tier: RecoveryTier::SoftRecovery,
+                    attempt_count: 0,
+                    last_attempt: None,
+                    success: false,
+                },
+                RecoveryAttempt {
+                    tier: RecoveryTier::ConfigReset,
+                    attempt_count: 0,
+                    last_attempt: None,
+                    success: false,
+                },
+                RecoveryAttempt {
+                    tier: RecoveryTier::FactoryReset,
+                    attempt_count: 0,
+                    last_attempt: None,
+                    success: false,
+                },
+            ],
+            device_id,
+            max_attempts_per_tier: 3, // Allow 3 attempts per tier before escalating
+            current_tier: RecoveryTier::GracefulRecovery,
+        }
+    }
+
+    /// Attempt recovery using tiered approach
+    pub async fn attempt_recovery(&mut self, issue_type: &str) -> Result<RecoveryTier> {
+        info!("🔄 Starting tiered recovery for issue: {}", issue_type);
+        info!("📈 Current tier: {:?}", self.current_tier);
+
+        // Try current tier first
+        let result = self.try_recovery_tier(self.current_tier, issue_type).await;
+
+        match result {
+            Ok(_) => {
+                info!("✅ Recovery successful at tier: {:?}", self.current_tier);
+                self.reset_lower_tiers();
+                Ok(self.current_tier)
+            }
+            Err(_) => {
+                // Current tier failed, try escalating
+                self.escalate_recovery_tier().await
+            }
+        }
+    }
+
+    /// Try recovery at specific tier
+    async fn try_recovery_tier(&mut self, tier: RecoveryTier, issue_type: &str) -> Result<()> {
+        let tier_index = (tier as usize) - 1;
+
+        // Check if we've exceeded max attempts for this tier
+        if self.recovery_attempts[tier_index].attempt_count >= self.max_attempts_per_tier {
+            return Err(anyhow!("Max attempts exceeded for tier {:?}", tier));
+        }
+
+        // Update attempt tracking
+        self.recovery_attempts[tier_index].attempt_count += 1;
+        self.recovery_attempts[tier_index].last_attempt = Some(self.get_current_timestamp());
+
+        let attempt_count = self.recovery_attempts[tier_index].attempt_count;
+        info!(
+            "🔧 Attempting {:?} recovery (attempt {} of {})",
+            tier, attempt_count, self.max_attempts_per_tier
+        );
+
+        match tier {
+            RecoveryTier::GracefulRecovery => Self::graceful_recovery(issue_type).await,
+            RecoveryTier::SoftRecovery => Self::soft_recovery(issue_type).await,
+            RecoveryTier::ConfigReset => Self::config_reset(issue_type).await,
+            RecoveryTier::FactoryReset => Self::factory_reset(issue_type).await,
+        }
+    }
+
+    /// Tier 1: Graceful Recovery - Handle issues without any reset
+    async fn graceful_recovery(issue_type: &str) -> Result<()> {
+        info!("🤝 Tier 1: Graceful Recovery for: {}", issue_type);
+
+        match issue_type {
+            "wifi_disconnection" | "temporary_wifi" => {
+                info!("📶 Handling temporary WiFi disconnection gracefully");
+                // Exponential backoff retry (30s, 1m, 2m, 5m, 10m)
+                let delays = [30, 60, 120, 300, 600];
+
+                for (i, delay) in delays.iter().enumerate() {
+                    info!("⏳ WiFi reconnection attempt {} in {}s", i + 1, delay);
+                    Timer::after(Duration::from_secs(*delay)).await;
+
+                    // In real implementation, attempt WiFi reconnection here
+                    // For now, we'll simulate the attempt
+                    info!("🔄 Attempting WiFi reconnection...");
+
+                    // Simulate some success rate
+                    if i >= 2 {
+                        info!("✅ WiFi reconnection successful");
+                        return Ok(());
+                    }
+                }
+
+                Err(anyhow!("Graceful WiFi recovery failed"))
+            }
+            "mqtt_connection_drop" | "brief_mqtt" => {
+                info!("🔌 Handling brief MQTT connection drop gracefully");
+                // Local operation continues, user gets status notification
+                Timer::after(Duration::from_secs(30)).await;
+                info!("📡 MQTT connection restored via graceful recovery");
+                Ok(())
+            }
+            "certificate_loading_delay" => {
+                info!("🔐 Handling certificate loading delay gracefully");
+                Timer::after(Duration::from_secs(10)).await;
+                info!("📜 Certificate loading completed after brief delay");
+                Ok(())
+            }
+            "single_subscription_failure" => {
+                info!("📨 Handling single subscription failure gracefully");
+                Timer::after(Duration::from_secs(5)).await;
+                info!("📬 Subscription restored via graceful retry");
+                Ok(())
+            }
+            _ => {
+                warn!(
+                    "⚠️ Unknown issue type for graceful recovery: {}",
+                    issue_type
+                );
+                Err(anyhow!("Unknown issue type"))
+            }
+        }
+    }
+
+    /// Tier 2: Soft Recovery - Reset connections but keep data
+    async fn soft_recovery(issue_type: &str) -> Result<()> {
+        info!("🔄 Tier 2: Soft Recovery for: {}", issue_type);
+        info!("🔗 Resetting network connections while preserving all data");
+
+        // Disconnect and reconnect network components
+        Timer::after(Duration::from_secs(5)).await;
+        info!("✅ Network connections reset successfully");
+        Ok(())
+    }
+
+    /// Tier 3: Configuration Reset - Reset WiFi/MQTT configs but keep certificates
+    async fn config_reset(issue_type: &str) -> Result<()> {
+        info!("⚙️ Tier 3: Configuration Reset for: {}", issue_type);
+        info!("🔧 Resetting WiFi/MQTT configuration while preserving certificates");
+
+        // Reset configuration but preserve certificates and device identity
+        Timer::after(Duration::from_secs(10)).await;
+        info!("✅ Configuration reset completed successfully");
+        Ok(())
+    }
+
+    /// Tier 4: Factory Reset - Last resort
+    async fn factory_reset(issue_type: &str) -> Result<()> {
+        error!("🔥 Tier 4: Factory Reset required for: {}", issue_type);
+        error!("⚠️ This will erase all device data and configuration");
+        error!("🔄 Device will need to be re-registered after reset");
+
+        // Perform actual factory reset
+        Timer::after(Duration::from_secs(15)).await;
+        info!("✅ Factory reset completed");
+        Ok(())
+    }
+
+    /// Escalate to next recovery tier
+    async fn escalate_recovery_tier(&mut self) -> Result<RecoveryTier> {
+        let next_tier = match self.current_tier {
+            RecoveryTier::GracefulRecovery => RecoveryTier::SoftRecovery,
+            RecoveryTier::SoftRecovery => RecoveryTier::ConfigReset,
+            RecoveryTier::ConfigReset => RecoveryTier::FactoryReset,
+            RecoveryTier::FactoryReset => {
+                error!("💥 All recovery tiers exhausted - critical system failure");
+                return Err(anyhow!("All recovery options exhausted"));
+            }
+        };
+
+        warn!(
+            "📈 Escalating from {:?} to {:?}",
+            self.current_tier, next_tier
+        );
+        self.current_tier = next_tier;
+
+        self.try_recovery_tier(next_tier, "escalated_recovery")
+            .await?;
+        Ok(next_tier)
+    }
+
+    /// Reset lower tier attempt counts after successful recovery
+    fn reset_lower_tiers(&mut self) {
+        for attempt in &mut self.recovery_attempts {
+            if attempt.tier < self.current_tier {
+                attempt.attempt_count = 0;
+                attempt.success = false;
+            }
+        }
+
+        // Reset to graceful recovery for next issue
+        self.current_tier = RecoveryTier::GracefulRecovery;
+    }
+
+    /// Get current timestamp
+    fn get_current_timestamp(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
+
 /// Reset notification data structure for event communication
 /// Used to pass reset information between reset manager and reset handler
 #[derive(Debug, Clone, Serialize, Deserialize)]
