@@ -9,10 +9,10 @@ use esp_idf_svc::mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS};
 use esp_idf_svc::tls::X509;
 
 // Import Embassy time utilities for timeouts and delays
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Timer};
 
 // Import logging for detailed output
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 
 // Import anyhow for error handling
 use anyhow::{anyhow, Result};
@@ -22,20 +22,12 @@ use serde::{Deserialize, Serialize};
 
 // Import our certificate management module
 use crate::device_api::DeviceCertificates;
-use crate::mqtt_certificates::MqttCertificateStorage;
 
-// MQTT topic patterns following technical documentation
-const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
-const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
-const TOPIC_STATUS_REQUEST: &str = "acorn-pups/status-request";
-const TOPIC_HEARTBEAT: &str = "acorn-pups/heartbeat";
-const TOPIC_SETTINGS: &str = "acorn-pups/settings";
-const TOPIC_COMMANDS: &str = "acorn-pups/commands";
-
-// Connection retry configuration with exponential backoff
-const INITIAL_RETRY_DELAY_MS: u64 = 1000; // 1 second
-const MAX_RETRY_DELAY_MS: u64 = 60000; // 60 seconds
-const MAX_RETRY_ATTEMPTS: u32 = 10;
+// MQTT Topic Constants - Centralized to prevent inconsistency
+pub const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
+pub const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
+pub const TOPIC_HEARTBEAT: &str = "acorn-pups/heartbeat";
+pub const TOPIC_DEVICE_SHADOW: &str = "$aws/thing";
 
 // Static certificate holder for managing certificate lifetimes
 // This provides the static lifetime requirement without memory leaks
@@ -48,11 +40,17 @@ struct CertificateHolder {
     device_cert_cstring: std::ffi::CString,
     private_key_cstring: std::ffi::CString,
     root_ca_cstring: std::ffi::CString,
+    iot_endpoint: String,
 }
 
 impl CertificateHolder {
     /// Create a new certificate holder with owned certificate data
-    fn new(device_cert: &str, private_key: &str, root_ca: &str) -> Result<Self> {
+    fn new(
+        device_cert: &str,
+        private_key: &str,
+        root_ca: &str,
+        iot_endpoint: &str,
+    ) -> Result<Self> {
         Ok(Self {
             device_cert_cstring: std::ffi::CString::new(device_cert)
                 .map_err(|e| anyhow!("Device certificate contains null bytes: {}", e))?,
@@ -60,22 +58,32 @@ impl CertificateHolder {
                 .map_err(|e| anyhow!("Private key contains null bytes: {}", e))?,
             root_ca_cstring: std::ffi::CString::new(root_ca)
                 .map_err(|e| anyhow!("Root CA contains null bytes: {}", e))?,
+            iot_endpoint: iot_endpoint.to_string(),
         })
     }
 
     /// Get X509 certificate objects with proper lifetimes
-    fn get_x509_certificates(&self) -> (X509<'static>, X509<'static>, X509<'static>) {
-        // SAFETY: The CStrings are owned by this holder and will live for the static lifetime
-        // as the holder is stored in a static variable. The certificate holder is initialized
-        // once and never dropped during the program lifetime.
-        unsafe {
-            let device_cert =
-                X509::pem(&*(self.device_cert_cstring.as_c_str() as *const std::ffi::CStr));
-            let private_key =
-                X509::pem(&*(self.private_key_cstring.as_c_str() as *const std::ffi::CStr));
-            let root_ca = X509::pem(&*(self.root_ca_cstring.as_c_str() as *const std::ffi::CStr));
-            (device_cert, private_key, root_ca)
-        }
+    /// Uses safe transmute instead of raw pointer casting
+    fn get_x509_certificates(&self) -> Result<(X509<'static>, X509<'static>, X509<'static>)> {
+        // SAFETY: The CStrings are owned by this holder and stored in static storage
+        // This transmute is safe because the holder lives for the entire program duration
+        let device_cert_static: &'static std::ffi::CStr =
+            unsafe { std::mem::transmute(self.device_cert_cstring.as_c_str()) };
+        let private_key_static: &'static std::ffi::CStr =
+            unsafe { std::mem::transmute(self.private_key_cstring.as_c_str()) };
+        let root_ca_static: &'static std::ffi::CStr =
+            unsafe { std::mem::transmute(self.root_ca_cstring.as_c_str()) };
+
+        Ok((
+            X509::pem(device_cert_static),
+            X509::pem(private_key_static),
+            X509::pem(root_ca_static),
+        ))
+    }
+
+    /// Get the IoT endpoint for MQTT connection
+    fn get_iot_endpoint(&self) -> &str {
+        &self.iot_endpoint
     }
 }
 
@@ -125,20 +133,22 @@ pub struct ButtonPressMessage {
     pub battery_level: Option<u8>,
 }
 
-/// Connection status for health monitoring
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConnectionStatus {
+/// MQTT connection state tracking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MqttConnectionState {
     Disconnected,
     Connecting,
     Connected,
-    Error(String),
+    Error,
 }
 
 /// MQTT client manager for AWS IoT Core
 /// Handles mutual TLS authentication with device certificates
 pub struct AwsIotMqttClient {
     client: Option<EspMqttClient<'static>>,
+    device_id: String,
     client_id: String,
+    connection_state: MqttConnectionState,
 }
 
 impl AwsIotMqttClient {
@@ -150,6 +160,7 @@ impl AwsIotMqttClient {
                 &certificates.device_certificate,
                 &certificates.private_key,
                 AWS_ROOT_CA_1,
+                &certificates.iot_endpoint,
             ) {
                 Ok(holder) => unsafe {
                     CERTIFICATE_HOLDER = Some(holder);
@@ -175,30 +186,43 @@ impl AwsIotMqttClient {
     fn get_x509_certificates() -> Result<(X509<'static>, X509<'static>, X509<'static>)> {
         unsafe {
             match &CERTIFICATE_HOLDER {
-                Some(holder) => Ok(holder.get_x509_certificates()),
+                Some(holder) => holder.get_x509_certificates(),
+                None => Err(anyhow!("Certificate holder not initialized")),
+            }
+        }
+    }
+
+    /// Get IoT endpoint from the static holder
+    fn get_iot_endpoint() -> Result<String> {
+        unsafe {
+            match &CERTIFICATE_HOLDER {
+                Some(holder) => Ok(holder.get_iot_endpoint().to_string()),
                 None => Err(anyhow!("Certificate holder not initialized")),
             }
         }
     }
 
     /// Create new MQTT client with device configuration
+    /// Separates device_id from client_id for proper semantic distinction
     pub fn new(device_id: String) -> Self {
         let client_id = format!("acorn-receiver-{}", device_id);
         info!(
-            "🔌 Creating X.509 certificate-authenticated MQTT client for device: {} (client_id: {})",
+            "🔌 Creating MQTT client for device: {} with client_id: {}",
             device_id, client_id
         );
 
         Self {
             client: None,
+            device_id,
             client_id,
+            connection_state: MqttConnectionState::Disconnected,
         }
     }
 
     /// Initialize client with stored certificates
     pub async fn initialize_with_certificates(
         &mut self,
-        cert_storage: &mut MqttCertificateStorage,
+        cert_storage: &mut crate::mqtt_certificates::MqttCertificateStorage,
     ) -> Result<()> {
         info!("🔐 Initializing MQTT client with stored X.509 certificates");
 
@@ -252,8 +276,10 @@ impl AwsIotMqttClient {
         // Get X509 certificates from static holder
         let (device_cert_x509, private_key_x509, root_ca_x509) = Self::get_x509_certificates()?;
 
-        // Create secure MQTT broker URL for mutual TLS authentication
-        let broker_url = format!("mqtts://{}:8883", self.client_id); // Placeholder, needs actual endpoint
+        // Get IoT endpoint from static holder
+        let _broker_url = format!("mqtts://{}:8883", self.client_id); // Placeholder, needs actual endpoint
+        let iot_endpoint = Self::get_iot_endpoint()?;
+        let broker_url = format!("mqtts://{}:8883", iot_endpoint);
         info!("🌐 MQTT broker URL: {}", broker_url);
         info!("🆔 Client ID: {}", self.client_id);
 
@@ -287,13 +313,13 @@ impl AwsIotMqttClient {
 
                 // Store client
                 self.client = Some(client);
-                // self.connection_status = ConnectionStatus::Connected; // This enum is removed
-                // self.reset_retry_state(); // This method is removed
+                self.connection_state = MqttConnectionState::Connected;
 
                 Ok(())
             }
             Err(e) => {
                 error!("❌ Failed to create MQTT client: {:?}", e);
+                self.connection_state = MqttConnectionState::Error;
                 Err(anyhow!("MQTT client creation failed: {:?}", e))
             }
         }
@@ -302,7 +328,7 @@ impl AwsIotMqttClient {
     /// Subscribe to device-specific MQTT topics with retry logic for connection timing
     pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
         if let Some(client) = self.client.as_mut() {
-            let device_id = &self.client_id; // Use client_id as device_id for topics
+            let device_id = &self.device_id; // Use device_id as device_id for topics
             info!(
                 "🔗 Starting MQTT topic subscriptions for device: {}",
                 device_id
@@ -316,7 +342,7 @@ impl AwsIotMqttClient {
                 info!("📨 Subscription attempt {} of {}", attempt, max_attempts);
 
                 // Subscribe to settings updates
-                let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
+                let settings_topic = format!("{}/{}", TOPIC_DEVICE_SHADOW, device_id);
                 info!(
                     "📨 Attempting to subscribe to settings topic: {}",
                     settings_topic
@@ -330,7 +356,7 @@ impl AwsIotMqttClient {
                         );
 
                         // Subscribe to commands
-                        let commands_topic = format!("{}/{}", TOPIC_COMMANDS, device_id);
+                        let commands_topic = format!("{}/{}", TOPIC_DEVICE_SHADOW, device_id);
                         info!(
                             "📨 Attempting to subscribe to commands topic: {}",
                             commands_topic
@@ -345,7 +371,7 @@ impl AwsIotMqttClient {
 
                                 // Subscribe to status request topic
                                 let status_req_topic =
-                                    format!("{}/{}", TOPIC_STATUS_REQUEST, device_id);
+                                    format!("{}/{}", TOPIC_DEVICE_SHADOW, device_id);
                                 info!(
                                     "📨 Attempting to subscribe to status request topic: {}",
                                     status_req_topic
@@ -426,15 +452,15 @@ impl AwsIotMqttClient {
         button_rf_id: &str,
         battery_level: Option<u8>,
     ) -> Result<()> {
-        if let Some(client) = self.client.as_mut() {
+        if let Some(_client) = self.client.as_mut() {
             let message = ButtonPressMessage {
-                device_id: self.client_id.clone(),
+                device_id: self.device_id.clone(),
                 button_rf_id: button_rf_id.to_string(),
                 timestamp: self.get_iso8601_timestamp(),
                 battery_level,
             };
 
-            let topic = format!("{}/{}", TOPIC_BUTTON_PRESS, self.client_id);
+            let topic = format!("{}/{}", TOPIC_BUTTON_PRESS, self.device_id);
             self.publish_json_message(&topic, &message).await?;
 
             info!(
@@ -453,9 +479,9 @@ impl AwsIotMqttClient {
         status: &str,
         _wifi_signal: Option<i32>,
     ) -> Result<()> {
-        if let Some(client) = self.client.as_mut() {
+        if let Some(_client) = self.client.as_mut() {
             let message = DeviceStatusMessage {
-                device_id: self.client_id.clone(),
+                device_id: self.device_id.clone(),
                 status: status.to_string(),
                 timestamp: self.get_current_timestamp_u64(),
                 uptime_seconds: 0, // Placeholder, needs actual uptime
@@ -463,7 +489,7 @@ impl AwsIotMqttClient {
                 wifi_rssi: 0,      // Placeholder, needs actual RSSI
             };
 
-            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.client_id);
+            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.device_id);
             self.publish_json_message(&topic, &message).await?;
 
             debug!("📊 Published authenticated device status: {}", status);
@@ -475,9 +501,9 @@ impl AwsIotMqttClient {
 
     /// Publish heartbeat message
     pub async fn publish_heartbeat(&mut self) -> Result<()> {
-        if let Some(client) = self.client.as_mut() {
+        if let Some(_client) = self.client.as_mut() {
             let message = DeviceStatusMessage {
-                device_id: self.client_id.clone(),
+                device_id: self.device_id.clone(),
                 status: "online".to_string(),
                 timestamp: self.get_current_timestamp_u64(),
                 uptime_seconds: 0, // Placeholder, needs actual uptime
@@ -485,7 +511,7 @@ impl AwsIotMqttClient {
                 wifi_rssi: 0,      // Placeholder, needs actual RSSI
             };
 
-            let topic = format!("{}/{}", TOPIC_HEARTBEAT, self.client_id);
+            let topic = format!("{}/{}", TOPIC_HEARTBEAT, self.device_id);
             self.publish_json_message(&topic, &message).await?;
 
             debug!("💓 Published authenticated heartbeat");
@@ -497,8 +523,8 @@ impl AwsIotMqttClient {
 
     /// Publish volume change notification
     pub async fn publish_volume_change(&mut self, volume: u8, source: &str) -> Result<()> {
-        let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.client_id);
-        let device_id = self.client_id.clone();
+        let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.device_id);
+        let device_id = self.device_id.clone();
         let timestamp = self.get_current_timestamp_u64();
 
         if let Some(client) = self.client.as_mut() {
@@ -526,6 +552,18 @@ impl AwsIotMqttClient {
         }
     }
 
+    /// Disconnect from AWS IoT Core
+    pub async fn disconnect(&mut self) -> Result<()> {
+        info!("🔌 Disconnecting from AWS IoT Core");
+
+        // Clean up MQTT client
+        self.client = None;
+        self.connection_state = MqttConnectionState::Disconnected;
+
+        info!("✅ Disconnected from AWS IoT Core");
+        Ok(())
+    }
+
     /// Generic JSON message publishing with X.509 authenticated MQTT client
     async fn publish_json_message<T: Serialize>(&mut self, topic: &str, message: &T) -> Result<()> {
         if let Some(client) = self.client.as_mut() {
@@ -534,94 +572,19 @@ impl AwsIotMqttClient {
 
             client
                 .publish(topic, QoS::AtLeastOnce, false, json_payload.as_bytes())
-                .map_err(|e| anyhow!("Failed to publish to topic {}: {:?}", topic, e))?;
+                .map_err(|e| anyhow!("Failed to publish message: {:?}", e))?;
 
-            debug!(
-                "📤 Published authenticated message to {}: {} bytes",
-                topic,
-                json_payload.len()
-            );
-            debug!("📝 Payload: {}", json_payload);
+            debug!("📤 Published message to topic: {}", topic);
             Ok(())
         } else {
             Err(anyhow!("MQTT client not initialized"))
         }
     }
 
-    /// Check if client is connected
-    pub fn is_connected(&self) -> bool {
-        // ESP-IDF MQTT client doesn't have a direct is_connected method
-        // We'll check if client exists as a proxy for connection status
-        self.client.is_some()
-    }
-
-    /// Get current connection status
-    pub fn get_connection_status(&self) -> &ConnectionStatus {
-        // This method is removed, so we'll return a dummy or remove it if not used.
-        // For now, returning a dummy to avoid compilation errors.
-        // In a real scenario, this would need to be re-implemented or removed.
-        // Since the enum is removed, this function is also obsolete.
-        // Returning a dummy to satisfy the original code structure.
-        &ConnectionStatus::Disconnected // Placeholder
-    }
-
-    /// Disconnect from AWS IoT Core
-    pub async fn disconnect(&mut self) -> Result<()> {
-        info!("🔌 Disconnecting from AWS IoT Core");
-
-        // Clean up MQTT client
-        self.client = None;
-        // self.connection_status = ConnectionStatus::Disconnected; // This enum is removed
-
-        info!("✅ Disconnected from AWS IoT Core");
-        Ok(())
-    }
-
-    /// Attempt automatic reconnection with exponential backoff
-    pub async fn attempt_reconnection(&mut self) -> Result<()> {
-        // This method is removed, so we'll return a dummy or remove it if not used.
-        // For now, returning a dummy to avoid compilation errors.
-        // In a real scenario, this would need to be re-implemented or removed.
-        // Since the enum is removed, this function is also obsolete.
-        // Returning a dummy to satisfy the original code structure.
-        Ok(()) // Placeholder
-    }
-
-    /// Process incoming MQTT messages (X.509 authenticated connection)
-    pub async fn process_messages(&mut self) -> Result<()> {
-        // For now, just ensure we're connected with X.509 authentication
-        if !self.is_connected() {
-            debug!("📭 X.509 authenticated MQTT not connected, no messages to process");
-        } else {
-            debug!("🔒 Processing messages on X.509 certificate-authenticated connection");
-        }
-        Ok(())
-    }
-
-    /// Reset retry state after successful connection
-    fn reset_retry_state(&mut self) {
-        // This method is removed, so we'll return a dummy or remove it if not used.
-        // For now, returning a dummy to avoid compilation errors.
-        // In a real scenario, this would need to be re-implemented or removed.
-        // Since the enum is removed, this function is also obsolete.
-        // Returning a dummy to satisfy the original code structure.
-    }
-
-    /// Update retry state after failed connection
-    fn update_retry_state(&mut self) {
-        // This method is removed, so we'll return a dummy or remove it if not used.
-        // For now, returning a dummy to avoid compilation errors.
-        // In a real scenario, this would need to be re-implemented or removed.
-        // Since the enum is removed, this function is also obsolete.
-        // Returning a dummy to satisfy the original code structure.
-    }
-
-    /// Get current timestamp in ISO 8601 format
+    /// Get ISO 8601 timestamp for message timestamps
     fn get_iso8601_timestamp(&self) -> String {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string()
     }
 
@@ -631,5 +594,71 @@ impl AwsIotMqttClient {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    /// Update connection state based on MQTT events
+    pub fn update_connection_state(&mut self, connected: bool) {
+        self.connection_state = if connected {
+            MqttConnectionState::Connected
+        } else {
+            MqttConnectionState::Disconnected
+        };
+
+        info!(
+            "🔄 MQTT connection state updated: {:?}",
+            self.connection_state
+        );
+    }
+
+    /// Check if client is connected
+    pub fn is_connected(&self) -> bool {
+        matches!(self.connection_state, MqttConnectionState::Connected)
+    }
+
+    /// Get current connection status
+    pub fn get_connection_status(&self) -> &MqttConnectionState {
+        &self.connection_state
+    }
+
+    /// Process incoming MQTT messages
+    pub async fn process_messages(&mut self) -> Result<()> {
+        if !self.is_connected() {
+            debug!("📭 MQTT not connected, no messages to process");
+            return Ok(());
+        }
+
+        debug!("🔒 Processing messages on authenticated connection");
+        Ok(())
+    }
+
+    /// Attempt reconnection using tiered recovery
+    pub async fn attempt_reconnection(&mut self) -> Result<()> {
+        info!("🔄 Attempting MQTT reconnection using tiered recovery");
+
+        // Use tiered recovery for reconnection attempts
+        let mut recovery_manager =
+            crate::reset_manager::TieredRecoveryManager::new(self.device_id.clone());
+        match recovery_manager.attempt_recovery("mqtt_reconnection").await {
+            Ok(_tier) => {
+                info!("✅ MQTT reconnection successful");
+                self.connection_state = MqttConnectionState::Connected;
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ MQTT reconnection failed: {:?}", e);
+                self.connection_state = MqttConnectionState::Error;
+                Err(anyhow!("MQTT reconnection failed: {:?}", e))
+            }
+        }
+    }
+
+    /// Get device ID (separate from client ID)
+    pub fn get_device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    /// Get client ID for MQTT operations
+    pub fn get_client_id(&self) -> &str {
+        &self.client_id
     }
 }

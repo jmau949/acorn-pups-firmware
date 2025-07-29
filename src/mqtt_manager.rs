@@ -18,7 +18,7 @@ use anyhow::{anyhow, Result};
 
 // Import our MQTT client and certificate management modules
 use crate::mqtt_certificates::MqttCertificateStorage;
-use crate::mqtt_client::{AwsIotMqttClient, ConnectionStatus};
+use crate::mqtt_client::{AwsIotMqttClient, MqttConnectionState};
 
 // Import existing system events for integration
 // System events imported where needed
@@ -275,7 +275,7 @@ impl MqttManager {
         let status = self.client.get_connection_status();
 
         match status {
-            ConnectionStatus::Connected => {
+            MqttConnectionState::Connected => {
                 debug!("💚 MQTT connection healthy");
 
                 // Process any pending messages
@@ -284,20 +284,22 @@ impl MqttManager {
                 }
             }
 
-            ConnectionStatus::Disconnected => {
+            MqttConnectionState::Disconnected => {
                 info!("🔄 MQTT disconnected, attempting reconnection");
                 if let Err(e) = self.attempt_reconnection().await {
                     warn!("⚠️ Reconnection failed: {}", e);
                 }
             }
 
-            ConnectionStatus::Connecting => {
+            MqttConnectionState::Connecting => {
                 debug!("🔄 MQTT connection in progress");
             }
 
-            ConnectionStatus::Error(ref error) => {
-                warn!("❌ MQTT connection error: {}", error);
-                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(error.clone()));
+            MqttConnectionState::Error => {
+                warn!("❌ MQTT connection error detected");
+                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(
+                    "MQTT connection error".to_string(),
+                ));
 
                 // Attempt recovery
                 if let Err(e) = self.force_reconnection().await {

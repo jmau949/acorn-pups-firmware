@@ -151,7 +151,6 @@ impl MqttCertificateStorage {
             "📜 Certificate fingerprint: {}",
             &metadata.certificate_fingerprint[..16]
         );
-        info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
 
         Ok(())
     }
@@ -161,99 +160,92 @@ impl MqttCertificateStorage {
     pub fn load_certificates(&mut self) -> Result<Option<DeviceCertificates>, EspError> {
         info!("🔍 Loading AWS IoT Core certificates from NVS");
 
-        // Check if certificates exist
-        if !self.certificates_exist() {
-            info!("📭 No stored certificates found");
+        // Check if certificates exist using efficient probe
+        if !self.certificates_exist()? {
+            info!("📭 No certificates found in NVS storage");
             return Ok(None);
         }
 
-        // Load certificate components
-        let mut cert_buffer = [0u8; 2048];
-        let device_certificate = match self.nvs.get_str(DEVICE_CERT_KEY, &mut cert_buffer) {
-            Ok(Some(cert)) => cert,
-            Ok(None) => {
-                warn!("⚠️ Device certificate not found in storage");
-                return Ok(None);
-            }
-            Err(e) => {
-                error!("❌ Failed to load device certificate: {:?}", e);
-                return Err(e);
-            }
-        };
+        // Load certificate components with appropriate buffer sizes
+        let device_certificate =
+            self.load_certificate_component(DEVICE_CERT_KEY, "device certificate")?;
+        let private_key = self.load_certificate_component(PRIVATE_KEY_KEY, "private key")?;
+        let iot_endpoint = self.load_certificate_component(IOT_ENDPOINT_KEY, "IoT endpoint")?;
 
-        let mut key_buffer = [0u8; 2048];
-        let private_key = match self.nvs.get_str(PRIVATE_KEY_KEY, &mut key_buffer) {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                warn!("⚠️ Private key not found in storage");
-                return Ok(None);
-            }
-            Err(e) => {
-                error!("❌ Failed to load private key: {:?}", e);
-                return Err(e);
-            }
-        };
-
-        let mut endpoint_buffer = [0u8; 256];
-        let iot_endpoint = match self.nvs.get_str(IOT_ENDPOINT_KEY, &mut endpoint_buffer) {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => {
-                warn!("⚠️ IoT endpoint not found in storage");
-                return Ok(None);
-            }
-            Err(e) => {
-                error!("❌ Failed to load IoT endpoint: {:?}", e);
-                return Err(e);
-            }
-        };
+        // Load and validate metadata
+        if let Ok(Some(metadata)) = self.get_certificate_metadata() {
+            info!("✅ Certificate metadata loaded successfully");
+            info!("📅 Stored at: {}", metadata.stored_at);
+            info!("🌐 IoT endpoint: {}", metadata.iot_endpoint);
+        } else {
+            warn!("⚠️ Certificate metadata missing or corrupted");
+        }
 
         let certificates = DeviceCertificates {
-            device_certificate: device_certificate.to_string(),
-            private_key: private_key.to_string(),
-            iot_endpoint: iot_endpoint.to_string(),
+            device_certificate,
+            private_key,
+            iot_endpoint,
         };
 
-        // Validate loaded certificates
-        match self.validate_certificate_format(&certificates) {
-            Ok(_) => {
-                info!("✅ Certificates loaded and validated successfully");
-                self.update_last_used_timestamp()?;
-                Ok(Some(certificates))
-            }
-            Err(validation_result) => {
-                warn!(
-                    "⚠️ Loaded certificates failed validation: {:?}",
-                    validation_result
-                );
-                Ok(None)
-            }
-        }
+        info!("✅ AWS IoT Core certificates loaded successfully");
+        Ok(Some(certificates))
     }
 
-    /// Get certificate size by attempting to load with 1-byte buffer
-    /// Returns required size or defaults to 2048 for safety
-    fn get_certificate_size(&mut self, key: &str) -> usize {
-        // Try with 1-byte buffer to trigger size error
-        let mut tiny_buffer = [0u8; 1];
-        match self.nvs.get_str(key, &mut tiny_buffer) {
-            Err(e) => {
-                // Check if error indicates insufficient buffer space
-                debug!(
-                    "🔍 NVS get_str error (expected for size detection): {:?}",
-                    e
-                );
-                // For any error with tiny buffer, assume certificate exists and is larger
-                // Default to 2048 bytes for safety
-                2048
-            }
-            Ok(Some(_)) => {
-                // Certificate fits in 1 byte (impossible for real certs), use default
-                warn!("⚠️ Certificate unexpectedly small, using default buffer size");
-                2048
-            }
-            Ok(None) => {
-                // Certificate doesn't exist
-                0
+    /// Efficiently check if certificates exist using small probe buffers
+    /// Avoids allocating large buffers for existence checks
+    pub fn certificates_exist(&mut self) -> Result<bool, EspError> {
+        // Use small probe buffer to check key existence
+        const PROBE_BUFFER_SIZE: usize = 16;
+        let mut probe_buffer = [0u8; PROBE_BUFFER_SIZE];
+
+        // Check if required certificate keys exist
+        let device_cert_exists = self.nvs.get_str(DEVICE_CERT_KEY, &mut probe_buffer).is_ok();
+        let private_key_exists = self.nvs.get_str(PRIVATE_KEY_KEY, &mut probe_buffer).is_ok();
+        let iot_endpoint_exists = self
+            .nvs
+            .get_str(IOT_ENDPOINT_KEY, &mut probe_buffer)
+            .is_ok();
+
+        Ok(device_cert_exists && private_key_exists && iot_endpoint_exists)
+    }
+
+    /// Load certificate component with appropriate buffer sizing
+    fn load_certificate_component(
+        &mut self,
+        key: &str,
+        component_name: &str,
+    ) -> Result<String, EspError> {
+        // Start with a reasonable buffer size and grow if needed
+        let mut buffer_size = 2048; // Most certificates fit in 2KB
+        loop {
+            let mut buffer = vec![0u8; buffer_size];
+
+            match self.nvs.get_str(key, &mut buffer) {
+                Ok(Some(value)) => {
+                    info!("📋 Loaded {}: {} bytes", component_name, value.len());
+                    return Ok(value.to_string());
+                }
+                Ok(None) => {
+                    error!("❌ {} not found in storage", component_name);
+                    return Err(EspError::from_infallible::<
+                        { esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND },
+                    >());
+                }
+                Err(_e) => {
+                    // Try with larger buffer if current one wasn't sufficient
+                    if buffer_size < 8192 {
+                        buffer_size *= 2;
+                        continue;
+                    } else {
+                        error!(
+                            "❌ Failed to load {} after trying up to {} bytes",
+                            component_name, buffer_size
+                        );
+                        return Err(EspError::from_infallible::<
+                            { esp_idf_svc::sys::ESP_ERR_NO_MEM },
+                        >());
+                    }
+                }
             }
         }
     }
@@ -264,15 +256,15 @@ impl MqttCertificateStorage {
         info!("🔍 Loading AWS IoT Core certificates with optimized buffer sizing");
 
         // Check if certificates exist
-        if !self.certificates_exist() {
+        if !self.certificates_exist().unwrap_or(false) {
             info!("📭 No stored certificates found");
             return Ok(None);
         }
 
-        // Get optimized buffer sizes (with fallback to reasonable defaults)
-        let cert_size = std::cmp::max(self.get_certificate_size(DEVICE_CERT_KEY), 1500);
-        let key_size = std::cmp::max(self.get_certificate_size(PRIVATE_KEY_KEY), 1700);
-        let endpoint_size = std::cmp::max(self.get_certificate_size(IOT_ENDPOINT_KEY), 256);
+        // Use reasonable buffer sizes for certificate components
+        let cert_size = 2048; // Standard certificate size
+        let key_size = 2048; // Standard private key size
+        let endpoint_size = 256; // IoT endpoint URL size
 
         debug!(
             "📏 Using buffer sizes - cert: {}, key: {}, endpoint: {}",
@@ -345,100 +337,6 @@ impl MqttCertificateStorage {
                 );
                 Ok(None)
             }
-        }
-    }
-
-    /// Check if certificates exist in storage
-    pub fn certificates_exist(&mut self) -> bool {
-        info!("🔍 Checking if certificates exist in NVS storage");
-
-        // Check validation flag first
-        let validation_flag = match self.nvs.get_u8(CERT_VALIDATION_KEY) {
-            Ok(Some(value)) => {
-                info!("📋 Validation flag value: {}", value);
-                value
-            }
-            Ok(None) => {
-                warn!("⚠️ Validation flag not found in storage");
-                0
-            }
-            Err(e) => {
-                error!("❌ Error reading validation flag: {:?}", e);
-                0
-            }
-        };
-
-        if validation_flag == 1 {
-            info!("✅ Validation flag indicates certificates should exist");
-
-            // Check if all required components exist by using proper buffer sizes
-            // Use larger buffers to avoid ESP_ERR_NVS_INVALID_LENGTH
-            let cert_exists = {
-                let mut buffer = vec![0u8; 2048]; // Large enough buffer for certificates
-                match self.nvs.get_str(DEVICE_CERT_KEY, &mut buffer) {
-                    Ok(Some(_)) => {
-                        info!("✅ Device certificate key exists");
-                        true
-                    }
-                    Ok(None) => {
-                        warn!("⚠️ Device certificate key not found");
-                        false
-                    }
-                    Err(e) => {
-                        error!("❌ Error checking device certificate existence: {:?}", e);
-                        false
-                    }
-                }
-            };
-
-            let key_exists = {
-                let mut buffer = vec![0u8; 2048]; // Large enough buffer for private keys
-                match self.nvs.get_str(PRIVATE_KEY_KEY, &mut buffer) {
-                    Ok(Some(_)) => {
-                        info!("✅ Private key exists");
-                        true
-                    }
-                    Ok(None) => {
-                        warn!("⚠️ Private key not found");
-                        false
-                    }
-                    Err(e) => {
-                        error!("❌ Error checking private key existence: {:?}", e);
-                        false
-                    }
-                }
-            };
-
-            let endpoint_exists = {
-                let mut buffer = [0u8; 256]; // Smaller buffer for endpoint URLs
-                match self.nvs.get_str(IOT_ENDPOINT_KEY, &mut buffer) {
-                    Ok(Some(_)) => {
-                        info!("✅ IoT endpoint exists");
-                        true
-                    }
-                    Ok(None) => {
-                        warn!("⚠️ IoT endpoint not found");
-                        false
-                    }
-                    Err(e) => {
-                        error!("❌ Error checking IoT endpoint existence: {:?}", e);
-                        false
-                    }
-                }
-            };
-
-            let all_exist = cert_exists && key_exists && endpoint_exists;
-            info!(
-                "📊 Certificate existence summary: cert={}, key={}, endpoint={}, all={}",
-                cert_exists, key_exists, endpoint_exists, all_exist
-            );
-            all_exist
-        } else {
-            warn!(
-                "⚠️ Validation flag is {} (expected 1), certificates marked as invalid or missing",
-                validation_flag
-            );
-            false
         }
     }
 
