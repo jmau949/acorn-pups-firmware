@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 // Import our certificate management module
 use crate::device_api::DeviceCertificates;
 
+use std::sync::OnceLock;
+
 // MQTT Topic Constants - Centralized to prevent inconsistency
 pub const TOPIC_STATUS_REQUEST: &str = "acorn-pups/status-request";
 pub const TOPIC_SETTINGS: &str = "acorn-pups/settings";
@@ -64,21 +66,22 @@ impl CertificateHolder {
     }
 
     /// Get X509 certificate objects with proper lifetimes
-    /// Uses safe transmute instead of raw pointer casting
+    /// Uses safe static initialization via OnceLock instead of unsafe transmute
     fn get_x509_certificates(&self) -> Result<(X509<'static>, X509<'static>, X509<'static>)> {
-        // SAFETY: The CStrings are owned by this holder and stored in static storage
-        // This transmute is safe because the holder lives for the entire program duration
-        let device_cert_static: &'static std::ffi::CStr =
-            unsafe { std::mem::transmute(self.device_cert_cstring.as_c_str()) };
-        let private_key_static: &'static std::ffi::CStr =
-            unsafe { std::mem::transmute(self.private_key_cstring.as_c_str()) };
-        let root_ca_static: &'static std::ffi::CStr =
-            unsafe { std::mem::transmute(self.root_ca_cstring.as_c_str()) };
+        // Use OnceLock for safe static storage of certificate references
+        static DEVICE_CERT: OnceLock<std::ffi::CString> = OnceLock::new();
+        static PRIVATE_KEY: OnceLock<std::ffi::CString> = OnceLock::new();
+        static ROOT_CA: OnceLock<std::ffi::CString> = OnceLock::new();
+
+        // Store certificates in static storage - this ensures 'static lifetime
+        let device_cert_static = DEVICE_CERT.get_or_init(|| self.device_cert_cstring.clone());
+        let private_key_static = PRIVATE_KEY.get_or_init(|| self.private_key_cstring.clone());
+        let root_ca_static = ROOT_CA.get_or_init(|| self.root_ca_cstring.clone());
 
         Ok((
-            X509::pem(device_cert_static),
-            X509::pem(private_key_static),
-            X509::pem(root_ca_static),
+            X509::pem(device_cert_static.as_c_str()),
+            X509::pem(private_key_static.as_c_str()),
+            X509::pem(root_ca_static.as_c_str()),
         ))
     }
 

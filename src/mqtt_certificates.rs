@@ -414,11 +414,15 @@ impl MqttCertificateStorage {
         );
         info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
 
-        // Full certificate logging for debugging (no truncation)
-        info!("📜 FULL DEVICE CERTIFICATE:");
-        info!("{}", certificates.device_certificate);
-        info!("🔑 FULL PRIVATE KEY:");
-        info!("{}", certificates.private_key);
+        // Certificate validation logging (without exposing full content for security)
+        info!(
+            "📜 Device certificate loaded - length: {} bytes",
+            certificates.device_certificate.len()
+        );
+        info!(
+            "🔑 Private key loaded - length: {} bytes",
+            certificates.private_key.len()
+        );
 
         // Trim whitespace from certificates for validation
         let device_cert = certificates.device_certificate.trim();

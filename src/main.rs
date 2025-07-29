@@ -91,11 +91,13 @@ use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
 use reset_handler::ResetHandler; // Reset behavior execution
                                  // Note: ResetNotificationData no longer needed with new architecture
-use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring
+use reset_manager::{
+    RecoverySystemComponents, ResetManager, ResetManagerEvent, TieredRecoveryManager,
+}; // Reset button monitoring and tiered recovery
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 // Import our reset manager with tiered recovery
-use crate::reset_manager::{RecoveryTier, TieredRecoveryManager};
+use crate::reset_manager::RecoveryTier;
 
 // Helper functions to get real device information
 fn get_device_serial_number() -> String {
@@ -627,27 +629,55 @@ async fn main(spawner: Spawner) {
             SystemEvent::SystemError(error) => {
                 error!("💥 System error: {}", error);
 
-                // Check if this is an MQTT-related error that requires factory reset
+                // Check if this is an MQTT-related error that requires recovery
                 if error.contains("MQTT connection failed") {
-                    error!("🔄 MQTT connection failure detected - triggering factory reset");
-                    error!("📱 Device will reset to BLE provisioning mode");
+                    error!("🔄 MQTT connection failure detected - using tiered recovery system");
 
-                    // Get device ID and NVS partition for factory reset
+                    // Initialize tiered recovery manager with system components
                     let device_id = generate_device_id();
+                    let mut recovery_manager = TieredRecoveryManager::new(device_id);
 
-                    // Take a new NVS partition for the reset
-                    match EspDefaultNvsPartition::take() {
-                        Ok(nvs_partition) => {
-                            // Perform factory reset directly
-                            perform_mqtt_failure_factory_reset(device_id, nvs_partition).await;
+                    // Set up recovery system components
+                    let nvs_partition = match EspDefaultNvsPartition::take() {
+                        Ok(partition) => partition,
+                        Err(e) => {
+                            error!("❌ Failed to take NVS partition for recovery: {:?}", e);
+                            warn!("⚠️ Continuing without tiered recovery");
+                            continue;
+                        }
+                    };
 
-                            // Restart device after reset
-                            restart_device("MQTT connection failed - factory reset completed")
-                                .await;
+                    let certificate_storage = match MqttCertificateStorage::new() {
+                        Ok(storage) => Some(storage),
+                        Err(e) => {
+                            error!(
+                                "❌ Failed to initialize certificate storage for recovery: {:?}",
+                                e
+                            );
+                            None
+                        }
+                    };
+
+                    let components = RecoverySystemComponents {
+                        certificate_storage,
+                    };
+
+                    recovery_manager.set_system_components(components);
+
+                    // Attempt tiered recovery instead of immediate factory reset
+                    match recovery_manager
+                        .attempt_recovery("MQTT connection failed")
+                        .await
+                    {
+                        Ok(recovery_tier) => {
+                            info!("✅ Recovery completed at tier: {:?}", recovery_tier);
+                            info!("📡 System should be operational again");
                         }
                         Err(e) => {
-                            error!("❌ Failed to take NVS partition for reset: {:?}", e);
-                            restart_device("MQTT failure - forced restart").await;
+                            error!("❌ All recovery tiers exhausted: {}", e);
+                            error!("🔄 System will perform emergency restart");
+                            restart_device("All recovery options exhausted - emergency restart")
+                                .await;
                         }
                     }
                 } else {
