@@ -279,20 +279,57 @@ impl AwsIotMqttClient {
             Ok((mut client, mut connection)) => {
                 info!("✅ ESP-IDF MQTT client created successfully");
 
-                // Wait for connection establishment with detailed logging
-                info!("⏳ Waiting for MQTT connection to be established...");
+                // Wait explicitly for the MQTT_EVENT_CONNECTED event so that we are
+                // absolutely sure that the broker handshake has finished before
+                // proceeding with subscriptions or publishes. This avoids the common
+                // trap where the client object exists but the underlying connection
+                // is still negotiating TLS or MQTT parameters.
+                use esp_idf_svc::mqtt::client::EventPayload;
+                use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-                // Give the connection time to establish before checking state
-                Timer::after(Duration::from_secs(5)).await;
+                self.connection_status = ConnectionStatus::Connecting;
 
-                // Try to verify connection by attempting a simple operation
-                info!("🔍 Verifying connection by testing client state...");
+                let timeout = StdDuration::from_secs(30);
+                let start = StdInstant::now();
+                let mut connected_confirmed = false;
 
-                // Since ESP-IDF MQTT connection verification is complex, we'll rely on
-                // the subscription attempt to verify the actual connection state
-                info!("✅ MQTT client created - connection state will be verified during subscription");
+                while start.elapsed() < timeout {
+                    match connection.next() {
+                        Ok(event) => {
+                            match event.payload() {
+                                EventPayload::Connected(_) => {
+                                    connected_confirmed = true;
+                                    break;
+                                }
+                                EventPayload::Disconnected => {
+                                    error!("🔌 Received unexpected DISCONNECTED event during connection phase");
+                                    break;
+                                }
+                                _ => {
+                                    // Ignore other events while waiting
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // If no event is available yet, yield and continue (EAGAIN / WouldBlock)
+                            if e.code() == 11 {
+                                // ESP_ERR_TIMEOUT / EAGAIN equivalent
+                                // Briefly yield to allow other tasks
+                                embassy_time::Timer::after(embassy_time::Duration::from_millis(50))
+                                    .await;
+                                continue;
+                            }
+                            error!("❌ Error while waiting for connection event: {:?}", e);
+                            break;
+                        }
+                    }
+                }
 
-                // Store client
+                if !connected_confirmed {
+                    return Err(anyhow!("Timeout waiting for MQTT_EVENT_CONNECTED"));
+                }
+
+                // Store client only after the connection has been positively confirmed.
                 self.client = Some(client);
                 self.connection_status = ConnectionStatus::Connected;
                 self.reset_retry_state();
