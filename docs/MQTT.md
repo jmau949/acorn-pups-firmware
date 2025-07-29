@@ -238,7 +238,6 @@ The application uses a structured topic hierarchy for AWS IoT Core communication
 // MQTT topic patterns following AWS IoT Core conventions
 const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
 const TOPIC_DEVICE_STATUS: &str = "acorn-pups/status";
-const TOPIC_HEARTBEAT: &str = "acorn-pups/heartbeat";
 const TOPIC_SETTINGS: &str = "acorn-pups/settings";
 const TOPIC_COMMANDS: &str = "acorn-pups/commands";
 ```
@@ -246,7 +245,6 @@ const TOPIC_COMMANDS: &str = "acorn-pups/commands";
 **Device-Specific Topics:**
 - `acorn-pups/button-press/{device_id}` - Button press events
 - `acorn-pups/status/{device_id}` - Device status updates
-- `acorn-pups/heartbeat/{device_id}` - Periodic heartbeat messages
 - `acorn-pups/settings/{device_id}` - Configuration updates (subscribed)
 - `acorn-pups/commands/{device_id}` - Remote commands (subscribed)
 
@@ -419,7 +417,6 @@ pub enum ConnectionStatus {
 ```rust
 // Regular connection health checks
 const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30;
-const HEARTBEAT_INTERVAL_SECONDS: u64 = 300;    // 5 minutes
 
 async fn check_connection_health(&mut self) {
     match self.client.get_connection_status() {

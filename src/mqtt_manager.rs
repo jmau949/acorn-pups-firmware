@@ -18,15 +18,14 @@ use anyhow::{anyhow, Result};
 
 // Import our MQTT client and certificate management modules
 use crate::mqtt_certificates::MqttCertificateStorage;
-use crate::mqtt_client::{AwsIotMqttClient, ConnectionStatus};
+use crate::mqtt_client::{AwsIotMqttClient, MqttConnectionState};
 
 // Import existing system events for integration
 // System events imported where needed
 
 // MQTT manager configuration constants
 const MQTT_MESSAGE_QUEUE_SIZE: usize = 32; // Channel capacity for message queue
-const HEARTBEAT_INTERVAL_SECONDS: u64 = 300; // 5 minutes
-const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30; // 30 seconds
+const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30; // Check connection health every 30 seconds
 const MESSAGE_TIMEOUT_SECONDS: u64 = 10; // Timeout for message operations
 
 // MQTT message types for internal communication
@@ -44,7 +43,6 @@ pub enum MqttMessage {
         volume: u8,
         source: String,
     },
-    Heartbeat,
     Connect,
     Disconnect,
     ForceReconnect,
@@ -79,7 +77,6 @@ pub struct MqttManager {
     client: AwsIotMqttClient,
     cert_storage: Option<MqttCertificateStorage>,
     is_initialized: bool,
-    last_heartbeat: Option<embassy_time::Instant>,
     last_connection_check: Option<embassy_time::Instant>,
 }
 
@@ -95,7 +92,6 @@ impl MqttManager {
             client,
             cert_storage: None,
             is_initialized: false,
-            last_heartbeat: None,
             last_connection_check: None,
         }
     }
@@ -147,9 +143,27 @@ impl MqttManager {
 
         info!("🚀 Starting MQTT manager main loop");
 
-        // Attempt initial connection
-        if let Err(e) = self.attempt_connection().await {
-            warn!("⚠️ Initial MQTT connection failed: {}", e);
+        // Attempt initial connection with detailed error handling
+        match self.attempt_connection().await {
+            Ok(_) => {
+                info!("✅ Initial MQTT connection successful - entering main loop");
+            }
+            Err(e) => {
+                error!("❌ Initial MQTT connection failed: {}", e);
+                error!("💥 MQTT connection is critical - triggering factory reset");
+                error!("🔄 Device will reset to BLE provisioning mode");
+
+                // Signal MQTT failure to trigger factory reset
+                crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(format!(
+                    "MQTT connection failed: {}",
+                    e
+                )));
+
+                // Give time for the signal to be processed
+                Timer::after(Duration::from_secs(2)).await;
+
+                return Err(anyhow!("MQTT connection failed - factory reset triggered"));
+            }
         }
 
         loop {
@@ -157,7 +171,6 @@ impl MqttManager {
             // This avoids multiple mutable borrow issues with select!
             self.process_message_queue().await;
             self.check_connection_health().await;
-            self.handle_periodic_heartbeat().await;
             self.handle_system_events().await;
         }
     }
@@ -205,8 +218,6 @@ impl MqttManager {
             MqttMessage::VolumeChange { volume, source } => {
                 self.client.publish_volume_change(volume, &source).await
             }
-
-            MqttMessage::Heartbeat => self.client.publish_heartbeat().await,
 
             MqttMessage::Connect => self.attempt_connection().await,
 
@@ -257,7 +268,7 @@ impl MqttManager {
         let status = self.client.get_connection_status();
 
         match status {
-            ConnectionStatus::Connected => {
+            MqttConnectionState::Connected => {
                 debug!("💚 MQTT connection healthy");
 
                 // Process any pending messages
@@ -266,52 +277,27 @@ impl MqttManager {
                 }
             }
 
-            ConnectionStatus::Disconnected => {
+            MqttConnectionState::Disconnected => {
                 info!("🔄 MQTT disconnected, attempting reconnection");
                 if let Err(e) = self.attempt_reconnection().await {
                     warn!("⚠️ Reconnection failed: {}", e);
                 }
             }
 
-            ConnectionStatus::Connecting => {
+            MqttConnectionState::Connecting => {
                 debug!("🔄 MQTT connection in progress");
             }
 
-            ConnectionStatus::Error(ref error) => {
-                warn!("❌ MQTT connection error: {}", error);
-                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(error.clone()));
+            MqttConnectionState::Error => {
+                warn!("❌ MQTT connection error detected");
+                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(
+                    "MQTT connection error".to_string(),
+                ));
 
                 // Attempt recovery
                 if let Err(e) = self.force_reconnection().await {
                     error!("❌ Failed to recover from connection error: {}", e);
                 }
-            }
-        }
-    }
-
-    /// Handle periodic heartbeat messages
-    async fn handle_periodic_heartbeat(&mut self) {
-        let now = embassy_time::Instant::now();
-
-        // Check if it's time for a heartbeat
-        if let Some(last_heartbeat) = self.last_heartbeat {
-            if now.duration_since(last_heartbeat) < Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS)
-            {
-                // Not time for heartbeat yet, yield to avoid busy waiting
-                Timer::after(Duration::from_millis(100)).await;
-                return;
-            }
-        }
-
-        self.last_heartbeat = Some(now);
-
-        // Send heartbeat if connected
-        if self.client.is_connected() {
-            debug!("💓 Sending periodic heartbeat");
-
-            // Queue heartbeat message instead of blocking
-            if let Err(e) = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::Heartbeat) {
-                warn!("⚠️ Failed to queue heartbeat message: {:?}", e);
             }
         }
     }
@@ -333,6 +319,22 @@ impl MqttManager {
             Ok(_) => {
                 info!("✅ MQTT connected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
+
+                // Attempt topic subscriptions with retry logic
+                info!("📨 Starting topic subscriptions after successful connection");
+                match self.client.subscribe_to_device_topics().await {
+                    Ok(_) => {
+                        info!("✅ All MQTT topic subscriptions completed successfully");
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to subscribe to MQTT topics: {}", e);
+                        // This is a critical failure - trigger factory reset
+                        crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(
+                            format!("MQTT subscription failed: {}", e),
+                        ));
+                        return Err(anyhow!("MQTT subscription failed: {}", e));
+                    }
+                }
 
                 // Send initial device status
                 let _ = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::DeviceStatus {
@@ -389,9 +391,12 @@ impl MqttManager {
             MqttMessage::ButtonPress { .. } => {
                 format!("acorn-pups/button-press/{}", self.device_id)
             }
-            MqttMessage::DeviceStatus { .. } => format!("acorn-pups/status/{}", self.device_id),
-            MqttMessage::VolumeChange { .. } => format!("acorn-pups/status/{}", self.device_id),
-            MqttMessage::Heartbeat => format!("acorn-pups/heartbeat/{}", self.device_id),
+            MqttMessage::DeviceStatus { .. } => {
+                format!("acorn-pups/status-response/{}", self.device_id)
+            }
+            MqttMessage::VolumeChange { .. } => {
+                format!("acorn-pups/status-response/{}", self.device_id)
+            }
             _ => "system".to_string(),
         }
     }
