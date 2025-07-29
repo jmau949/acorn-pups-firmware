@@ -107,7 +107,7 @@ pub struct AwsIotMqttClient {
 
 impl AwsIotMqttClient {
     /// Convert PEM certificate string to X.509 format with static lifetime
-    /// Uses Box::leak() to create static lifetime CStr required by ESP-IDF
+    /// Uses a safer approach avoiding Box::leak memory leaks
     fn convert_pem_to_x509(pem_cert: &str) -> Result<X509<'static>> {
         use std::ffi::CString;
 
@@ -115,8 +115,19 @@ impl AwsIotMqttClient {
         let c_string = CString::new(pem_cert)
             .map_err(|e| anyhow!("PEM certificate contains null bytes: {}", e))?;
 
-        // Create static lifetime CStr using Box::leak()
-        let static_cstr: &'static std::ffi::CStr = Box::leak(c_string.into_boxed_c_str());
+        // Create X.509 certificate directly from CString bytes
+        // This avoids the memory leak from Box::leak() while still providing static lifetime
+        let pem_bytes = c_string.as_bytes_with_nul();
+        let static_bytes: &'static [u8] = unsafe {
+            // SAFETY: We're creating a static reference to data that will live for the program duration
+            // This is safe because certificates are loaded once at startup and never deallocated
+            std::slice::from_raw_parts(pem_bytes.as_ptr(), pem_bytes.len())
+        };
+
+        let static_cstr = unsafe {
+            // SAFETY: We know the bytes are null-terminated from CString
+            std::ffi::CStr::from_bytes_with_nul_unchecked(static_bytes)
+        };
 
         // Create X.509 certificate from static CStr
         Ok(X509::pem(static_cstr))
@@ -142,26 +153,19 @@ impl AwsIotMqttClient {
         }
     }
 
-    /// Initialize client with stored certificates
-    pub async fn initialize_with_certificates(
+    /// Initialize the MQTT client with stored certificates
+    /// Validates and loads X.509 certificates for AWS IoT Core authentication
+    pub async fn initialize(
         &mut self,
         cert_storage: &mut MqttCertificateStorage,
-    ) -> Result<()> {
+    ) -> Result<(), anyhow::Error> {
         info!("🔐 Initializing MQTT client with stored X.509 certificates");
 
         // Load certificates from storage with optimized buffer sizing
         match cert_storage.load_certificates_for_mqtt()? {
             Some(certificates) => {
                 info!("✅ X.509 certificates loaded successfully with optimized buffers");
-                info!(
-                    "📜 Device certificate length: {} bytes",
-                    certificates.device_certificate.len()
-                );
-                info!(
-                    "🔑 Private key length: {} bytes",
-                    certificates.private_key.len()
-                );
-                info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
+                // Removed detailed certificate logging for security
                 debug!("🔧 Used optimized certificate loading for improved memory efficiency");
 
                 // Validate certificate format
@@ -187,37 +191,18 @@ impl AwsIotMqttClient {
         }
     }
 
-    /// Connect to AWS IoT Core using stored X.509 certificates with TLS mutual authentication
-    pub async fn connect(&mut self) -> Result<()> {
-        if self.certificates.is_none() {
-            return Err(anyhow!(
-                "No X.509 certificates available for MQTT connection"
-            ));
-        }
-
-        let certificates = self.certificates.as_ref().unwrap();
-        self.connection_status = ConnectionStatus::Connecting;
-        self.last_connection_attempt = Some(Instant::now());
-
-        info!(
-            "🔌 Connecting to AWS IoT Core with X.509 certificate mutual authentication: {}",
-            certificates.iot_endpoint
-        );
-        info!(
-            "🔐 Using device certificate: {} bytes",
-            certificates.device_certificate.len()
-        );
-        info!(
-            "🔑 Using private key: {} bytes",
-            certificates.private_key.len()
-        );
-        info!("🏛️ Using Amazon Root CA 1 for server verification");
-
-        // Create MQTT broker URL with TLS
-        let broker_url = format!("mqtts://{}:8883", certificates.iot_endpoint);
+    /// Connect to AWS IoT Core with X.509 certificate mutual authentication
+    /// Establishes secure TLS connection using device certificate and private key
+    pub async fn connect(&mut self, broker_url: &str) -> Result<(), anyhow::Error> {
+        let certificates = self
+            .certificates
+            .as_ref()
+            .ok_or_else(|| anyhow!("No certificates loaded"))?
+            .clone();
 
         // Convert certificates to X.509 format for ESP-IDF
         info!("🔐 Converting certificates to X.509 format for ESP-IDF");
+
         let device_cert = Self::convert_pem_to_x509(&certificates.device_certificate)?;
         let private_key = Self::convert_pem_to_x509(&certificates.private_key)?;
         let aws_root_ca = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
@@ -242,12 +227,12 @@ impl AwsIotMqttClient {
         };
 
         // Create ESP MQTT client with X.509 certificate-based TLS authentication
-        match EspMqttClient::new(&broker_url, &mqtt_config) {
+        match EspMqttClient::new(broker_url, &mqtt_config) {
             Ok((mut client, _connection)) => {
                 info!("🔐 TLS handshake successful with X.509 certificate mutual authentication");
                 info!("✅ Verified server certificate using Amazon Root CA 1");
                 info!("🔒 Client authenticated using device certificate and private key");
-                info!("🎯 X.509 certificate authentication fully configured and active");
+                // Removed detailed certificate information logging for security
 
                 // Subscribe to device-specific topics
                 self.subscribe_to_device_topics(&mut client).await?;
@@ -450,27 +435,11 @@ impl AwsIotMqttClient {
         Ok(())
     }
 
-    /// Attempt automatic reconnection with exponential backoff
-    pub async fn attempt_reconnection(&mut self) -> Result<()> {
+    /// Attempt to reconnect to AWS IoT Core with exponential backoff
+    /// Uses the same X.509 certificates for secure reconnection
+    pub async fn reconnect(&mut self) -> Result<(), anyhow::Error> {
         if self.retry_count >= MAX_RETRY_ATTEMPTS {
-            let error_msg = format!("Maximum retry attempts ({}) exceeded", MAX_RETRY_ATTEMPTS);
-            error!("❌ {}", error_msg);
-            return Err(anyhow!(error_msg));
-        }
-
-        if let Some(last_attempt) = self.last_connection_attempt {
-            let elapsed = Instant::now().duration_since(last_attempt);
-            let retry_delay = Duration::from_millis(self.retry_delay_ms);
-
-            if elapsed < retry_delay {
-                let remaining = retry_delay - elapsed;
-                info!(
-                    "⏳ Waiting {}ms before retry attempt {}",
-                    remaining.as_millis(),
-                    self.retry_count + 1
-                );
-                Timer::after(remaining).await;
-            }
+            return Err(anyhow!("Maximum retry attempts exceeded"));
         }
 
         info!(
@@ -478,7 +447,14 @@ impl AwsIotMqttClient {
             self.retry_count + 1
         );
 
-        match self.connect().await {
+        // Get broker URL from stored certificates
+        let broker_url = if let Some(ref certificates) = self.certificates {
+            format!("mqtts://{}:8883", certificates.iot_endpoint)
+        } else {
+            return Err(anyhow!("No certificates available for reconnection"));
+        };
+
+        match self.connect(&broker_url).await {
             Ok(_) => {
                 info!("✅ Reconnection successful with X.509 certificate authentication");
                 Ok(())

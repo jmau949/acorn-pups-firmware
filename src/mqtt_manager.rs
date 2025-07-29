@@ -101,37 +101,28 @@ impl MqttManager {
     }
 
     /// Initialize MQTT manager with certificate storage
-    pub async fn initialize(&mut self, cert_storage: MqttCertificateStorage) -> Result<()> {
+    pub async fn initialize(
+        &mut self,
+        mut cert_storage: MqttCertificateStorage,
+    ) -> Result<(), anyhow::Error> {
         info!("🔐 Initializing MQTT manager with certificate storage");
 
+        // Initialize MQTT client with stored certificates
+        match self.client.initialize(&mut cert_storage).await {
+            Ok(_) => info!("✅ MQTT client initialized with X.509 certificates"),
+            Err(e) => {
+                error!("❌ Failed to initialize MQTT client: {:?}", e);
+                return Err(e);
+            }
+        }
+
+        // Store cert_storage after using it for initialization
         self.cert_storage = Some(cert_storage);
 
-        // Load certificates with optimized buffer sizing and initialize MQTT client
-        if let Some(ref mut storage) = self.cert_storage {
-            match self.client.initialize_with_certificates(storage).await {
-                Ok(_) => {
-                    self.is_initialized = true;
-                    info!("✅ MQTT manager initialized successfully");
+        // Signal that certificates are loaded
+        MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::CertificatesLoaded);
 
-                    // Signal that certificates are loaded
-                    MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::CertificatesLoaded);
-
-                    Ok(())
-                }
-                Err(e) => {
-                    let error_msg = format!("Failed to initialize MQTT client: {}", e);
-                    error!("❌ {}", error_msg);
-
-                    // Signal certificate error
-                    MQTT_EVENT_SIGNAL
-                        .signal(MqttManagerEvent::CertificatesError(error_msg.clone()));
-
-                    Err(anyhow!(error_msg))
-                }
-            }
-        } else {
-            Err(anyhow!("Certificate storage not available"))
-        }
+        Ok(())
     }
 
     /// Check if MQTT manager is ready for operations
@@ -228,7 +219,7 @@ impl MqttManager {
 
                 // If message failed due to connection issues, attempt reconnection
                 if !self.client.is_connected() {
-                    if let Err(reconnect_error) = self.attempt_reconnection().await {
+                    if let Err(reconnect_error) = self.reconnect().await {
                         warn!("⚠️ Reconnection attempt failed: {}", reconnect_error);
                     }
                 }
@@ -268,7 +259,7 @@ impl MqttManager {
 
             ConnectionStatus::Disconnected => {
                 info!("🔄 MQTT disconnected, attempting reconnection");
-                if let Err(e) = self.attempt_reconnection().await {
+                if let Err(e) = self.reconnect().await {
                     warn!("⚠️ Reconnection failed: {}", e);
                 }
             }
@@ -329,7 +320,17 @@ impl MqttManager {
     async fn attempt_connection(&mut self) -> Result<()> {
         info!("🔌 Attempting MQTT connection");
 
-        match self.client.connect().await {
+        // Get broker URL from certificate storage
+        let broker_url = if let Some(ref mut cert_storage) = self.cert_storage {
+            match cert_storage.load_certificates_for_mqtt()? {
+                Some(certificates) => format!("mqtts://{}:8883", certificates.iot_endpoint),
+                None => return Err(anyhow!("No certificates available for MQTT connection")),
+            }
+        } else {
+            return Err(anyhow!("Certificate storage not available"));
+        };
+
+        match self.client.connect(&broker_url).await {
             Ok(_) => {
                 info!("✅ MQTT connected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
@@ -343,18 +344,17 @@ impl MqttManager {
                 Ok(())
             }
             Err(e) => {
-                warn!("⚠️ MQTT connection failed: {}", e);
-                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(e.to_string()));
+                error!("❌ MQTT connection failed: {}", e);
                 Err(e)
             }
         }
     }
 
     /// Attempt MQTT reconnection with automatic retry
-    async fn attempt_reconnection(&mut self) -> Result<()> {
+    async fn reconnect(&mut self) -> Result<()> {
         info!("🔄 Attempting MQTT reconnection");
 
-        match self.client.attempt_reconnection().await {
+        match self.client.reconnect().await {
             Ok(_) => {
                 info!("✅ MQTT reconnected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);

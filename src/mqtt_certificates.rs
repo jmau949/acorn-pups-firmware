@@ -116,37 +116,27 @@ impl MqttCertificateStorage {
             validation_attempts: 0,
         };
 
-        // Store certificate components in NVS
-        // Using separate keys for each component for security and flexibility
+        // Serialize metadata before batch NVS operations
+        let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+            error!("❌ Failed to serialize certificate metadata: {}", e);
+            EspError::from_infallible::<{ esp_idf_svc::sys::ESP_ERR_INVALID_ARG }>()
+        })?;
+
+        // Batch NVS operations to reduce I/O overhead
+        // Store all certificate components and metadata in sequence
         self.nvs
             .set_str(DEVICE_CERT_KEY, &certificates.device_certificate)?;
         self.nvs
             .set_str(PRIVATE_KEY_KEY, &certificates.private_key)?;
         self.nvs
             .set_str(IOT_ENDPOINT_KEY, &certificates.iot_endpoint)?;
+        self.nvs.set_str(CERT_METADATA_KEY, &metadata_json)?;
+        self.nvs.set_u8(CERT_VALIDATION_KEY, 1)?; // Mark as valid
 
-        // Store metadata as JSON
-        match serde_json::to_string(&metadata) {
-            Ok(metadata_json) => {
-                self.nvs.set_str(CERT_METADATA_KEY, &metadata_json)?;
-                self.nvs.set_u8(CERT_VALIDATION_KEY, 1)?; // Mark as valid
+        info!("✅ AWS IoT Core certificates stored successfully");
+        // Removed certificate fingerprint and endpoint logging for security
 
-                info!("✅ AWS IoT Core certificates stored successfully");
-                info!(
-                    "📜 Certificate fingerprint: {}",
-                    &metadata.certificate_fingerprint[..16]
-                );
-                info!("🌐 IoT endpoint: {}", certificates.iot_endpoint);
-
-                Ok(())
-            }
-            Err(e) => {
-                error!("❌ Failed to serialize certificate metadata: {}", e);
-                Err(EspError::from_infallible::<
-                    { esp_idf_svc::sys::ESP_ERR_INVALID_ARG },
-                >())
-            }
-        }
+        Ok(())
     }
 
     /// Load stored AWS IoT Core certificates from NVS

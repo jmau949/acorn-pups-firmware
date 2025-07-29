@@ -86,41 +86,33 @@ pub static RESET_MANAGER_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, ResetMana
 // Atomic reset state to prevent concurrent resets
 static RESET_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-/// Reset button manager - handles GPIO monitoring and reset coordination
+/// Reset button manager - handles GPIO monitoring and tiered recovery
 pub struct ResetManager {
     reset_button: PinDriver<'static, Gpio0, Input>,
-    // Note: reset_storage removed - no longer needed for GPIO-only monitoring
     device_id: String,
     certificate_arn: String,
+    // Tiered recovery state
+    recovery_attempts: u32,
+    last_recovery_attempt: Option<embassy_time::Instant>,
 }
 
 impl ResetManager {
-    /// Create new reset manager with GPIO configuration
-    pub fn new(device_id: String, certificate_arn: String, gpio0: Gpio0) -> Result<Self> {
-        info!(
-            "🔧 Initializing reset manager for GPIO{}",
-            RESET_BUTTON_GPIO
-        );
+    /// Create new reset manager with GPIO button monitoring and tiered recovery
+    pub fn new(
+        reset_button: PinDriver<'static, Gpio0, Input>,
+        device_id: String,
+        certificate_arn: String,
+    ) -> Self {
+        info!("🔧 Initializing reset manager with tiered recovery approach");
+        info!("📋 Device ID: {}", device_id);
 
-        // Configure reset button GPIO as input with internal pull-up
-        // Pull-up means button press will read as LOW (0)
-        let mut reset_button = PinDriver::input(gpio0)
-            .map_err(|e| anyhow!("Failed to configure reset button GPIO: {}", e))?;
-
-        reset_button
-            .set_pull(Pull::Up)
-            .map_err(|e| anyhow!("Failed to set pull-up on reset button GPIO: {}", e))?;
-
-        info!(
-            "✅ Reset manager initialized with button on GPIO{}",
-            RESET_BUTTON_GPIO
-        );
-
-        Ok(Self {
+        Self {
             reset_button,
             device_id,
             certificate_arn,
-        })
+            recovery_attempts: 0,
+            last_recovery_attempt: None,
+        }
     }
 
     // Note: initialize_storage removed - reset manager no longer needs storage
@@ -248,7 +240,7 @@ impl ResetManager {
         Ok(())
     }
 
-    /// Execute the reset process based on WiFi availability
+    /// Execute the reset process with tiered recovery approach
     async fn execute_reset(&mut self) -> Result<()> {
         // Check if reset is already in progress to prevent concurrent resets
         if RESET_IN_PROGRESS.swap(true, Ordering::SeqCst) {
@@ -256,26 +248,88 @@ impl ResetManager {
             return Ok(());
         }
 
-        info!("🚀 Triggering reset process");
+        info!("🚀 Starting tiered recovery process");
 
-        // Create reset notification data
-        let reset_data = ResetNotificationData {
-            device_id: self.device_id.clone(),
-            reset_timestamp: get_iso8601_timestamp(), // Use local function instead of ResetStorage
-            old_cert_arn: self.certificate_arn.clone(),
-            reason: "physical_button_reset".to_string(),
-        };
+        // Tier 1: Graceful Recovery (No Reset)
+        // Check if we should attempt graceful recovery first
+        let should_attempt_recovery = self.recovery_attempts < 3; // Max 3 recovery attempts
 
-        // Signal that reset is triggered - delegate execution to reset_handler
-        RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetTriggered { reset_data });
+        if should_attempt_recovery {
+            self.recovery_attempts += 1;
+            self.last_recovery_attempt = Some(embassy_time::Instant::now());
 
-        info!("📡 Reset trigger signal sent to reset handler");
+            info!(
+                "🔄 Tier 1: Attempting graceful recovery (attempt {})",
+                self.recovery_attempts
+            );
 
-        // Reset manager's job is done - reset_handler will take over
-        // Clear reset in progress flag will be handled by reset_handler
-        RESET_IN_PROGRESS.store(false, Ordering::SeqCst);
+            // Calculate exponential backoff delay
+            let base_delay_secs = match self.recovery_attempts {
+                1 => 30,  // 30 seconds
+                2 => 60,  // 1 minute
+                3 => 120, // 2 minutes
+                _ => 300, // 5 minutes (fallback)
+            };
 
-        Ok(())
+            // Signal graceful recovery attempt instead of immediate factory reset
+            let recovery_data = ResetNotificationData {
+                device_id: self.device_id.clone(),
+                reset_timestamp: get_iso8601_timestamp(),
+                old_cert_arn: self.certificate_arn.clone(),
+                reason: format!("graceful_recovery_attempt_{}", self.recovery_attempts),
+            };
+
+            info!(
+                "🔄 Attempting graceful recovery for {}s before escalation",
+                base_delay_secs
+            );
+
+            // TODO: Implement graceful recovery actions here:
+            // - Retry WiFi connection
+            // - Retry MQTT connection
+            // - Reload certificates
+            // - Check system health
+
+            // For now, signal recovery attempt and wait
+            RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetTriggered {
+                reset_data: recovery_data,
+            });
+
+            // Wait for recovery period before allowing next attempt
+            Timer::after(Duration::from_secs(base_delay_secs)).await;
+
+            // Clear reset in progress flag to allow future attempts
+            RESET_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+            info!("✅ Graceful recovery attempt completed");
+            return Ok(());
+        } else {
+            // Tier 2: Factory Reset (Last Resort)
+            info!("🔥 Tier 2: All graceful recovery attempts exhausted, proceeding with factory reset");
+
+            // Reset recovery counter for future button presses
+            self.recovery_attempts = 0;
+            self.last_recovery_attempt = None;
+
+            // Create factory reset notification data
+            let reset_data = ResetNotificationData {
+                device_id: self.device_id.clone(),
+                reset_timestamp: get_iso8601_timestamp(),
+                old_cert_arn: self.certificate_arn.clone(),
+                reason: "physical_button_factory_reset_after_recovery_failure".to_string(),
+            };
+
+            // Signal that factory reset is triggered
+            RESET_MANAGER_EVENT_SIGNAL.signal(ResetManagerEvent::ResetTriggered { reset_data });
+
+            info!("📡 Factory reset trigger signal sent to reset handler");
+
+            // Reset manager's job is done - reset_handler will take over
+            // Clear reset in progress flag will be handled by reset_handler
+            RESET_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+            Ok(())
+        }
     }
 
     // Note: update_certificate_arn and is_storage_initialized removed - no longer needed

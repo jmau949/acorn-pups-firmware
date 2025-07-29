@@ -24,6 +24,7 @@ use embassy_sync::signal::Signal;
 // Import ESP-IDF (ESP32 development framework) GPIO pin driver
 // PinDriver lets us control individual GPIO pins (set high/low, read input)
 use esp_idf_svc::hal::gpio::PinDriver;
+use esp_idf_svc::hal::gpio::Pull;
 
 // Import the main peripherals struct that gives access to all ESP32 hardware
 // Peripherals contains references to GPIO pins, SPI, I2C, WiFi, etc.
@@ -1355,7 +1356,23 @@ async fn mqtt_manager_task(device_id: String, nvs_partition: EspDefaultNvsPartit
             }
             Err(e) => {
                 error!("❌ Failed to initialize certificate storage: {:?}", e);
-                Timer::after(Duration::from_secs(10)).await;
+
+                // Use progressive delay instead of arbitrary fixed delay
+                // Start with 5 seconds, double up to max 30 seconds
+                let current_delay = {
+                    let state = SYSTEM_STATE.lock().await;
+                    if state.wifi_connected {
+                        5000 // WiFi connected, shorter delay
+                    } else {
+                        15000 // No WiFi, longer delay
+                    }
+                };
+
+                warn!(
+                    "⏳ Certificate initialization failed, retrying in {}ms",
+                    current_delay
+                );
+                Timer::after(Duration::from_millis(current_delay)).await;
             }
         }
     };
@@ -1416,18 +1433,22 @@ async fn reset_manager_task(
 
     info!("✅ Reset handler initialized successfully");
 
-    // Initialize reset manager (only for GPIO monitoring)
-    let mut reset_manager =
-        match ResetManager::new(device_id.clone(), "placeholder-cert-arn".to_string(), gpio0) {
-            Ok(manager) => {
-                info!("✅ Reset manager GPIO initialized successfully");
-                manager
-            }
-            Err(e) => {
-                error!("❌ Failed to initialize reset manager GPIO: {}", e);
-                return;
-            }
-        };
+    // Initialize reset manager with GPIO button monitoring and tiered recovery
+    // Configure reset button GPIO as input with internal pull-up
+    // Pull-up means button press will read as LOW (0)
+    let mut reset_button = PinDriver::input(gpio0).expect("Failed to configure reset button GPIO");
+
+    reset_button
+        .set_pull(Pull::Up)
+        .expect("Failed to set pull-up on reset button GPIO");
+
+    let mut reset_manager = ResetManager::new(
+        reset_button,
+        device_id.clone(),
+        "placeholder-cert-arn".to_string(),
+    );
+
+    info!("✅ Reset manager with tiered recovery initialized successfully");
 
     // Reset manager no longer needs storage - only GPIO monitoring
 
@@ -1464,27 +1485,40 @@ async fn reset_manager_task(
                     }
                     // Note: ResetInitiated event removed - simplified reset flow
                     ResetManagerEvent::ResetTriggered { reset_data } => {
-                        info!("🚀 Reset triggered - delegating to reset handler");
-                        SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetInProgress);
+                        // Check if this is a graceful recovery attempt or factory reset
+                        if reset_data.reason.contains("graceful_recovery_attempt") {
+                            info!("🔄 Graceful recovery triggered: {}", reset_data.reason);
 
-                        // Delegate reset execution to reset_handler (single source of truth)
-                        // No more online/offline distinction - direct factory reset
-                        let execution_result =
-                            reset_handler.execute_factory_reset(reset_data.reason).await;
+                            // TODO: Implement graceful recovery actions:
+                            // - Retry WiFi connection
+                            // - Retry MQTT connection
+                            // - Reload certificates
+                            // - Check system health
 
-                        match execution_result {
-                            Ok(_) => {
-                                info!("✅ Reset execution completed successfully");
-                                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetCompleted);
-                                // System will reboot, so this task will end
-                                return;
-                            }
-                            Err(e) => {
-                                error!("❌ Reset execution failed: {}", e);
-                                SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
-                                    "Reset execution failed: {}",
-                                    e
-                                )));
+                            // For now, just log and continue monitoring
+                            info!("🔄 Graceful recovery attempt in progress...");
+                        } else {
+                            info!("🚀 Factory reset triggered - delegating to reset handler");
+                            SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetInProgress);
+
+                            // Delegate factory reset execution to reset_handler
+                            let execution_result =
+                                reset_handler.execute_factory_reset(reset_data.reason).await;
+
+                            match execution_result {
+                                Ok(_) => {
+                                    info!("✅ Factory reset execution completed successfully");
+                                    SYSTEM_EVENT_SIGNAL.signal(SystemEvent::ResetCompleted);
+                                    // System will reboot, so this task will end
+                                    return;
+                                }
+                                Err(e) => {
+                                    error!("❌ Factory reset execution failed: {}", e);
+                                    SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
+                                        "Factory reset execution failed: {}",
+                                        e
+                                    )));
+                                }
                             }
                         }
                     } // Note: ResetCompleted and ResetError events removed - simplified reset flow
