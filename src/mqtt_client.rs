@@ -33,9 +33,8 @@ pub const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
 pub const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
 
 // Static certificate holder for managing certificate lifetimes
-// This provides the static lifetime requirement without memory leaks
-static mut CERTIFICATE_HOLDER: Option<CertificateHolder> = None;
-static CERTIFICATE_INIT: std::sync::Once = std::sync::Once::new();
+// Uses OnceLock for safe static initialization without data races or memory leaks
+static CERTIFICATE_HOLDER: std::sync::OnceLock<CertificateHolder> = std::sync::OnceLock::new();
 
 /// Safe certificate holder that manages X509 certificate lifetimes
 /// without causing memory leaks like Box::leak()
@@ -69,9 +68,9 @@ impl CertificateHolder {
     /// Uses safe static initialization via OnceLock instead of unsafe transmute
     fn get_x509_certificates(&self) -> Result<(X509<'static>, X509<'static>, X509<'static>)> {
         // Use OnceLock for safe static storage of certificate references
-        static DEVICE_CERT: OnceLock<std::ffi::CString> = OnceLock::new();
-        static PRIVATE_KEY: OnceLock<std::ffi::CString> = OnceLock::new();
-        static ROOT_CA: OnceLock<std::ffi::CString> = OnceLock::new();
+        static DEVICE_CERT: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+        static PRIVATE_KEY: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+        static ROOT_CA: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
 
         // Store certificates in static storage - this ensures 'static lifetime
         let device_cert_static = DEVICE_CERT.get_or_init(|| self.device_cert_cstring.clone());
@@ -156,53 +155,38 @@ pub struct AwsIotMqttClient {
 }
 
 impl AwsIotMqttClient {
-    /// Initialize certificate holder in static storage
-    /// This must be called before creating any X509 certificates
+    /// Initialize certificate holder in static storage safely
+    /// Uses OnceLock for memory-safe static initialization
     fn initialize_certificates(certificates: &DeviceCertificates) -> Result<()> {
-        CERTIFICATE_INIT.call_once(|| {
-            match CertificateHolder::new(
-                &certificates.device_certificate,
-                &certificates.private_key,
-                AWS_ROOT_CA_1,
-                &certificates.iot_endpoint,
-            ) {
-                Ok(holder) => unsafe {
-                    CERTIFICATE_HOLDER = Some(holder);
-                },
-                Err(e) => {
-                    error!("❌ Failed to initialize certificate holder: {}", e);
-                }
-            }
-        });
+        let holder = CertificateHolder::new(
+            &certificates.device_certificate,
+            &certificates.private_key,
+            AWS_ROOT_CA_1,
+            &certificates.iot_endpoint,
+        )?;
 
-        // Verify initialization succeeded
-        unsafe {
-            if CERTIFICATE_HOLDER.is_none() {
-                return Err(anyhow!("Certificate holder initialization failed"));
-            }
-        }
+        // Safe static initialization with OnceLock
+        CERTIFICATE_HOLDER
+            .set(holder)
+            .map_err(|_| anyhow!("Certificate holder already initialized"))?;
 
         Ok(())
     }
 
-    /// Get X509 certificates from the static holder
+    /// Get X509 certificates from the static holder safely
     /// Returns certificates with static lifetime required by ESP-IDF
     fn get_x509_certificates() -> Result<(X509<'static>, X509<'static>, X509<'static>)> {
-        unsafe {
-            match &CERTIFICATE_HOLDER {
-                Some(holder) => holder.get_x509_certificates(),
-                None => Err(anyhow!("Certificate holder not initialized")),
-            }
+        match CERTIFICATE_HOLDER.get() {
+            Some(holder) => holder.get_x509_certificates(),
+            None => Err(anyhow!("Certificate holder not initialized")),
         }
     }
 
-    /// Get IoT endpoint from the static holder
+    /// Get IoT endpoint from the static holder safely
     fn get_iot_endpoint() -> Result<String> {
-        unsafe {
-            match &CERTIFICATE_HOLDER {
-                Some(holder) => Ok(holder.get_iot_endpoint().to_string()),
-                None => Err(anyhow!("Certificate holder not initialized")),
-            }
+        match CERTIFICATE_HOLDER.get() {
+            Some(holder) => Ok(holder.get_iot_endpoint().to_string()),
+            None => Err(anyhow!("Certificate holder not initialized")),
         }
     }
 
