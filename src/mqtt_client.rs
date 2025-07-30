@@ -267,11 +267,26 @@ impl AwsIotMqttClient {
         let (device_cert_x509, private_key_x509, root_ca_x509) = Self::get_x509_certificates()?;
 
         // Get IoT endpoint from static holder
-        let _broker_url = format!("mqtts://{}:8883", self.client_id); // Placeholder, needs actual endpoint
         let iot_endpoint = Self::get_iot_endpoint()?;
         let broker_url = format!("mqtts://{}:8883", iot_endpoint);
         info!("🌐 MQTT broker URL: {}", broker_url);
         info!("🆔 Client ID: {}", self.client_id);
+
+        // Enhanced debugging for connection issues
+        debug!("🔍 Certificate details:");
+        debug!(
+            "  📜 Device cert type: {:?}",
+            std::any::type_name_of_val(&device_cert_x509)
+        );
+        debug!(
+            "  🔑 Private key type: {:?}",
+            std::any::type_name_of_val(&private_key_x509)
+        );
+        debug!(
+            "  🌐 Root CA type: {:?}",
+            std::any::type_name_of_val(&root_ca_x509)
+        );
+        debug!("  🌐 IoT endpoint: {}", iot_endpoint);
 
         info!("🚀 Creating production-grade ESP-IDF MQTT client configuration");
 
@@ -294,12 +309,16 @@ impl AwsIotMqttClient {
             use_global_ca_store: false,
             skip_cert_common_name_check: false,
 
+            // Enhanced debugging configuration
+            disable_clean_session: false,
+
             ..Default::default()
         };
 
         match EspMqttClient::new(&broker_url, &mqtt_config) {
             Ok((client, mut connection)) => {
                 info!("✅ MQTT client created with full X.509 mutual authentication");
+                debug!("🔍 MQTT client configuration applied successfully");
 
                 // Start the connection event loop in a background task for message handling
                 std::thread::spawn(move || {
@@ -307,10 +326,16 @@ impl AwsIotMqttClient {
                     loop {
                         match connection.next() {
                             Ok(event) => {
+                                debug!("📡 MQTT event received");
                                 Self::handle_mqtt_event(&event);
                             }
                             Err(e) => {
                                 error!("❌ MQTT connection error: {:?}", e);
+                                debug!(
+                                    "🔍 MQTT error details: type={:?}, code={:?}",
+                                    std::any::type_name_of_val(&e),
+                                    e
+                                );
                                 break;
                             }
                         }
@@ -326,6 +351,11 @@ impl AwsIotMqttClient {
             }
             Err(e) => {
                 error!("❌ Failed to create MQTT client: {:?}", e);
+                debug!(
+                    "🔍 MQTT client creation error details: type={:?}, code={:?}",
+                    std::any::type_name_of_val(&e),
+                    e
+                );
                 self.connection_state = MqttConnectionState::Error;
                 Err(anyhow!("MQTT client creation failed: {:?}", e))
             }
@@ -341,12 +371,26 @@ impl AwsIotMqttClient {
                 client_id
             );
 
+            // Enhanced debugging for subscription process
+            debug!("🔍 MQTT client state before subscriptions:");
+            debug!("  📡 Client ID: {}", client_id);
+            debug!("  🔗 Connection state: {:?}", self.connection_state);
+            debug!("  📋 Topics to subscribe:");
+            debug!("    - Settings: {}/{}", TOPIC_SETTINGS, client_id);
+            debug!("    - Commands: {}/{}", TOPIC_COMMANDS, client_id);
+            debug!(
+                "    - Status Request: {}/{}",
+                TOPIC_STATUS_REQUEST, client_id
+            );
+            debug!("    - Firmware: {}/{}", TOPIC_FIRMWARE, client_id);
+
             // Retry logic for subscription - ESP-IDF MQTT client needs time to establish connection
             let max_attempts = 10;
             let mut attempt = 1;
 
             while attempt <= max_attempts {
                 info!("📨 Subscription attempt {} of {}", attempt, max_attempts);
+                debug!("🔍 Attempt {} details:", attempt);
 
                 // Subscribe to settings updates
                 let settings_topic = format!("{}/{}", TOPIC_SETTINGS, client_id);
@@ -361,6 +405,7 @@ impl AwsIotMqttClient {
                             "✅ Successfully subscribed to settings topic: {}",
                             settings_topic
                         );
+                        debug!("🔍 Settings subscription successful on attempt {}", attempt);
 
                         // Subscribe to commands
                         let commands_topic = format!("{}/{}", TOPIC_COMMANDS, client_id);
@@ -374,6 +419,10 @@ impl AwsIotMqttClient {
                                 info!(
                                     "✅ Successfully subscribed to commands topic: {}",
                                     commands_topic
+                                );
+                                debug!(
+                                    "🔍 Commands subscription successful on attempt {}",
+                                    attempt
                                 );
 
                                 // Subscribe to status request topic
@@ -390,6 +439,7 @@ impl AwsIotMqttClient {
                                             "✅ Successfully subscribed to status request topic: {}",
                                             status_req_topic
                                         );
+                                        debug!("🔍 Status request subscription successful on attempt {}", attempt);
 
                                         // Subscribe to firmware updates (required by AWS IoT policy)
                                         let firmware_topic =
@@ -398,6 +448,16 @@ impl AwsIotMqttClient {
                                             "📨 Attempting to subscribe to firmware topic: {}",
                                             firmware_topic
                                         );
+                                        debug!("🔍 Firmware topic subscription attempt {} - this is where failures occur", attempt);
+
+                                        // Debug connection state before firmware subscription
+                                        debug!("🔍 MQTT Client Debug Information:");
+                                        debug!("  📡 Client ID: {}", client_id);
+                                        debug!(
+                                            "  🔗 Connection State: {:?}",
+                                            self.connection_state
+                                        );
+                                        debug!("  📋 Client Initialized: {}", true);
 
                                         match client.subscribe(&firmware_topic, QoS::AtLeastOnce) {
                                             Ok(_) => {
@@ -405,6 +465,7 @@ impl AwsIotMqttClient {
                                                     "✅ Successfully subscribed to firmware topic: {}",
                                                     firmware_topic
                                                 );
+                                                debug!("🔍 Firmware subscription successful on attempt {}", attempt);
                                                 info!("✅ All MQTT topic subscriptions completed successfully");
                                                 info!("  📨 Settings: {}", settings_topic);
                                                 info!("  📨 Commands: {}", commands_topic);
@@ -417,6 +478,18 @@ impl AwsIotMqttClient {
                                                     "❌ Failed to subscribe to firmware topic: {:?}",
                                                     e
                                                 );
+                                                debug!("🔍 Firmware subscription error details: type={:?}, code={:?}", 
+                                                    std::any::type_name_of_val(&e), e);
+
+                                                // Check for specific transport errors
+                                                let error_str = format!("{:?}", e);
+                                                if error_str.contains("EOF")
+                                                    || error_str.contains("transport_read")
+                                                {
+                                                    warn!("⚠️ Transport error detected - connection may be dropping");
+                                                    debug!("🔍 This appears to be a transport layer issue, not a policy issue");
+                                                }
+
                                                 if attempt >= max_attempts {
                                                     return Err(anyhow!(
                                                         "Failed to subscribe to firmware topic after {} attempts: {:?}",
@@ -432,6 +505,8 @@ impl AwsIotMqttClient {
                                             "❌ Failed to subscribe to status request topic: {:?}",
                                             e
                                         );
+                                        debug!("🔍 Status request subscription error details: type={:?}, code={:?}", 
+                                            std::any::type_name_of_val(&e), e);
                                         if attempt >= max_attempts {
                                             return Err(anyhow!(
                                                 "Failed to subscribe to status request topic after {} attempts: {:?}",
@@ -444,6 +519,11 @@ impl AwsIotMqttClient {
                             }
                             Err(e) => {
                                 error!("❌ Failed to subscribe to commands topic: {:?}", e);
+                                debug!(
+                                    "🔍 Commands subscription error details: type={:?}, code={:?}",
+                                    std::any::type_name_of_val(&e),
+                                    e
+                                );
                                 if attempt >= max_attempts {
                                     return Err(anyhow!("Failed to subscribe to commands topic after {} attempts: {:?}", max_attempts, e));
                                 }
@@ -454,6 +534,11 @@ impl AwsIotMqttClient {
                         error!(
                             "❌ Failed to subscribe to settings topic on attempt {}: {:?}",
                             attempt, e
+                        );
+                        debug!(
+                            "🔍 Settings subscription error details: type={:?}, code={:?}",
+                            std::any::type_name_of_val(&e),
+                            e
                         );
                         if attempt >= max_attempts {
                             return Err(anyhow!(
@@ -470,6 +555,10 @@ impl AwsIotMqttClient {
                 info!(
                     "⏳ Waiting {} seconds before retry (attempt {}/{})",
                     delay_seconds, attempt, max_attempts
+                );
+                debug!(
+                    "🔍 Connection state before delay: {:?}",
+                    self.connection_state
                 );
                 Timer::after(Duration::from_secs(delay_seconds)).await;
                 attempt += 1;
@@ -717,6 +806,20 @@ impl AwsIotMqttClient {
         // 4. Restart device
 
         Ok(())
+    }
+
+    /// Debug function to check MQTT client state and connection health
+    pub fn debug_connection_state(&self) {
+        debug!("🔍 MQTT Client Debug Information:");
+        debug!("  📡 Client ID: {}", self.client_id);
+        debug!("  🔗 Connection State: {:?}", self.connection_state);
+        debug!("  📋 Client Initialized: {}", self.client.is_some());
+
+        if let Some(_client) = &self.client {
+            debug!("  ✅ MQTT Client exists");
+        } else {
+            debug!("  ❌ MQTT Client is None");
+        }
     }
 
     /// Update AWS IoT Thing Shadow (required by AWS IoT policy)
