@@ -10,8 +10,8 @@ const FORCE_FACTORY_RESET_ON_STARTUP: bool = false;
 // Duration represents a time span, Timer provides async delays (non-blocking waits)
 use embassy_time::{Duration, Timer};
 
-// Import Embassy async utilities for event coordination
-use embassy_futures::select::{select, Either};
+// Import Embassy async utilities for event coordination (currently unused)
+// use embassy_futures::select::{select, Either};
 
 // Import Embassy synchronization primitives for task coordination
 // Signal provides event-driven communication between tasks
@@ -640,7 +640,7 @@ async fn main(spawner: Spawner) {
                     let mut recovery_manager = TieredRecoveryManager::new(device_id);
 
                     // Set up recovery system components
-                    let nvs_partition = match EspDefaultNvsPartition::take() {
+                    let _nvs_partition = match EspDefaultNvsPartition::take() {
                         Ok(partition) => partition,
                         Err(e) => {
                             error!("❌ Failed to take NVS partition for recovery: {:?}", e);
