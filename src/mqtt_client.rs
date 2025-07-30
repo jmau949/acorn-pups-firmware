@@ -3,9 +3,7 @@
 // Fully async implementation using EspAsyncMqttClient and owned certificate data
 
 // Import ESP-IDF async MQTT client functionality
-use esp_idf_svc::mqtt::client::{
-    EspAsyncMqttClient, EspMqttClient, MqttClientConfiguration, QoS,
-};
+use esp_idf_svc::mqtt::client::{EspAsyncMqttClient, EspMqttClient, MqttClientConfiguration, QoS};
 
 // Import Embassy time utilities for timeouts and delays
 use embassy_time::{with_timeout, Duration};
@@ -189,7 +187,7 @@ impl AwsIotMqttClient {
         // Create callback-based client first, then wrap with async interface
         match EspMqttClient::new_cb(&broker_url, &mqtt_config, |event| {
             // Handle MQTT events through callback and log them
-            Self::handle_mqtt_callback_event(event);
+            Self::handle_mqtt_callback_event(&event);
         }) {
             Ok(sync_client) => {
                 info!("✅ Synchronous MQTT client created, wrapping with async interface");
@@ -203,7 +201,7 @@ impl AwsIotMqttClient {
 
                         info!("✅ Async MQTT client and connection created successfully");
                         info!("⏳ MQTT handshake in progress - connection state: Connecting");
-                        
+
                         // Connection state will be updated to Connected after successful handshake
                         // Subscriptions should wait for connection to be fully established
                         Ok(())
@@ -226,11 +224,11 @@ impl AwsIotMqttClient {
     /// Wait for MQTT connection to be fully established
     async fn wait_for_connection(&mut self) -> Result<()> {
         info!("⏳ Waiting for MQTT connection to be fully established...");
-        
+
         // For ESP-IDF async MQTT, we'll wait a bit for the connection to establish
         // The logs show the connection does establish after a few seconds
         embassy_time::Timer::after(Duration::from_secs(3)).await;
-        
+
         self.connection_state = MqttConnectionState::Connected;
         info!("✅ MQTT connection assumed established after delay");
         Ok(())
@@ -240,7 +238,7 @@ impl AwsIotMqttClient {
     pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
         // First wait for the connection to be fully established
         self.wait_for_connection().await?;
-        
+
         if let Some(client) = self.client.as_mut() {
             let client_id = &self.client_id;
             info!(
@@ -465,27 +463,12 @@ impl AwsIotMqttClient {
     /// Process incoming MQTT messages asynchronously
     /// This replaces the callback-based approach with async message processing
     pub async fn process_messages(&mut self) -> Result<()> {
-        if let Some(client) = self.client.as_mut() {
+        if let Some(_client) = self.client.as_mut() {
             debug!("🔒 Processing async MQTT messages");
-            
+
             // Try to receive a message with a short timeout
-            match with_timeout(Duration::from_millis(100), async {
-                client.next().await
-            }).await {
-                Ok(Ok(event)) => {
-                    debug!("📡 Received async MQTT event");
-                    self.handle_mqtt_event_async(&event).await?;
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    warn!("⚠️ MQTT event error: {:?}", e);
-                    Ok(()) // Don't fail on individual message errors
-                }
-                Err(_) => {
-                    // Timeout - no messages available, this is normal
-                    Ok(())
-                }
-            }
+            // Message processing is handled via the callback, so no further polling is required here
+            Ok(())
         } else {
             debug!("📭 MQTT not connected, no messages to process");
             Ok(())
@@ -512,33 +495,38 @@ impl AwsIotMqttClient {
         &self,
         event: &esp_idf_svc::mqtt::client::EspMqttEvent,
     ) -> Option<(String, Vec<u8>)> {
-        use esp_idf_svc::mqtt::client::EspMqttEvent;
-        
-        match event {
-            EspMqttEvent::Received { id: _, topic, data, dup: _, qos: _, retain: _ } => {
-                if let (Some(topic_str), Some(payload_data)) = (topic, data) {
+        use embedded_svc::mqtt::client::EventPayload;
+
+        match event.payload() {
+            EventPayload::Received {
+                id: _, topic, data, ..
+            } => {
+                if let Some(topic_str) = topic {
                     let topic = topic_str.to_string();
-                    let payload = payload_data.to_vec();
-                    
-                    info!("📨 ✅ MQTT MESSAGE RECEIVED - topic='{}', payload_size={} bytes", 
-                           topic, payload.len());
-                    
+                    let payload = data.to_vec();
+
+                    info!(
+                        "📨 ✅ MQTT MESSAGE RECEIVED - topic='{}', payload_size={} bytes",
+                        topic,
+                        payload.len()
+                    );
+
                     Some((topic, payload))
                 } else {
                     debug!("📭 MQTT event missing topic or data");
                     None
                 }
             }
-            EspMqttEvent::Connected => {
+            EventPayload::Connected(_) => {
                 info!("🔗 MQTT Connected event received");
                 None
             }
-            EspMqttEvent::Disconnected => {
+            EventPayload::Disconnected => {
                 warn!("🔌 MQTT Disconnected event received");
                 None
             }
             _ => {
-                debug!("📋 Other MQTT event received: {:?}", event);
+                debug!("📋 Other MQTT event received");
                 None
             }
         }
@@ -571,7 +559,10 @@ impl AwsIotMqttClient {
 
     /// Handle incoming settings update messages asynchronously
     async fn handle_settings_message_async(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
-        info!("🔧 ✅ FIRMWARE RECEIVED SETTINGS MESSAGE from topic: {}", topic);
+        info!(
+            "🔧 ✅ FIRMWARE RECEIVED SETTINGS MESSAGE from topic: {}",
+            topic
+        );
         info!("📦 Settings payload size: {} bytes", payload.len());
 
         // Convert payload to string
@@ -706,29 +697,33 @@ impl AwsIotMqttClient {
 
     /// Handle MQTT events from the callback (static method)
     fn handle_mqtt_callback_event(event: &esp_idf_svc::mqtt::client::EspMqttEvent) {
-        use esp_idf_svc::mqtt::client::EspMqttEvent;
-        
+        use embedded_svc::mqtt::client::EventPayload;
+
         info!("📡 ✅ MQTT CALLBACK EVENT RECEIVED");
-        
-        match event {
-            EspMqttEvent::Received { id: _, topic, data, dup: _, qos: _, retain: _ } => {
-                if let (Some(topic_str), Some(payload_data)) = (topic, data) {
+
+        match event.payload() {
+            EventPayload::Received {
+                id: _, topic, data, ..
+            } => {
+                if let Some(topic_str) = topic {
                     info!("📨 ✅ ✨ SETTINGS MESSAGE RECEIVED VIA CALLBACK");
                     info!("🎯 Topic: {}", topic_str);
-                    info!("📦 Payload size: {} bytes", payload_data.len());
-                    
+                    info!("📦 Payload size: {} bytes", data.len());
+
                     // Convert payload to string and log it
-                    if let Ok(payload_str) = std::str::from_utf8(payload_data) {
+                    if let Ok(payload_str) = std::str::from_utf8(data) {
                         info!("📝 Payload content: {}", payload_str);
-                        
+
                         // If this is a settings message, handle it
                         if topic_str.contains("settings") {
                             info!("🔧 ✅ ✨ PROCESSING SETTINGS MESSAGE FROM CALLBACK");
-                            
+
                             // Send to settings manager
                             crate::settings::request_mqtt_settings_update(payload_str.to_string());
-                            
-                            info!("✅ ✨ Settings message forwarded to settings manager via callback");
+
+                            info!(
+                                "✅ ✨ Settings message forwarded to settings manager via callback"
+                            );
                         }
                     } else {
                         warn!("⚠️ Could not decode payload as UTF-8");
@@ -737,14 +732,14 @@ impl AwsIotMqttClient {
                     debug!("📭 MQTT event missing topic or data");
                 }
             }
-            EspMqttEvent::Connected => {
+            EventPayload::Connected(_) => {
                 info!("🔗 ✅ MQTT Connected via callback");
             }
-            EspMqttEvent::Disconnected => {
+            EventPayload::Disconnected => {
                 warn!("🔌 ❌ MQTT Disconnected via callback");
             }
             _ => {
-                debug!("📋 Other MQTT event via callback: {:?}", event);
+                debug!("📋 Other MQTT event via callback");
             }
         }
     }
