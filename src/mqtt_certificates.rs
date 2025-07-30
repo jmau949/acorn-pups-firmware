@@ -92,23 +92,18 @@ impl MqttCertificateStorage {
     > {
         use esp_idf_svc::tls::X509;
 
-        // Convert to X509 using owned byte vectors for static lifetime
-        let device_cert_bytes: &'static [u8] = Box::leak(
-            certificates
-                .device_certificate
-                .as_bytes()
-                .to_vec()
-                .into_boxed_slice(),
-        );
-        let private_key_bytes: &'static [u8] = Box::leak(
-            certificates
-                .private_key
-                .as_bytes()
-                .to_vec()
-                .into_boxed_slice(),
-        );
-        let root_ca_bytes: &'static [u8] =
-            Box::leak(AWS_ROOT_CA_1.as_bytes().to_vec().into_boxed_slice());
+        // Convert to X509 using owned byte vectors with null terminators for static lifetime
+        let mut device_cert_vec = certificates.device_certificate.as_bytes().to_vec();
+        device_cert_vec.push(0); // Add null terminator
+        let device_cert_bytes: &'static [u8] = Box::leak(device_cert_vec.into_boxed_slice());
+
+        let mut private_key_vec = certificates.private_key.as_bytes().to_vec();
+        private_key_vec.push(0); // Add null terminator
+        let private_key_bytes: &'static [u8] = Box::leak(private_key_vec.into_boxed_slice());
+
+        let mut root_ca_vec = AWS_ROOT_CA_1.as_bytes().to_vec();
+        root_ca_vec.push(0); // Add null terminator
+        let root_ca_bytes: &'static [u8] = Box::leak(root_ca_vec.into_boxed_slice());
 
         // Convert to X509 using pem_until_nul for proper lifetime management
         let device_cert_x509 = X509::pem_until_nul(device_cert_bytes);
