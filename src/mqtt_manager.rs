@@ -143,26 +143,26 @@ impl MqttManager {
 
         info!("🚀 Starting MQTT manager main loop");
 
-        // Attempt initial connection with detailed error handling
+        // Attempt initial async connection with detailed error handling
         match self.attempt_connection().await {
             Ok(_) => {
-                info!("✅ Initial MQTT connection successful - entering main loop");
+                info!("✅ Initial async MQTT connection successful - entering main loop");
             }
             Err(e) => {
-                error!("❌ Initial MQTT connection failed: {}", e);
-                error!("💥 MQTT connection is critical - triggering factory reset");
+                error!("❌ Initial async MQTT connection failed: {}", e);
+                error!("💥 Async MQTT connection is critical - triggering factory reset");
                 error!("🔄 Device will reset to BLE provisioning mode");
 
                 // Signal MQTT failure to trigger factory reset
                 crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(format!(
-                    "MQTT connection failed: {}",
+                    "Async MQTT connection failed: {}",
                     e
                 )));
 
                 // Give time for the signal to be processed
                 Timer::after(Duration::from_secs(2)).await;
 
-                return Err(anyhow!("MQTT connection failed - factory reset triggered"));
+                return Err(anyhow!("Async MQTT connection failed - factory reset triggered"));
             }
         }
 
@@ -269,34 +269,34 @@ impl MqttManager {
 
         match status {
             MqttConnectionState::Connected => {
-                debug!("💚 MQTT connection healthy");
+                debug!("💚 Async MQTT connection healthy");
 
-                // Process any pending messages
+                // Process any pending messages with async operations
                 if let Err(e) = self.client.process_messages().await {
-                    warn!("⚠️ Message processing error: {}", e);
+                    warn!("⚠️ Async message processing error: {}", e);
                 }
             }
 
             MqttConnectionState::Disconnected => {
-                info!("🔄 MQTT disconnected, attempting reconnection");
+                info!("🔄 Async MQTT disconnected, attempting reconnection");
                 if let Err(e) = self.attempt_reconnection().await {
-                    warn!("⚠️ Reconnection failed: {}", e);
+                    warn!("⚠️ Async reconnection failed: {}", e);
                 }
             }
 
             MqttConnectionState::Connecting => {
-                debug!("🔄 MQTT connection in progress");
+                debug!("🔄 Async MQTT connection in progress");
             }
 
             MqttConnectionState::Error => {
-                warn!("❌ MQTT connection error detected");
+                warn!("❌ Async MQTT connection error detected");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(
-                    "MQTT connection error".to_string(),
+                    "Async MQTT connection error".to_string(),
                 ));
 
-                // Attempt recovery
+                // Attempt recovery using async operations
                 if let Err(e) = self.force_reconnection().await {
-                    error!("❌ Failed to recover from connection error: {}", e);
+                    error!("❌ Failed to recover from async connection error: {}", e);
                 }
             }
         }
@@ -311,32 +311,32 @@ impl MqttManager {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    /// Attempt initial MQTT connection
+    /// Attempt initial MQTT connection with async operations
     async fn attempt_connection(&mut self) -> Result<()> {
-        info!("🔌 Attempting MQTT connection");
+        info!("🔌 Attempting async MQTT connection");
 
         match self.client.connect().await {
             Ok(_) => {
-                info!("✅ MQTT connected successfully");
+                info!("✅ Async MQTT connected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
 
-                // Attempt topic subscriptions with retry logic
-                info!("📨 Starting topic subscriptions after successful connection");
+                // Attempt topic subscriptions with async operations
+                info!("📨 Starting async topic subscriptions after successful connection");
                 match self.client.subscribe_to_device_topics().await {
                     Ok(_) => {
-                        info!("✅ All MQTT topic subscriptions completed successfully");
+                        info!("✅ All async MQTT topic subscriptions completed successfully");
                     }
                     Err(e) => {
-                        error!("❌ Failed to subscribe to MQTT topics: {}", e);
+                        error!("❌ Failed to subscribe to async MQTT topics: {}", e);
                         // This is a critical failure - trigger factory reset
                         crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(
-                            format!("MQTT subscription failed: {}", e),
+                            format!("Async MQTT subscription failed: {}", e),
                         ));
-                        return Err(anyhow!("MQTT subscription failed: {}", e));
+                        return Err(anyhow!("Async MQTT subscription failed: {}", e));
                     }
                 }
 
-                // Send initial device status
+                // Send initial device status using async message queue
                 let _ = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::DeviceStatus {
                     status: "online".to_string(),
                     wifi_signal: Some(-45), // TODO: Get actual WiFi signal
@@ -345,43 +345,43 @@ impl MqttManager {
                 Ok(())
             }
             Err(e) => {
-                warn!("⚠️ MQTT connection failed: {}", e);
+                warn!("⚠️ Async MQTT connection failed: {}", e);
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(e.to_string()));
                 Err(e)
             }
         }
     }
 
-    /// Attempt MQTT reconnection with automatic retry
+    /// Attempt async MQTT reconnection with automatic retry
     async fn attempt_reconnection(&mut self) -> Result<()> {
-        info!("🔄 Attempting MQTT reconnection");
+        info!("🔄 Attempting async MQTT reconnection");
 
         match self.client.attempt_reconnection().await {
             Ok(_) => {
-                info!("✅ MQTT reconnected successfully");
+                info!("✅ Async MQTT reconnected successfully");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
                 Ok(())
             }
             Err(e) => {
-                warn!("⚠️ MQTT reconnection failed: {}", e);
+                warn!("⚠️ Async MQTT reconnection failed: {}", e);
                 Err(e)
             }
         }
     }
 
-    /// Force reconnection by disconnecting and reconnecting
+    /// Force reconnection by disconnecting and reconnecting using async operations
     async fn force_reconnection(&mut self) -> Result<()> {
-        info!("🔄 Forcing MQTT reconnection");
+        info!("🔄 Forcing async MQTT reconnection");
 
-        // Disconnect first
+        // Disconnect first using async operations
         if let Err(e) = self.client.disconnect().await {
-            warn!("⚠️ Error during disconnect: {}", e);
+            warn!("⚠️ Error during async disconnect: {}", e);
         }
 
         // Small delay before reconnecting
         Timer::after(Duration::from_secs(2)).await;
 
-        // Attempt connection
+        // Attempt connection using async operations
         self.attempt_connection().await
     }
 
@@ -403,9 +403,9 @@ impl MqttManager {
     }
 }
 
-// Public API functions for external modules to interact with MQTT manager
+// Public API functions for external modules to interact with async MQTT manager
 
-/// Send button press message to MQTT manager
+/// Send button press message to async MQTT manager
 pub async fn send_button_press(button_rf_id: String, battery_level: Option<u8>) -> Result<()> {
     let message = MqttMessage::ButtonPress {
         button_rf_id,
@@ -414,17 +414,17 @@ pub async fn send_button_press(button_rf_id: String, battery_level: Option<u8>) 
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {
-            debug!("📤 Button press message queued successfully");
+            debug!("📤 Async button press message queued successfully");
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue button press message: {:?}", e);
-            Err(anyhow!("Message queue full or unavailable"))
+            warn!("⚠️ Failed to queue async button press message: {:?}", e);
+            Err(anyhow!("Async message queue full or unavailable"))
         }
     }
 }
 
-/// Send device status update to MQTT manager
+/// Send device status update to async MQTT manager
 pub async fn send_device_status(status: String, wifi_signal: Option<i32>) -> Result<()> {
     let message = MqttMessage::DeviceStatus {
         status,
@@ -433,76 +433,76 @@ pub async fn send_device_status(status: String, wifi_signal: Option<i32>) -> Res
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {
-            debug!("📤 Device status message queued successfully");
+            debug!("📤 Async device status message queued successfully");
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue device status message: {:?}", e);
-            Err(anyhow!("Message queue full or unavailable"))
+            warn!("⚠️ Failed to queue async device status message: {:?}", e);
+            Err(anyhow!("Async message queue full or unavailable"))
         }
     }
 }
 
-/// Send volume change notification to MQTT manager
+/// Send volume change notification to async MQTT manager
 pub async fn send_volume_change(volume: u8, source: String) -> Result<()> {
     let message = MqttMessage::VolumeChange { volume, source };
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {
-            debug!("📤 Volume change message queued successfully");
+            debug!("📤 Async volume change message queued successfully");
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue volume change message: {:?}", e);
-            Err(anyhow!("Message queue full or unavailable"))
+            warn!("⚠️ Failed to queue async volume change message: {:?}", e);
+            Err(anyhow!("Async message queue full or unavailable"))
         }
     }
 }
 
-/// Request MQTT connection
+/// Request async MQTT connection
 pub async fn request_connection() -> Result<()> {
     let message = MqttMessage::Connect;
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {
-            info!("📤 MQTT connection request queued");
+            info!("📤 Async MQTT connection request queued");
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue connection request: {:?}", e);
-            Err(anyhow!("Message queue full or unavailable"))
+            warn!("⚠️ Failed to queue async connection request: {:?}", e);
+            Err(anyhow!("Async message queue full or unavailable"))
         }
     }
 }
 
-/// Request MQTT disconnection
+/// Request async MQTT disconnection
 pub async fn request_disconnection() -> Result<()> {
     let message = MqttMessage::Disconnect;
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {
-            info!("📤 MQTT disconnection request queued");
+            info!("📤 Async MQTT disconnection request queued");
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue disconnection request: {:?}", e);
-            Err(anyhow!("Message queue full or unavailable"))
+            warn!("⚠️ Failed to queue async disconnection request: {:?}", e);
+            Err(anyhow!("Async message queue full or unavailable"))
         }
     }
 }
 
-/// Force MQTT reconnection
+/// Force async MQTT reconnection
 pub async fn force_reconnection() -> Result<()> {
     let message = MqttMessage::ForceReconnect;
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {
-            info!("📤 MQTT force reconnection request queued");
+            info!("📤 Async MQTT force reconnection request queued");
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue force reconnection request: {:?}", e);
-            Err(anyhow!("Message queue full or unavailable"))
+            warn!("⚠️ Failed to queue async force reconnection request: {:?}", e);
+            Err(anyhow!("Async message queue full or unavailable"))
         }
     }
 }

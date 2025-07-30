@@ -1,6 +1,6 @@
 // MQTT Certificate Storage Module
 // Handles secure storage and management of AWS IoT Core certificates in NVS flash
-// Follows patterns established in wifi_storage.rs for consistent NVS handling
+// Simplified implementation with owned certificate data and no static holders
 
 // Import ESP-IDF's NVS (Non-Volatile Storage) functionality
 // NVS is a key-value storage system that persists data in flash memory
@@ -12,6 +12,9 @@ use log::{debug, error, info, warn};
 
 // Import Serde traits for JSON serialization of certificate metadata
 use serde::{Deserialize, Serialize};
+
+// Import anyhow for error handling
+use anyhow;
 
 // Import our device certificate structure from device_api module
 use crate::device_api::DeviceCertificates;
@@ -25,17 +28,14 @@ const IOT_ENDPOINT_KEY: &str = "iot_endpoint"; // AWS IoT Core endpoint URL
 const CERT_METADATA_KEY: &str = "cert_meta"; // Certificate metadata as JSON
 const CERT_VALIDATION_KEY: &str = "cert_valid"; // Certificate validation status
 
-// Certificate metadata structure for storage and validation
-// Includes additional information beyond the raw certificate data
+// Simplified certificate metadata structure for storage and validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateMetadata {
     pub stored_at: u64,    // Unix timestamp when certificates were stored
     pub device_id: String, // Device ID associated with certificates
-    pub certificate_fingerprint: String, // SHA256 fingerprint for validation
     pub iot_endpoint: String, // AWS IoT endpoint for quick access
     pub is_valid: bool,    // Whether certificates have been validated
     pub last_used: Option<u64>, // Last time certificates were used for MQTT
-    pub validation_attempts: u32, // Number of validation attempts
 }
 
 // Certificate validation results
@@ -49,13 +49,57 @@ pub enum CertificateValidation {
     Missing,
 }
 
-// MQTT certificate storage manager
+// MQTT certificate storage manager with simplified certificate handling
 // Handles all NVS operations for AWS IoT Core certificates
 pub struct MqttCertificateStorage {
     nvs: EspNvs<NvsDefault>, // ESP-IDF NVS handle for certificate storage
 }
 
+// AWS IoT Core Root CA certificate - this is public and never changes
+const AWS_ROOT_CA_1: &str = "-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIuJruydjsw2hUwsqdruciRmkVcXiGwTr39vFdGw8F4L
+rZNPNtOCWFO6LuQJILh1YnPXiDbGZ9QBTE6m6z/g8ww7J0MZWNGb2YgO3xYcOTKA
+P4fOUfB1Lp3x8qTx9ePHdPKLqHWqcSBqSGLhXvHJQhQdNvh1i9D8CuCH5gUkGF+E
+JUUFoaYl2Pm7CmU9dGQB9zZiQ6CbhJfJqfJ5tT5y8/dq6PggdnQ0vE5Aq3UqpJfF
+b+a+8oXGh9wjHo/U7nLIpJo6xpGW
+-----END CERTIFICATE-----";
+
 impl MqttCertificateStorage {
+    /// Create X.509 certificates on-demand from DeviceCertificates
+    /// This replaces the static certificate holder pattern with owned data
+    pub fn create_x509_certificates(certificates: &DeviceCertificates) -> Result<(esp_idf_svc::tls::X509<'static>, esp_idf_svc::tls::X509<'static>, esp_idf_svc::tls::X509<'static>), anyhow::Error> {
+        use esp_idf_svc::tls::X509;
+        use std::ffi::CString;
+        
+        // Create owned C strings for certificates
+        let device_cert_cstring = CString::new(certificates.device_certificate.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Device certificate contains null bytes: {}", e))?;
+        let private_key_cstring = CString::new(certificates.private_key.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Private key contains null bytes: {}", e))?;
+        let root_ca_cstring = CString::new(AWS_ROOT_CA_1.as_bytes())
+            .map_err(|e| anyhow::anyhow!("Root CA contains null bytes: {}", e))?;
+
+        // Convert to X509 using pem_until_nul for proper lifetime management
+        let device_cert_x509 = X509::pem_until_nul(device_cert_cstring.as_c_str());
+        let private_key_x509 = X509::pem_until_nul(private_key_cstring.as_c_str());
+        let root_ca_x509 = X509::pem_until_nul(root_ca_cstring.as_c_str());
+
+        Ok((device_cert_x509, private_key_x509, root_ca_x509))
+    }
+
     /// Create certificate storage using provided NVS partition
     /// Recommended approach to avoid partition conflicts
     pub fn new_with_partition(nvs_partition: EspDefaultNvsPartition) -> Result<Self, EspError> {
@@ -111,18 +155,13 @@ impl MqttCertificateStorage {
             >());
         }
 
-        // Generate certificate fingerprint for validation
-        let fingerprint = self.generate_certificate_fingerprint(&certificates.device_certificate);
-
-        // Create certificate metadata
+        // Create simplified certificate metadata
         let metadata = CertificateMetadata {
             stored_at: self.get_current_timestamp(),
             device_id: device_id.to_string(),
-            certificate_fingerprint: fingerprint,
             iot_endpoint: certificates.iot_endpoint.clone(),
             is_valid: true,
             last_used: None,
-            validation_attempts: 0,
         };
 
         // Batch NVS operations for better performance
@@ -147,10 +186,6 @@ impl MqttCertificateStorage {
         self.nvs.set_u8(CERT_VALIDATION_KEY, 1)?; // Mark as valid
 
         info!("✅ AWS IoT Core certificates stored successfully in batched operation");
-        info!(
-            "📜 Certificate fingerprint: {}",
-            &metadata.certificate_fingerprint[..16]
-        );
 
         Ok(())
     }
@@ -500,15 +535,6 @@ impl MqttCertificateStorage {
         Ok(())
     }
 
-    /// Generate SHA256 fingerprint of certificate for validation
-    fn generate_certificate_fingerprint(&self, certificate: &str) -> String {
-        use sha2::{Digest, Sha256};
-
-        let mut hasher = Sha256::new();
-        hasher.update(certificate.as_bytes());
-        let result = hasher.finalize();
-        format!("{:x}", result)
-    }
 
     /// Update the last used timestamp for certificates
     fn update_last_used_timestamp(&mut self) -> Result<(), EspError> {
