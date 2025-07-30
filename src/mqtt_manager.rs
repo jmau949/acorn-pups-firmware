@@ -342,18 +342,6 @@ impl MqttManager {
                     wifi_signal: Some(-45), // TODO: Get actual WiFi signal
                 });
 
-                // Publish initial device shadow (required by AWS IoT policy)
-                info!("🔄 Publishing initial device shadow document");
-                match self.client.publish_device_shadow().await {
-                    Ok(_) => {
-                        info!("✅ Initial device shadow published successfully");
-                    }
-                    Err(e) => {
-                        warn!("⚠️ Failed to publish initial device shadow: {}", e);
-                        // Non-critical error - continue operation
-                    }
-                }
-
                 Ok(())
             }
             Err(e) => {
