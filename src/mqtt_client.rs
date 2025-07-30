@@ -187,8 +187,9 @@ impl AwsIotMqttClient {
         };
 
         // Create callback-based client first, then wrap with async interface
-        match EspMqttClient::new_cb(&broker_url, &mqtt_config, |_| {
-            // Callback is not used in async mode - all events handled via connection
+        match EspMqttClient::new_cb(&broker_url, &mqtt_config, |event| {
+            // Handle MQTT events through callback and log them
+            Self::handle_mqtt_callback_event(event);
         }) {
             Ok(sync_client) => {
                 info!("✅ Synchronous MQTT client created, wrapping with async interface");
@@ -464,12 +465,27 @@ impl AwsIotMqttClient {
     /// Process incoming MQTT messages asynchronously
     /// This replaces the callback-based approach with async message processing
     pub async fn process_messages(&mut self) -> Result<()> {
-        if let Some(_client) = self.client.as_mut() {
+        if let Some(client) = self.client.as_mut() {
             debug!("🔒 Processing async MQTT messages");
             
-            // For EspAsyncMqttClient, message processing is handled internally
-            // We just need to ensure the client is active
-            Ok(())
+            // Try to receive a message with a short timeout
+            match with_timeout(Duration::from_millis(100), async {
+                client.next().await
+            }).await {
+                Ok(Ok(event)) => {
+                    debug!("📡 Received async MQTT event");
+                    self.handle_mqtt_event_async(&event).await?;
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    warn!("⚠️ MQTT event error: {:?}", e);
+                    Ok(()) // Don't fail on individual message errors
+                }
+                Err(_) => {
+                    // Timeout - no messages available, this is normal
+                    Ok(())
+                }
+            }
         } else {
             debug!("📭 MQTT not connected, no messages to process");
             Ok(())
@@ -494,34 +510,60 @@ impl AwsIotMqttClient {
     /// Extract topic and payload from MQTT event for async processing
     fn extract_message_data_async(
         &self,
-        _event: &esp_idf_svc::mqtt::client::EspMqttEvent,
+        event: &esp_idf_svc::mqtt::client::EspMqttEvent,
     ) -> Option<(String, Vec<u8>)> {
-        // TODO: Implement message extraction based on actual EspMqttEvent structure
-        // For now, return None as a placeholder
-        debug!("📋 MQTT event received but extraction not implemented yet");
-        None
+        use esp_idf_svc::mqtt::client::EspMqttEvent;
+        
+        match event {
+            EspMqttEvent::Received { id: _, topic, data, dup: _, qos: _, retain: _ } => {
+                if let (Some(topic_str), Some(payload_data)) = (topic, data) {
+                    let topic = topic_str.to_string();
+                    let payload = payload_data.to_vec();
+                    
+                    info!("📨 ✅ MQTT MESSAGE RECEIVED - topic='{}', payload_size={} bytes", 
+                           topic, payload.len());
+                    
+                    Some((topic, payload))
+                } else {
+                    debug!("📭 MQTT event missing topic or data");
+                    None
+                }
+            }
+            EspMqttEvent::Connected => {
+                info!("🔗 MQTT Connected event received");
+                None
+            }
+            EspMqttEvent::Disconnected => {
+                warn!("🔌 MQTT Disconnected event received");
+                None
+            }
+            _ => {
+                debug!("📋 Other MQTT event received: {:?}", event);
+                None
+            }
+        }
     }
 
     /// Route incoming MQTT messages to appropriate async handlers
     async fn route_mqtt_message_async(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
-        debug!(
-            "📨 Routing async MQTT message on topic: {}, payload size: {} bytes",
+        info!(
+            "🎯 ✅ ROUTING MQTT MESSAGE - topic: {}, payload size: {} bytes",
             topic,
             payload.len()
         );
 
         // Route based on topic patterns
         if topic.contains("settings") {
-            info!("🔧 Processing settings message asynchronously");
+            info!("🔧 ✅ DETECTED SETTINGS MESSAGE - routing to settings handler");
             self.handle_settings_message_async(topic, payload).await?;
         } else if topic.contains("commands") {
-            info!("📋 Processing command message asynchronously");
+            info!("📋 ✅ DETECTED COMMAND MESSAGE - routing to command handler");
             self.handle_command_message_async(topic, payload).await?;
         } else if topic.contains("status-request") {
-            info!("📊 Processing status request asynchronously");
+            info!("📊 ✅ DETECTED STATUS REQUEST - routing to status handler");
             self.handle_status_request_async(topic, payload).await?;
         } else {
-            debug!("📋 Unhandled async message topic: {}", topic);
+            info!("❓ UNHANDLED MESSAGE TOPIC: {}", topic);
         }
 
         Ok(())
@@ -659,6 +701,51 @@ impl AwsIotMqttClient {
             debug!("  ✅ Async MQTT Client exists");
         } else {
             debug!("  ❌ Async MQTT Client is None");
+        }
+    }
+
+    /// Handle MQTT events from the callback (static method)
+    fn handle_mqtt_callback_event(event: &esp_idf_svc::mqtt::client::EspMqttEvent) {
+        use esp_idf_svc::mqtt::client::EspMqttEvent;
+        
+        info!("📡 ✅ MQTT CALLBACK EVENT RECEIVED");
+        
+        match event {
+            EspMqttEvent::Received { id: _, topic, data, dup: _, qos: _, retain: _ } => {
+                if let (Some(topic_str), Some(payload_data)) = (topic, data) {
+                    info!("📨 ✅ ✨ SETTINGS MESSAGE RECEIVED VIA CALLBACK");
+                    info!("🎯 Topic: {}", topic_str);
+                    info!("📦 Payload size: {} bytes", payload_data.len());
+                    
+                    // Convert payload to string and log it
+                    if let Ok(payload_str) = std::str::from_utf8(payload_data) {
+                        info!("📝 Payload content: {}", payload_str);
+                        
+                        // If this is a settings message, handle it
+                        if topic_str.contains("settings") {
+                            info!("🔧 ✅ ✨ PROCESSING SETTINGS MESSAGE FROM CALLBACK");
+                            
+                            // Send to settings manager
+                            crate::settings::request_mqtt_settings_update(payload_str.to_string());
+                            
+                            info!("✅ ✨ Settings message forwarded to settings manager via callback");
+                        }
+                    } else {
+                        warn!("⚠️ Could not decode payload as UTF-8");
+                    }
+                } else {
+                    debug!("📭 MQTT event missing topic or data");
+                }
+            }
+            EspMqttEvent::Connected => {
+                info!("🔗 ✅ MQTT Connected via callback");
+            }
+            EspMqttEvent::Disconnected => {
+                warn!("🔌 ❌ MQTT Disconnected via callback");
+            }
+            _ => {
+                debug!("📋 Other MQTT event via callback: {:?}", event);
+            }
         }
     }
 }
