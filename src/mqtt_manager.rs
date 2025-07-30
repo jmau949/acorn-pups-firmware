@@ -387,15 +387,16 @@ impl MqttManager {
 
     /// Get topic name for a message (for event reporting)
     fn get_message_topic(&self, message: &MqttMessage) -> String {
+        let client_id = format!("acorn-receiver-{}", self.device_id);
         match message {
             MqttMessage::ButtonPress { .. } => {
-                format!("acorn-pups/button-press/{}", self.device_id)
+                format!("acorn-pups/button-press/{}", client_id)
             }
             MqttMessage::DeviceStatus { .. } => {
-                format!("acorn-pups/status-response/{}", self.device_id)
+                format!("acorn-pups/status-response/{}", client_id)
             }
             MqttMessage::VolumeChange { .. } => {
-                format!("acorn-pups/status-response/{}", self.device_id)
+                format!("acorn-pups/status-response/{}", client_id)
             }
             _ => "system".to_string(),
         }

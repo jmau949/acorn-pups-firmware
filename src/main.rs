@@ -81,6 +81,7 @@ mod mqtt_manager; // Embassy task coordination for MQTT operations
 mod reset_handler; // Reset behavior execution and notification processing
 mod reset_manager; // GPIO reset button monitoring and state management
                    // Note: reset_storage module removed - functionality moved to reset_manager
+mod settings; // Device settings management with MQTT and NVS integration
 mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
@@ -94,6 +95,7 @@ use reset_handler::ResetHandler; // Reset behavior execution
 use reset_manager::{
     RecoverySystemComponents, ResetManager, ResetManagerEvent, TieredRecoveryManager,
 }; // Reset button monitoring and tiered recovery
+use settings::SettingsManager; // Device settings management
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 // Import our reset manager with tiered recovery
@@ -1294,6 +1296,18 @@ async fn test_connectivity_and_register(
                 )) {
                     error!("❌ Failed to spawn MQTT manager task");
                     warn!("🔄 Attempting tiered recovery for MQTT spawn failure");
+                } else {
+                    info!("✅ MQTT manager task spawned successfully");
+                }
+
+                // Spawn settings manager task for device settings management
+                if let Err(_) = spawner.spawn(settings_manager_task(
+                    registered_device_id.clone(),
+                    nvs_partition.clone(),
+                )) {
+                    error!("❌ Failed to spawn settings manager task");
+                } else {
+                    info!("✅ Settings manager task spawned successfully");
 
                     // Use tiered recovery for MQTT spawn failures
                     let mut recovery_manager = TieredRecoveryManager::new(device_id.clone());
@@ -1678,6 +1692,37 @@ async fn mqtt_manager_task(device_id: String, nvs_partition: EspDefaultNvsPartit
             loop {
                 Timer::after(Duration::from_secs(60)).await;
                 warn!("⚠️ MQTT manager task is inactive due to initialization failure");
+            }
+        }
+    }
+}
+
+// SETTINGS MANAGER TASK - Handles device settings with MQTT and NVS integration
+#[embassy_executor::task]
+async fn settings_manager_task(device_id: String, nvs_partition: EspDefaultNvsPartition) {
+    info!("🔧 Settings Manager Task started for device: {}", device_id);
+
+    // Initialize settings manager with NVS partition
+    match SettingsManager::new_with_partition(nvs_partition, device_id.clone()) {
+        Ok(mut settings_manager) => {
+            info!("✅ Settings manager initialized successfully");
+
+            // Run the settings manager main loop
+            settings_manager.run_settings_task().await;
+        }
+        Err(e) => {
+            error!("❌ Failed to initialize settings manager: {}", e);
+
+            // Signal system error
+            SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemError(format!(
+                "Settings manager initialization failed: {}",
+                e
+            )));
+
+            // Task remains alive but non-functional
+            loop {
+                Timer::after(Duration::from_secs(60)).await;
+                warn!("⚠️ Settings manager task is inactive due to initialization failure");
             }
         }
     }
