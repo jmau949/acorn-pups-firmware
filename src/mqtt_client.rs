@@ -3,9 +3,7 @@
 // Fully async implementation using EspAsyncMqttClient and owned certificate data
 
 // Import ESP-IDF async MQTT client functionality
-use esp_idf_svc::mqtt::client::{
-    EspAsyncMqttClient, EspMqttClient, MqttClientConfiguration, QoS,
-};
+use esp_idf_svc::mqtt::client::{EspAsyncMqttClient, EspMqttClient, MqttClientConfiguration, QoS};
 
 // Import Embassy time utilities for timeouts and delays
 use embassy_time::{with_timeout, Duration};
@@ -67,6 +65,7 @@ pub enum MqttConnectionState {
 /// Handles mutual TLS authentication with device certificates using EspAsyncMqttClient
 pub struct AwsIotMqttClient {
     client: Option<EspAsyncMqttClient>,
+    connection: Option<esp_idf_svc::mqtt::client::EspAsyncMqttConnection>,
     certificates: Option<DeviceCertificates>,
     device_id: String,
     client_id: String,
@@ -85,6 +84,7 @@ impl AwsIotMqttClient {
 
         Self {
             client: None,
+            connection: None,
             certificates: None,
             device_id,
             client_id,
@@ -126,7 +126,7 @@ impl AwsIotMqttClient {
 
                 // Store certificates as owned data in the struct
                 self.certificates = Some(certificates);
-                info!("🔒 X.509 certificates stored as owned data and ready for async TLS");
+                info!("�� X.509 certificates stored as owned data and ready for async TLS");
                 Ok(())
             }
             None => {
@@ -186,33 +186,15 @@ impl AwsIotMqttClient {
             ..Default::default()
         };
 
-        // Create callback-based client first, then wrap with async interface
-        match EspMqttClient::new_cb(&broker_url, &mqtt_config, |_| {
-            // Callback is not used in async mode - all events handled via connection
-        }) {
-            Ok(sync_client) => {
-                info!("✅ Synchronous MQTT client created, wrapping with async interface");
+        // Directly create async client and its connection (preferred)
+        match EspAsyncMqttClient::new(&broker_url, &mqtt_config) {
+            Ok((async_client, connection)) => {
+                self.client = Some(async_client);
+                self.connection = Some(connection);
+                self.connection_state = MqttConnectionState::Connecting;
 
-                // Wrap with async interface using EspAsyncMqttClient::wrap
-                match EspAsyncMqttClient::wrap(sync_client) {
-                    Ok(async_client) => {
-                        // Store the async client (connection is handled internally)
-                        self.client = Some(async_client);
-                        self.connection_state = MqttConnectionState::Connecting;
-
-                        info!("✅ Async MQTT client and connection created successfully");
-                        info!("⏳ MQTT handshake in progress - connection state: Connecting");
-                        
-                        // Connection state will be updated to Connected after successful handshake
-                        // Subscriptions should wait for connection to be fully established
-                        Ok(())
-                    }
-                    Err(e) => {
-                        error!("❌ Failed to wrap MQTT client: {:?}", e);
-                        self.connection_state = MqttConnectionState::Error;
-                        Err(anyhow!("MQTT client wrapping failed: {:?}", e))
-                    }
-                }
+                info!("✅ Async MQTT client and connection created; handshake in progress");
+                Ok(())
             }
             Err(e) => {
                 error!("❌ Failed to create MQTT client: {:?}", e);
@@ -225,11 +207,11 @@ impl AwsIotMqttClient {
     /// Wait for MQTT connection to be fully established
     async fn wait_for_connection(&mut self) -> Result<()> {
         info!("⏳ Waiting for MQTT connection to be fully established...");
-        
+
         // For ESP-IDF async MQTT, we'll wait a bit for the connection to establish
         // The logs show the connection does establish after a few seconds
         embassy_time::Timer::after(Duration::from_secs(3)).await;
-        
+
         self.connection_state = MqttConnectionState::Connected;
         info!("✅ MQTT connection assumed established after delay");
         Ok(())
@@ -239,7 +221,7 @@ impl AwsIotMqttClient {
     pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
         // First wait for the connection to be fully established
         self.wait_for_connection().await?;
-        
+
         if let Some(client) = self.client.as_mut() {
             let client_id = &self.client_id;
             info!(
@@ -431,6 +413,7 @@ impl AwsIotMqttClient {
 
         // Clean up async MQTT client
         self.client = None;
+        self.connection = None;
         self.connection_state = MqttConnectionState::Disconnected;
 
         info!("✅ Disconnected from AWS IoT Core");
@@ -464,16 +447,25 @@ impl AwsIotMqttClient {
     /// Process incoming MQTT messages asynchronously
     /// This replaces the callback-based approach with async message processing
     pub async fn process_messages(&mut self) -> Result<()> {
-        if let Some(_client) = self.client.as_mut() {
-            debug!("🔒 Processing async MQTT messages");
-            
-            // For EspAsyncMqttClient, message processing is handled internally
-            // We just need to ensure the client is active
-            Ok(())
-        } else {
+        if self.connection.is_none() {
             debug!("📭 MQTT not connected, no messages to process");
-            Ok(())
+            return Ok(());
         }
+
+        // Temporarily take ownership of the connection to avoid borrow checker issues.
+        let mut connection = self.connection.take().unwrap();
+
+        if let Ok(Ok(evt)) = with_timeout(Duration::from_millis(50), connection.next()).await {
+            // Process the event while `self.connection` is not borrowed.
+            if let Err(e) = self.handle_mqtt_event_async(evt).await {
+                warn!("⚠️ Error while handling MQTT event: {}", e);
+            }
+        }
+
+        // Put the connection back.
+        self.connection = Some(connection);
+
+        Ok(())
     }
 
     /// Handle incoming MQTT events asynchronously
@@ -494,12 +486,25 @@ impl AwsIotMqttClient {
     /// Extract topic and payload from MQTT event for async processing
     fn extract_message_data_async(
         &self,
-        _event: &esp_idf_svc::mqtt::client::EspMqttEvent,
+        event: &esp_idf_svc::mqtt::client::EspMqttEvent,
     ) -> Option<(String, Vec<u8>)> {
-        // TODO: Implement message extraction based on actual EspMqttEvent structure
-        // For now, return None as a placeholder
-        debug!("📋 MQTT event received but extraction not implemented yet");
-        None
+        use esp_idf_svc::mqtt::client::EventPayload;
+
+        match event.payload() {
+            EventPayload::Received {
+                topic: Some(topic),
+                data,
+                ..
+            } => {
+                debug!(
+                    "📋 MQTT Data event received: Topic: {}, Payload size: {} bytes",
+                    topic,
+                    data.len()
+                );
+                Some((topic.to_string(), data.to_vec()))
+            }
+            _ => None,
+        }
     }
 
     /// Route incoming MQTT messages to appropriate async handlers
@@ -529,7 +534,10 @@ impl AwsIotMqttClient {
 
     /// Handle incoming settings update messages asynchronously
     async fn handle_settings_message_async(&mut self, topic: &str, payload: &[u8]) -> Result<()> {
-        info!("🔧 ✅ FIRMWARE RECEIVED SETTINGS MESSAGE from topic: {}", topic);
+        info!(
+            "🔧 ✅ FIRMWARE RECEIVED SETTINGS MESSAGE from topic: {}",
+            topic
+        );
         info!("📦 Settings payload size: {} bytes", payload.len());
 
         // Convert payload to string
