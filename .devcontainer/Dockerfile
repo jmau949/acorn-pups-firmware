@@ -14,6 +14,8 @@ ARG GITHUB_TOKEN
 RUN apt-get update \
     && apt-get install -y pkg-config curl gcc clang libudev-dev unzip xz-utils \
     git wget flex bison gperf python3 python3-pip python3-venv cmake ninja-build ccache libffi-dev libssl-dev dfu-util libusb-1.0-0 \
+    && curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y nodejs \
     && apt-get clean -y && rm -rf /var/lib/apt/lists/* /tmp/library-scripts
 
 # Set users
@@ -27,6 +29,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
 
 # Update envs
 ENV PATH=${PATH}:/home/${CONTAINER_USER}/.cargo/bin
+
+# Install Claude CLI
+RUN npm install -g @anthropic-ai/claude-cli
 
 # Install extra crates
 RUN ARCH=$($HOME/.cargo/bin/rustup show | grep "Default host" | sed -e 's/.* //') && \
