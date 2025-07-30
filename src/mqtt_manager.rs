@@ -342,6 +342,18 @@ impl MqttManager {
                     wifi_signal: Some(-45), // TODO: Get actual WiFi signal
                 });
 
+                // Publish initial device shadow (required by AWS IoT policy)
+                info!("🔄 Publishing initial device shadow document");
+                match self.client.publish_device_shadow().await {
+                    Ok(_) => {
+                        info!("✅ Initial device shadow published successfully");
+                    }
+                    Err(e) => {
+                        warn!("⚠️ Failed to publish initial device shadow: {}", e);
+                        // Non-critical error - continue operation
+                    }
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -387,15 +399,16 @@ impl MqttManager {
 
     /// Get topic name for a message (for event reporting)
     fn get_message_topic(&self, message: &MqttMessage) -> String {
+        let client_id = format!("acorn-receiver-{}", self.device_id);
         match message {
             MqttMessage::ButtonPress { .. } => {
-                format!("acorn-pups/button-press/{}", self.device_id)
+                format!("acorn-pups/button-press/{}", client_id)
             }
             MqttMessage::DeviceStatus { .. } => {
-                format!("acorn-pups/status-response/{}", self.device_id)
+                format!("acorn-pups/status-response/{}", client_id)
             }
             MqttMessage::VolumeChange { .. } => {
-                format!("acorn-pups/status-response/{}", self.device_id)
+                format!("acorn-pups/status-response/{}", client_id)
             }
             _ => "system".to_string(),
         }

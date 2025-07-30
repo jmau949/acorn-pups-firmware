@@ -32,6 +32,7 @@ pub const TOPIC_SETTINGS: &str = "acorn-pups/settings";
 pub const TOPIC_COMMANDS: &str = "acorn-pups/commands";
 pub const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
 pub const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
+pub const TOPIC_FIRMWARE: &str = "acorn-pups/firmware";
 
 // Static certificate holder for managing certificate lifetimes
 // Uses OnceLock for safe static initialization without data races or memory leaks
@@ -334,10 +335,10 @@ impl AwsIotMqttClient {
     /// Subscribe to device-specific MQTT topics with retry logic for connection timing
     pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
         if let Some(client) = self.client.as_mut() {
-            let device_id = &self.device_id; // Use device_id as device_id for topics
+            let client_id = &self.client_id; // Use client_id (acorn-receiver-{device_id}) for topics to match AWS policy
             info!(
-                "🔗 Starting MQTT topic subscriptions for device: {}",
-                device_id
+                "🔗 Starting MQTT topic subscriptions for client: {}",
+                client_id
             );
 
             // Retry logic for subscription - ESP-IDF MQTT client needs time to establish connection
@@ -348,7 +349,7 @@ impl AwsIotMqttClient {
                 info!("📨 Subscription attempt {} of {}", attempt, max_attempts);
 
                 // Subscribe to settings updates
-                let settings_topic = format!("{}/{}", TOPIC_SETTINGS, device_id);
+                let settings_topic = format!("{}/{}", TOPIC_SETTINGS, client_id);
                 info!(
                     "📨 Attempting to subscribe to settings topic: {}",
                     settings_topic
@@ -362,7 +363,7 @@ impl AwsIotMqttClient {
                         );
 
                         // Subscribe to commands
-                        let commands_topic = format!("{}/{}", TOPIC_COMMANDS, device_id);
+                        let commands_topic = format!("{}/{}", TOPIC_COMMANDS, client_id);
                         info!(
                             "📨 Attempting to subscribe to commands topic: {}",
                             commands_topic
@@ -377,7 +378,7 @@ impl AwsIotMqttClient {
 
                                 // Subscribe to status request topic
                                 let status_req_topic =
-                                    format!("{}/{}", TOPIC_STATUS_REQUEST, device_id);
+                                    format!("{}/{}", TOPIC_STATUS_REQUEST, client_id);
                                 info!(
                                     "📨 Attempting to subscribe to status request topic: {}",
                                     status_req_topic
@@ -389,11 +390,42 @@ impl AwsIotMqttClient {
                                             "✅ Successfully subscribed to status request topic: {}",
                                             status_req_topic
                                         );
-                                        info!("✅ All MQTT topic subscriptions completed successfully");
-                                        info!("  📨 Settings: {}", settings_topic);
-                                        info!("  📨 Commands: {}", commands_topic);
-                                        info!("  📨 Status Request: {}", status_req_topic);
-                                        return Ok(());
+
+                                        // Subscribe to firmware updates (required by AWS IoT policy)
+                                        let firmware_topic =
+                                            format!("{}/{}", TOPIC_FIRMWARE, client_id);
+                                        info!(
+                                            "📨 Attempting to subscribe to firmware topic: {}",
+                                            firmware_topic
+                                        );
+
+                                        match client.subscribe(&firmware_topic, QoS::AtLeastOnce) {
+                                            Ok(_) => {
+                                                info!(
+                                                    "✅ Successfully subscribed to firmware topic: {}",
+                                                    firmware_topic
+                                                );
+                                                info!("✅ All MQTT topic subscriptions completed successfully");
+                                                info!("  📨 Settings: {}", settings_topic);
+                                                info!("  📨 Commands: {}", commands_topic);
+                                                info!("  📨 Status Request: {}", status_req_topic);
+                                                info!("  📨 Firmware: {}", firmware_topic);
+                                                return Ok(());
+                                            }
+                                            Err(e) => {
+                                                error!(
+                                                    "❌ Failed to subscribe to firmware topic: {:?}",
+                                                    e
+                                                );
+                                                if attempt >= max_attempts {
+                                                    return Err(anyhow!(
+                                                        "Failed to subscribe to firmware topic after {} attempts: {:?}",
+                                                        max_attempts,
+                                                        e
+                                                    ));
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         error!(
@@ -466,7 +498,7 @@ impl AwsIotMqttClient {
                 battery_level,
             };
 
-            let topic = format!("{}/{}", TOPIC_BUTTON_PRESS, self.device_id);
+            let topic = format!("{}/{}", TOPIC_BUTTON_PRESS, self.client_id);
             self.publish_json_message(&topic, &message).await?;
 
             info!(
@@ -495,7 +527,7 @@ impl AwsIotMqttClient {
                 wifi_rssi: 0,      // Placeholder, needs actual RSSI
             };
 
-            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.device_id);
+            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.client_id);
             self.publish_json_message(&topic, &message).await?;
 
             debug!("📊 Published authenticated device status: {}", status);
@@ -507,7 +539,7 @@ impl AwsIotMqttClient {
 
     /// Publish volume change notification
     pub async fn publish_volume_change(&mut self, volume: u8, source: &str) -> Result<()> {
-        let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.device_id);
+        let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.client_id);
         let device_id = self.device_id.clone();
         let timestamp = self.get_current_timestamp_u64();
 
@@ -661,6 +693,97 @@ impl AwsIotMqttClient {
         Ok(())
     }
 
+    /// Handle incoming firmware update messages (called from MQTT event callback)
+    pub fn handle_firmware_message(topic: &str, payload: &[u8]) -> Result<()> {
+        info!("🔄 Processing firmware update from topic: {}", topic);
+
+        // Convert payload to string for processing
+        let firmware_payload = std::str::from_utf8(payload)
+            .map_err(|e| anyhow!("Invalid UTF-8 in firmware payload: {}", e))?;
+
+        debug!("🔄 Firmware payload: {}", firmware_payload);
+
+        // For MVP, just log firmware updates - actual OTA would be implemented here
+        info!(
+            "🔄 Firmware update received (OTA not implemented): {}",
+            firmware_payload
+        );
+
+        // TODO: Implement actual OTA firmware update logic
+        // This would typically involve:
+        // 1. Validate firmware package
+        // 2. Download firmware
+        // 3. Apply update
+        // 4. Restart device
+
+        Ok(())
+    }
+
+    /// Update AWS IoT Thing Shadow (required by AWS IoT policy)
+    pub async fn update_thing_shadow(&mut self, shadow_document: &str) -> Result<()> {
+        if let Some(client) = self.client.as_mut() {
+            let shadow_topic = format!("$aws/things/{}/shadow/update", self.client_id);
+
+            info!("🔄 Updating Thing Shadow for: {}", self.client_id);
+            debug!("🔄 Shadow topic: {}", shadow_topic);
+
+            client
+                .publish(
+                    &shadow_topic,
+                    QoS::AtLeastOnce,
+                    false,
+                    shadow_document.as_bytes(),
+                )
+                .map_err(|e| anyhow!("Failed to update Thing Shadow: {:?}", e))?;
+
+            info!("✅ Thing Shadow updated successfully");
+            Ok(())
+        } else {
+            Err(anyhow!("MQTT client not initialized"))
+        }
+    }
+
+    /// Get AWS IoT Thing Shadow (required by AWS IoT policy)
+    pub async fn get_thing_shadow(&mut self) -> Result<()> {
+        if let Some(client) = self.client.as_mut() {
+            let shadow_topic = format!("$aws/things/{}/shadow/get", self.client_id);
+
+            info!("🔍 Getting Thing Shadow for: {}", self.client_id);
+            debug!("🔍 Shadow topic: {}", shadow_topic);
+
+            // Publish empty payload to request shadow
+            client
+                .publish(&shadow_topic, QoS::AtLeastOnce, false, b"")
+                .map_err(|e| anyhow!("Failed to get Thing Shadow: {:?}", e))?;
+
+            info!("✅ Thing Shadow get request sent");
+            Ok(())
+        } else {
+            Err(anyhow!("MQTT client not initialized"))
+        }
+    }
+
+    /// Publish initial device shadow document
+    pub async fn publish_device_shadow(&mut self) -> Result<()> {
+        let shadow_document = serde_json::json!({
+            "state": {
+                "reported": {
+                    "deviceId": self.device_id,
+                    "clientId": self.client_id,
+                    "firmwareVersion": "1.0.0",
+                    "status": "online",
+                    "lastSeen": self.get_current_timestamp_u64(),
+                    "connectivity": "wifi"
+                }
+            }
+        });
+
+        let shadow_json = serde_json::to_string(&shadow_document)
+            .map_err(|e| anyhow!("Failed to serialize shadow document: {}", e))?;
+
+        self.update_thing_shadow(&shadow_json).await
+    }
+
     /// Attempt reconnection using tiered recovery
     pub async fn attempt_reconnection(&mut self) -> Result<()> {
         info!("🔄 Attempting MQTT reconnection using tiered recovery");
@@ -741,6 +864,11 @@ impl AwsIotMqttClient {
             info!("📊 Routing status request to status handler");
             if let Err(e) = Self::handle_status_request(topic, payload) {
                 error!("❌ Status request handler failed: {}", e);
+            }
+        } else if topic.contains("firmware") {
+            info!("🔄 Routing firmware message to firmware handler");
+            if let Err(e) = Self::handle_firmware_message(topic, payload) {
+                error!("❌ Firmware message handler failed: {}", e);
             }
         } else {
             debug!("📋 Unhandled message topic: {}", topic);
