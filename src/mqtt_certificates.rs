@@ -31,10 +31,10 @@ const CERT_VALIDATION_KEY: &str = "cert_valid"; // Certificate validation status
 // Simplified certificate metadata structure for storage and validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CertificateMetadata {
-    pub stored_at: u64,    // Unix timestamp when certificates were stored
-    pub device_id: String, // Device ID associated with certificates
-    pub iot_endpoint: String, // AWS IoT endpoint for quick access
-    pub is_valid: bool,    // Whether certificates have been validated
+    pub stored_at: u64,         // Unix timestamp when certificates were stored
+    pub device_id: String,      // Device ID associated with certificates
+    pub iot_endpoint: String,   // AWS IoT endpoint for quick access
+    pub is_valid: bool,         // Whether certificates have been validated
     pub last_used: Option<u64>, // Last time certificates were used for MQTT
 }
 
@@ -80,22 +80,40 @@ b+a+8oXGh9wjHo/U7nLIpJo6xpGW
 impl MqttCertificateStorage {
     /// Create X.509 certificates on-demand from DeviceCertificates
     /// This replaces the static certificate holder pattern with owned data
-    pub fn create_x509_certificates(certificates: &DeviceCertificates) -> Result<(esp_idf_svc::tls::X509<'static>, esp_idf_svc::tls::X509<'static>, esp_idf_svc::tls::X509<'static>), anyhow::Error> {
+    pub fn create_x509_certificates(
+        certificates: &DeviceCertificates,
+    ) -> Result<
+        (
+            esp_idf_svc::tls::X509<'static>,
+            esp_idf_svc::tls::X509<'static>,
+            esp_idf_svc::tls::X509<'static>,
+        ),
+        anyhow::Error,
+    > {
         use esp_idf_svc::tls::X509;
-        use std::ffi::CString;
-        
-        // Create owned C strings for certificates
-        let device_cert_cstring = CString::new(certificates.device_certificate.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Device certificate contains null bytes: {}", e))?;
-        let private_key_cstring = CString::new(certificates.private_key.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Private key contains null bytes: {}", e))?;
-        let root_ca_cstring = CString::new(AWS_ROOT_CA_1.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Root CA contains null bytes: {}", e))?;
+
+        // Convert to X509 using owned byte vectors for static lifetime
+        let device_cert_bytes: &'static [u8] = Box::leak(
+            certificates
+                .device_certificate
+                .as_bytes()
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let private_key_bytes: &'static [u8] = Box::leak(
+            certificates
+                .private_key
+                .as_bytes()
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        let root_ca_bytes: &'static [u8] =
+            Box::leak(AWS_ROOT_CA_1.as_bytes().to_vec().into_boxed_slice());
 
         // Convert to X509 using pem_until_nul for proper lifetime management
-        let device_cert_x509 = X509::pem_until_nul(device_cert_cstring.as_c_str());
-        let private_key_x509 = X509::pem_until_nul(private_key_cstring.as_c_str());
-        let root_ca_x509 = X509::pem_until_nul(root_ca_cstring.as_c_str());
+        let device_cert_x509 = X509::pem_until_nul(device_cert_bytes);
+        let private_key_x509 = X509::pem_until_nul(private_key_bytes);
+        let root_ca_x509 = X509::pem_until_nul(root_ca_bytes);
 
         Ok((device_cert_x509, private_key_x509, root_ca_x509))
     }
@@ -534,7 +552,6 @@ impl MqttCertificateStorage {
         info!("✅ Certificate format validation passed");
         Ok(())
     }
-
 
     /// Update the last used timestamp for certificates
     fn update_last_used_timestamp(&mut self) -> Result<(), EspError> {

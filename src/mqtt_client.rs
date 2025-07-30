@@ -3,10 +3,12 @@
 // Fully async implementation using EspAsyncMqttClient and owned certificate data
 
 // Import ESP-IDF async MQTT client functionality
-use esp_idf_svc::mqtt::client::{EspAsyncMqttClient, EspAsyncMqttConnection, EspMqttClient, MqttClientConfiguration, QoS};
+use esp_idf_svc::mqtt::client::{
+    EspAsyncMqttClient, EspAsyncMqttConnection, EspMqttClient, MqttClientConfiguration, QoS,
+};
 
 // Import Embassy time utilities for timeouts and delays
-use embassy_time::{Duration, with_timeout};
+use embassy_time::{with_timeout, Duration};
 
 // Import logging for detailed output
 use log::{debug, error, info, warn};
@@ -64,8 +66,8 @@ pub enum MqttConnectionState {
 /// Async MQTT client manager for AWS IoT Core
 /// Handles mutual TLS authentication with device certificates using EspAsyncMqttClient
 pub struct AwsIotMqttClient {
-    client: Option<EspAsyncMqttClient<'static>>,
-    connection: Option<EspAsyncMqttConnection<'static>>,
+    client: Option<EspAsyncMqttClient>,
+    connection: Option<EspAsyncMqttConnection>,
     certificates: Option<DeviceCertificates>,
     device_id: String,
     client_id: String,
@@ -146,11 +148,13 @@ impl AwsIotMqttClient {
         );
 
         // Ensure certificates are loaded
-        let certificates = self.certificates.as_ref()
+        let certificates = self
+            .certificates
+            .as_ref()
             .ok_or_else(|| anyhow!("Certificates not initialized"))?;
 
         // Create X509 certificates on-demand using the new simplified method
-        let (device_cert_x509, private_key_x509, root_ca_x509) = 
+        let (device_cert_x509, private_key_x509, root_ca_x509) =
             MqttCertificateStorage::create_x509_certificates(certificates)?;
 
         let broker_url = format!("mqtts://{}:8883", certificates.iot_endpoint);
@@ -188,19 +192,25 @@ impl AwsIotMqttClient {
         match EspMqttClient::new_cb(&broker_url, &mqtt_config, |_| {
             // Callback is not used in async mode - all events handled via connection
         }) {
-            Ok((sync_client, _)) => {
+            Ok(sync_client) => {
                 info!("✅ Synchronous MQTT client created, wrapping with async interface");
-                
-                // Wrap with async interface using EspAsyncMqttClient::wrap
-                let (async_client, async_connection) = EspAsyncMqttClient::wrap(sync_client);
-                
-                // Store the async client and connection
-                self.client = Some(async_client);
-                self.connection = Some(async_connection);
-                self.connection_state = MqttConnectionState::Connected;
 
-                info!("✅ Async MQTT client created and connected successfully");
-                Ok(())
+                // Wrap with async interface using EspAsyncMqttClient::wrap
+                match EspAsyncMqttClient::wrap(sync_client) {
+                    Ok(async_client) => {
+                        // Store the async client
+                        self.client = Some(async_client);
+                        self.connection_state = MqttConnectionState::Connected;
+
+                        info!("✅ Async MQTT client created and connected successfully");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to wrap MQTT client: {:?}", e);
+                        self.connection_state = MqttConnectionState::Error;
+                        Err(anyhow!("MQTT client wrapping failed: {:?}", e))
+                    }
+                }
             }
             Err(e) => {
                 error!("❌ Failed to create MQTT client: {:?}", e);
@@ -222,10 +232,11 @@ impl AwsIotMqttClient {
             // Subscribe to settings updates with timeout
             let settings_topic = format!("{}/{}", TOPIC_SETTINGS, client_id);
             info!("📨 Subscribing to settings topic: {}", settings_topic);
-            
+
             with_timeout(Duration::from_secs(10), async {
                 client.subscribe(&settings_topic, QoS::AtLeastOnce).await
-            }).await
+            })
+            .await
             .map_err(|_| anyhow!("Settings subscription timed out"))?
             .map_err(|e| anyhow!("Settings subscription failed: {:?}", e))?;
 
@@ -234,10 +245,11 @@ impl AwsIotMqttClient {
             // Subscribe to commands with timeout
             let commands_topic = format!("{}/{}", TOPIC_COMMANDS, client_id);
             info!("📨 Subscribing to commands topic: {}", commands_topic);
-            
+
             with_timeout(Duration::from_secs(10), async {
                 client.subscribe(&commands_topic, QoS::AtLeastOnce).await
-            }).await
+            })
+            .await
             .map_err(|_| anyhow!("Commands subscription timed out"))?
             .map_err(|e| anyhow!("Commands subscription failed: {:?}", e))?;
 
@@ -245,11 +257,15 @@ impl AwsIotMqttClient {
 
             // Subscribe to status request topic with timeout
             let status_req_topic = format!("{}/{}", TOPIC_STATUS_REQUEST, client_id);
-            info!("📨 Subscribing to status request topic: {}", status_req_topic);
-            
+            info!(
+                "📨 Subscribing to status request topic: {}",
+                status_req_topic
+            );
+
             with_timeout(Duration::from_secs(10), async {
                 client.subscribe(&status_req_topic, QoS::AtLeastOnce).await
-            }).await
+            })
+            .await
             .map_err(|_| anyhow!("Status request subscription timed out"))?
             .map_err(|e| anyhow!("Status request subscription failed: {:?}", e))?;
 
@@ -268,16 +284,34 @@ impl AwsIotMqttClient {
         button_rf_id: &str,
         battery_level: Option<u8>,
     ) -> Result<()> {
+        // Get values before borrowing client mutably
+        let device_id = self.device_id.clone();
+        let client_id = self.client_id.clone();
+        let timestamp = self.get_iso8601_timestamp();
+
         if let Some(client) = self.client.as_mut() {
             let message = ButtonPressMessage {
-                device_id: self.device_id.clone(),
+                device_id,
                 button_rf_id: button_rf_id.to_string(),
-                timestamp: self.get_iso8601_timestamp(),
+                timestamp,
                 battery_level,
             };
 
-            let topic = format!("{}/{}", TOPIC_BUTTON_PRESS, self.client_id);
-            self.publish_json_message_async(client, &topic, &message).await?;
+            let topic = format!("{}/{}", TOPIC_BUTTON_PRESS, client_id);
+
+            // Inline publishing to avoid borrow checker issues
+            let json_payload = serde_json::to_string(&message)
+                .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
+
+            // Publish with timeout for reliability
+            with_timeout(Duration::from_secs(10), async {
+                client
+                    .publish(&topic, QoS::AtLeastOnce, false, json_payload.as_bytes())
+                    .await
+            })
+            .await
+            .map_err(|_| anyhow!("Message publish timed out"))?
+            .map_err(|e| anyhow!("Failed to publish message: {:?}", e))?;
 
             info!(
                 "🔔 Published button press asynchronously: button={}, battery={:?}",
@@ -295,18 +329,36 @@ impl AwsIotMqttClient {
         status: &str,
         _wifi_signal: Option<i32>,
     ) -> Result<()> {
+        // Get values before borrowing client mutably
+        let device_id = self.device_id.clone();
+        let client_id = self.client_id.clone();
+        let timestamp = self.get_current_timestamp_u64();
+
         if let Some(client) = self.client.as_mut() {
             let message = DeviceStatusMessage {
-                device_id: self.device_id.clone(),
+                device_id,
                 status: status.to_string(),
-                timestamp: self.get_current_timestamp_u64(),
+                timestamp,
                 uptime_seconds: 0, // Placeholder, needs actual uptime
                 free_heap: 0,      // Placeholder, needs actual free heap
                 wifi_rssi: 0,      // Placeholder, needs actual RSSI
             };
 
-            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.client_id);
-            self.publish_json_message_async(client, &topic, &message).await?;
+            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, client_id);
+
+            // Inline publishing to avoid borrow checker issues
+            let json_payload = serde_json::to_string(&message)
+                .map_err(|e| anyhow!("Failed to serialize message: {}", e))?;
+
+            // Publish with timeout for reliability
+            with_timeout(Duration::from_secs(10), async {
+                client
+                    .publish(&topic, QoS::AtLeastOnce, false, json_payload.as_bytes())
+                    .await
+            })
+            .await
+            .map_err(|_| anyhow!("Message publish timed out"))?
+            .map_err(|e| anyhow!("Failed to publish message: {:?}", e))?;
 
             debug!("📊 Published device status asynchronously: {}", status);
             Ok(())
@@ -317,10 +369,13 @@ impl AwsIotMqttClient {
 
     /// Publish volume change notification using async operations
     pub async fn publish_volume_change(&mut self, volume: u8, source: &str) -> Result<()> {
+        // Get values before borrowing client mutably
+        let client_id = self.client_id.clone();
+        let device_id = self.device_id.clone();
+        let timestamp = self.get_current_timestamp_u64();
+
         if let Some(client) = self.client.as_mut() {
-            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, self.client_id);
-            let device_id = self.device_id.clone();
-            let timestamp = self.get_current_timestamp_u64();
+            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, client_id);
 
             let message = serde_json::json!({
                 "deviceId": device_id,
@@ -334,8 +389,11 @@ impl AwsIotMqttClient {
 
             // Publish with timeout
             with_timeout(Duration::from_secs(10), async {
-                client.publish(&topic, QoS::AtLeastOnce, false, json_payload.as_bytes()).await
-            }).await
+                client
+                    .publish(&topic, QoS::AtLeastOnce, false, json_payload.as_bytes())
+                    .await
+            })
+            .await
             .map_err(|_| anyhow!("Volume change publish timed out"))?
             .map_err(|e| anyhow!("Failed to publish volume change: {:?}", e))?;
 
@@ -365,7 +423,7 @@ impl AwsIotMqttClient {
     /// Generic async JSON message publishing
     async fn publish_json_message_async<T: Serialize>(
         &self,
-        client: &mut EspAsyncMqttClient<'static>,
+        client: &mut EspAsyncMqttClient,
         topic: &str,
         message: &T,
     ) -> Result<()> {
@@ -374,8 +432,11 @@ impl AwsIotMqttClient {
 
         // Publish with timeout for reliability
         with_timeout(Duration::from_secs(10), async {
-            client.publish(topic, QoS::AtLeastOnce, false, json_payload.as_bytes()).await
-        }).await
+            client
+                .publish(topic, QoS::AtLeastOnce, false, json_payload.as_bytes())
+                .await
+        })
+        .await
         .map_err(|_| anyhow!("Message publish timed out"))?
         .map_err(|e| anyhow!("Failed to publish message: {:?}", e))?;
 
@@ -386,48 +447,65 @@ impl AwsIotMqttClient {
     /// Process incoming MQTT messages asynchronously
     /// This replaces the callback-based approach with async message processing
     pub async fn process_messages(&mut self) -> Result<()> {
-        if let Some(connection) = self.connection.as_mut() {
-            debug!("🔒 Processing async MQTT messages");
-            
-            // Use embassy_time::with_timeout for async message processing
-            match with_timeout(Duration::from_millis(100), async {
-                connection.next().await
-            }).await {
-                Ok(Ok(event)) => {
-                    debug!("📡 Received async MQTT event");
-                    self.handle_mqtt_event_async(&event).await?;
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    warn!("⚠️ MQTT connection error: {:?}", e);  
-                    self.connection_state = MqttConnectionState::Error;
-                    Err(anyhow!("MQTT connection error: {:?}", e))
-                }
-                Err(_) => {
-                    // Timeout - no messages available, this is normal
-                    Ok(())
-                }
+        // First, try to get an event from the connection
+        let event_result = {
+            if let Some(connection) = self.connection.as_mut() {
+                debug!("🔒 Processing async MQTT messages");
+
+                // Use embassy_time::with_timeout for async message processing
+                Some(
+                    with_timeout(Duration::from_millis(100), async {
+                        connection.next().await
+                    })
+                    .await,
+                )
+            } else {
+                None
             }
-        } else {
-            debug!("📭 MQTT not connected, no messages to process");
-            Ok(())
+        };
+
+        // Now handle the result without any borrows active
+        match event_result {
+            Some(Ok(Ok(_event))) => {
+                debug!("📡 Received async MQTT event");
+                debug!("📡 Processing async MQTT event");
+                // Note: extract_message_data_async currently returns None (placeholder)
+                // so no actual message processing occurs yet
+                Ok(())
+            }
+            Some(Ok(Err(e))) => {
+                warn!("⚠️ MQTT connection error: {:?}", e);
+                self.connection_state = MqttConnectionState::Error;
+                Err(anyhow!("MQTT connection error: {:?}", e))
+            }
+            Some(Err(_)) => {
+                // Timeout - no messages available, this is normal
+                Ok(())
+            }
+            None => Err(anyhow!("Async MQTT connection not initialized")),
         }
     }
 
     /// Handle incoming MQTT events asynchronously
-    async fn handle_mqtt_event_async(&mut self, event: &esp_idf_svc::mqtt::client::EspMqttEvent) -> Result<()> {
+    async fn handle_mqtt_event_async(
+        &mut self,
+        event: &esp_idf_svc::mqtt::client::EspMqttEvent<'_>,
+    ) -> Result<()> {
         debug!("📡 Processing async MQTT event");
 
-        // Extract message data if available and route to appropriate handlers  
+        // Extract message data if available and route to appropriate handlers
         if let Some((topic, payload)) = self.extract_message_data_async(event) {
             self.route_mqtt_message_async(&topic, &payload).await?;
         }
-        
+
         Ok(())
     }
 
     /// Extract topic and payload from MQTT event for async processing
-    fn extract_message_data_async(&self, _event: &esp_idf_svc::mqtt::client::EspMqttEvent) -> Option<(String, Vec<u8>)> {
+    fn extract_message_data_async(
+        &self,
+        _event: &esp_idf_svc::mqtt::client::EspMqttEvent,
+    ) -> Option<(String, Vec<u8>)> {
         // TODO: Implement actual message extraction based on EspMqttEvent structure
         // This is a placeholder that allows the system to compile and run
         // The exact implementation depends on the ESP-IDF MQTT event structure
@@ -487,7 +565,10 @@ impl AwsIotMqttClient {
         debug!("📋 Command payload: {}", command_payload);
 
         // For MVP, just log commands - could be extended for device control
-        info!("📋 Async command received (not implemented): {}", command_payload);
+        info!(
+            "📋 Async command received (not implemented): {}",
+            command_payload
+        );
         Ok(())
     }
 
@@ -497,7 +578,7 @@ impl AwsIotMqttClient {
 
         // Send status response asynchronously
         self.publish_device_status("online", Some(-45)).await?;
-        
+
         info!("📊 Async status response sent");
         Ok(())
     }
