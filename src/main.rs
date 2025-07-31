@@ -78,7 +78,8 @@ mod device_api; // Device-specific API client for ESP32 receivers
 mod mqtt_certificates; // Secure storage of AWS IoT Core certificates
 mod mqtt_client; // AWS IoT Core MQTT client with TLS authentication
 mod mqtt_manager; // Embassy task coordination for MQTT operations
-mod reset_handler; // Reset behavior execution and notification processing
+mod reset_handler; // Reset behavior execution
+                   // Note: ResetNotificationData no longer needed with new architecture
 mod reset_manager; // GPIO reset button monitoring and state management
                    // Note: reset_storage module removed - functionality moved to reset_manager
 mod settings; // Device settings management with MQTT and NVS integration
@@ -92,14 +93,12 @@ use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
 use reset_handler::ResetHandler; // Reset behavior execution
                                  // Note: ResetNotificationData no longer needed with new architecture
-use reset_manager::{
-    RecoverySystemComponents, ResetManager, ResetManagerEvent, TieredRecoveryManager,
-}; // Reset button monitoring and tiered recovery
+use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring and tiered recovery
 use settings::SettingsManager; // Device settings management
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 // Import our reset manager with tiered recovery
-use crate::reset_manager::RecoveryTier;
+// Note: RecoveryTier enum no longer used
 
 // Helper functions to get real device information
 fn get_device_serial_number() -> String {
@@ -631,59 +630,16 @@ async fn main(spawner: Spawner) {
             SystemEvent::SystemError(error) => {
                 error!("💥 System error: {}", error);
 
-                // Check if this is an MQTT-related error that requires recovery
-                if error.contains("MQTT connection failed") {
-                    error!("🔄 MQTT connection failure detected - using tiered recovery system");
+                // Check if this is an MQTT-related error
+                if error.contains("MQTT connection failed") || error.contains("MQTT") {
+                    error!("🔄 MQTT-related error detected: {}", error);
+                    error!("📋 MQTT manager should handle its own retries - no duplicate spawning");
+                    warn!("⚠️ If MQTT issues persist, the existing MQTT manager will trigger factory reset");
 
-                    // Initialize tiered recovery manager with system components
-                    let device_id = generate_device_id();
-                    let mut recovery_manager = TieredRecoveryManager::new(device_id);
-
-                    // Set up recovery system components
-                    let _nvs_partition = match EspDefaultNvsPartition::take() {
-                        Ok(partition) => partition,
-                        Err(e) => {
-                            error!("❌ Failed to take NVS partition for recovery: {:?}", e);
-                            warn!("⚠️ Continuing without tiered recovery");
-                            continue;
-                        }
-                    };
-
-                    let certificate_storage = match MqttCertificateStorage::new() {
-                        Ok(storage) => Some(storage),
-                        Err(e) => {
-                            error!(
-                                "❌ Failed to initialize certificate storage for recovery: {:?}",
-                                e
-                            );
-                            None
-                        }
-                    };
-
-                    let components = RecoverySystemComponents {
-                        certificate_storage,
-                    };
-
-                    recovery_manager.set_system_components(components);
-
-                    // Attempt tiered recovery instead of immediate factory reset
-                    match recovery_manager
-                        .attempt_recovery("MQTT connection failed")
-                        .await
-                    {
-                        Ok(recovery_tier) => {
-                            info!("✅ Recovery completed at tier: {:?}", recovery_tier);
-                            info!("📡 System should be operational again");
-                        }
-                        Err(e) => {
-                            error!("❌ All recovery tiers exhausted: {}", e);
-                            error!("🔄 System will perform emergency restart");
-                            restart_device("All recovery options exhausted - emergency restart")
-                                .await;
-                        }
-                    }
+                    // Don't spawn new MQTT managers - let the existing one handle retries
+                    // The MQTT manager has built-in retry logic and will trigger factory reset if needed
                 } else {
-                    warn!("⚠️ Non-critical system error - continuing operation");
+                    warn!("⚠️ Non-MQTT system error - continuing operation: {}", error);
                 }
             }
 
@@ -903,16 +859,12 @@ async fn register_device_with_backend(
         }
         Err(e) => {
             error!("❌ Device registration failed: {:?}", e);
-            error!(
-                "💥 Registration failures indicate device state issues - triggering factory reset"
-            );
-
-            // Factory reset on registration failure - device may be in inconsistent state
-            // This handles cases like 409 "already registered" or other registration errors
+            error!("🔄 Registration failures indicate critical device state issues");
+            error!("🔄 Triggering factory reset to restore device to clean state");
             perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
-            return Err(anyhow::anyhow!(
-                "Device registration failed - factory reset triggered"
-            ));
+            return Err(
+                anyhow::anyhow!("Device registration failed - factory reset triggered").into(),
+            );
         }
     }
 }
@@ -1294,8 +1246,14 @@ async fn test_connectivity_and_register(
                     registered_device_id.clone(),
                     nvs_partition.clone(),
                 )) {
-                    error!("❌ Failed to spawn MQTT manager task");
-                    warn!("🔄 Attempting tiered recovery for MQTT spawn failure");
+                    error!("❌ Failed to spawn MQTT manager task - this is a critical failure");
+                    error!("🔄 System will trigger factory reset due to MQTT spawn failure");
+                    perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone())
+                        .await;
+                    return Err(anyhow::anyhow!(
+                        "MQTT manager spawn failed - factory reset triggered"
+                    )
+                    .into());
                 } else {
                     info!("✅ MQTT manager task spawned successfully");
                 }
@@ -1308,42 +1266,9 @@ async fn test_connectivity_and_register(
                     error!("❌ Failed to spawn settings manager task");
                 } else {
                     info!("✅ Settings manager task spawned successfully");
-
-                    // Use tiered recovery for MQTT spawn failures
-                    let mut recovery_manager = TieredRecoveryManager::new(device_id.clone());
-                    match recovery_manager
-                        .attempt_recovery("mqtt_spawn_failure")
-                        .await
-                    {
-                        Ok(RecoveryTier::FactoryReset) => {
-                            error!("🔥 MQTT spawn failure escalated to factory reset");
-                            perform_mqtt_failure_factory_reset(
-                                device_id.clone(),
-                                nvs_partition.clone(),
-                            )
-                            .await;
-                            return Err(
-                                "MQTT manager spawn failed - factory reset after tiered recovery"
-                                    .into(),
-                            );
-                        }
-                        Ok(tier) => {
-                            info!("✅ MQTT spawn issue resolved with {:?} recovery", tier);
-                            // Continue after successful recovery
-                        }
-                        Err(recovery_error) => {
-                            error!("❌ MQTT spawn recovery failed: {:?}", recovery_error);
-                            perform_mqtt_failure_factory_reset(
-                                device_id.clone(),
-                                nvs_partition.clone(),
-                            )
-                            .await;
-                            return Err("MQTT spawn and recovery both failed".into());
-                        }
-                    }
                 }
 
-                info!("✅ MQTT manager task spawned successfully");
+                info!("✅ All core tasks spawned successfully");
 
                 // Wait for MQTT connection with proper health checks instead of arbitrary delay
                 info!("🔍 Verifying MQTT connection state with health checks...");
@@ -1381,118 +1306,30 @@ async fn test_connectivity_and_register(
                         "❌ MQTT connection verification failed after {} attempts",
                         MAX_CONNECTION_RETRIES
                     );
-
-                    // Use tiered recovery for MQTT connection failures
-                    let mut recovery_manager = TieredRecoveryManager::new(device_id.clone());
-                    match recovery_manager
-                        .attempt_recovery("mqtt_connection_failure")
-                        .await
-                    {
-                        Ok(RecoveryTier::FactoryReset) => {
-                            error!("🔥 MQTT connection issue escalated to factory reset");
-                            perform_mqtt_failure_factory_reset(
-                                device_id.clone(),
-                                nvs_partition.clone(),
-                            )
-                            .await;
-                            return Err(
-                                "MQTT connection failed - factory reset after tiered recovery"
-                                    .into(),
-                            );
-                        }
-                        Ok(tier) => {
-                            info!("✅ MQTT connection issue resolved with {:?} recovery", tier);
-                            // Continue after successful recovery
-                        }
-                        Err(recovery_error) => {
-                            error!("❌ MQTT connection recovery failed: {:?}", recovery_error);
-                            perform_mqtt_failure_factory_reset(
-                                device_id.clone(),
-                                nvs_partition.clone(),
-                            )
-                            .await;
-                            return Err("MQTT connection and recovery both failed".into());
-                        }
-                    }
+                    error!("🔄 MQTT connection issues will be handled by the MQTT manager itself");
+                    warn!("⚠️ The MQTT manager has built-in retry and recovery logic");
                 }
 
                 info!("🔌 MQTT manager is active and ready for AWS IoT Core communication");
             } else {
                 error!("❌ AWS IoT Core certificates not found after registration");
                 error!("❌ Certificates were stored but verification failed");
-                warn!("🔄 Attempting tiered recovery for certificate storage issue");
-
-                // Use tiered recovery for certificate issues
-                let mut recovery_manager = TieredRecoveryManager::new(device_id.clone());
-                match recovery_manager
-                    .attempt_recovery("certificate_storage_failure")
-                    .await
-                {
-                    Ok(RecoveryTier::FactoryReset) => {
-                        error!("🔥 Certificate storage issue escalated to factory reset");
-                        perform_mqtt_failure_factory_reset(
-                            device_id.clone(),
-                            nvs_partition.clone(),
-                        )
-                        .await;
-                        return Err(
-                            "Certificate storage failed - factory reset after tiered recovery"
-                                .into(),
-                        );
-                    }
-                    Ok(tier) => {
-                        info!(
-                            "✅ Certificate storage issue resolved with {:?} recovery",
-                            tier
-                        );
-                        // Continue after successful recovery
-                    }
-                    Err(recovery_error) => {
-                        error!(
-                            "❌ Certificate storage recovery failed: {:?}",
-                            recovery_error
-                        );
-                        perform_mqtt_failure_factory_reset(
-                            device_id.clone(),
-                            nvs_partition.clone(),
-                        )
-                        .await;
-                        return Err("Certificate storage and recovery both failed".into());
-                    }
-                }
+                error!("🔄 This is a critical failure - triggering factory reset");
+                perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
+                return Err(anyhow::anyhow!(
+                    "Certificate storage verification failed - factory reset triggered"
+                )
+                .into());
             }
         }
         Err(e) => {
             error!("❌ Device registration failed: {:?}", e);
-            warn!("🔄 Attempting tiered recovery for registration failure");
-
-            // Use tiered recovery instead of immediate factory reset
-            let mut recovery_manager = TieredRecoveryManager::new(device_id.clone());
-            match recovery_manager
-                .attempt_recovery("registration_failure")
-                .await
-            {
-                Ok(RecoveryTier::FactoryReset) => {
-                    error!(
-                        "🔥 Tiered recovery escalated to factory reset for registration failure"
-                    );
-                    perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone())
-                        .await;
-                    return Err(
-                        "Device registration failed - factory reset after tiered recovery".into(),
-                    );
-                }
-                Ok(tier) => {
-                    info!("✅ Registration issue resolved with {:?} recovery", tier);
-                    // Continue with the process after successful recovery
-                }
-                Err(recovery_error) => {
-                    error!("❌ Tiered recovery failed: {:?}", recovery_error);
-                    perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone())
-                        .await;
-                    return Err("Device registration and recovery both failed".into());
-                }
-            }
+            error!("🔄 Registration failures indicate critical device state issues");
+            error!("🔄 Triggering factory reset to restore device to clean state");
+            perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
+            return Err(
+                anyhow::anyhow!("Device registration failed - factory reset triggered").into(),
+            );
         }
     }
 

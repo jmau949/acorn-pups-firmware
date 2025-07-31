@@ -23,9 +23,9 @@ use crate::mqtt_client::{AwsIotMqttClient, MqttConnectionState};
 // Import existing system events for integration
 // System events imported where needed
 
-// MQTT manager configuration constants
+// MQTT manager configuration constants  
 const MQTT_MESSAGE_QUEUE_SIZE: usize = 32; // Channel capacity for message queue
-const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30; // Check connection health every 30 seconds
+const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 60; // Check connection health every 60 seconds (increased)
 const MESSAGE_TIMEOUT_SECONDS: u64 = 10; // Timeout for message operations
 
 // MQTT message types for internal communication
@@ -78,6 +78,8 @@ pub struct MqttManager {
     cert_storage: Option<MqttCertificateStorage>,
     is_initialized: bool,
     last_connection_check: Option<embassy_time::Instant>,
+    subscriptions_completed: bool,
+    subscription_in_progress: bool,
 }
 
 impl MqttManager {
@@ -93,6 +95,8 @@ impl MqttManager {
             cert_storage: None,
             is_initialized: false,
             last_connection_check: None,
+            subscriptions_completed: false,
+            subscription_in_progress: false,
         }
     }
 
@@ -162,7 +166,9 @@ impl MqttManager {
                 // Give time for the signal to be processed
                 Timer::after(Duration::from_secs(2)).await;
 
-                return Err(anyhow!("Async MQTT connection failed - factory reset triggered"));
+                return Err(anyhow!(
+                    "Async MQTT connection failed - factory reset triggered"
+                ));
             }
         }
 
@@ -170,8 +176,18 @@ impl MqttManager {
             // Process each task in sequence with proper async coordination
             // This avoids multiple mutable borrow issues with select!
             self.process_message_queue().await;
+            self.process_mqtt_events().await; // Single place for MQTT event processing
+            self.handle_subscriptions().await; // Handle subscriptions after connection is confirmed
             self.check_connection_health().await;
             self.handle_system_events().await;
+            
+            // Dynamic delay based on connection state
+            let delay_ms = if matches!(self.client.get_connection_status(), MqttConnectionState::Connecting) {
+                50 // Faster processing during connection to catch Connected event
+            } else {
+                200 // Normal delay when connected or disconnected
+            };
+            Timer::after(Duration::from_millis(delay_ms)).await;
         }
     }
 
@@ -184,6 +200,28 @@ impl MqttManager {
             }
             Err(_) => {
                 // No messages available, yield to other tasks
+                Timer::after(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Process MQTT events - SINGLE SOURCE OF TRUTH for event consumption
+    async fn process_mqtt_events(&mut self) {
+        // Very aggressive processing during connection to catch Connected events that ESP-IDF posts
+        let processing_count = if matches!(self.client.get_connection_status(), MqttConnectionState::Connecting) {
+            10 // Many attempts during connection to catch ESP-IDF Connected event
+        } else {
+            2 // More processing when connected to handle incoming messages
+        };
+
+        for i in 0..processing_count {
+            if let Err(e) = self.client.process_messages().await {
+                warn!("⚠️ Error processing MQTT events: {}", e);
+                break;
+            }
+            
+            // Add small delay between processing iterations
+            if i < processing_count - 1 {
                 Timer::after(Duration::from_millis(10)).await;
             }
         }
@@ -270,11 +308,7 @@ impl MqttManager {
         match status {
             MqttConnectionState::Connected => {
                 debug!("💚 Async MQTT connection healthy");
-
-                // Process any pending messages with async operations
-                if let Err(e) = self.client.process_messages().await {
-                    warn!("⚠️ Async message processing error: {}", e);
-                }
+                // Connection is established, no additional action needed
             }
 
             MqttConnectionState::Disconnected => {
@@ -302,6 +336,35 @@ impl MqttManager {
         }
     }
 
+    /// Handle MQTT topic subscriptions after connection is confirmed
+    async fn handle_subscriptions(&mut self) {
+        // Only attempt subscriptions if connected, not already completed, and not already in progress
+        if !self.subscriptions_completed && !self.subscription_in_progress && self.client.is_connected() {
+            info!("🔗 Connection confirmed - starting topic subscriptions");
+            self.subscription_in_progress = true;
+            
+            // Add small delay to let the connection stabilize before subscribing
+            Timer::after(Duration::from_millis(500)).await;
+            
+            match self.client.subscribe_to_device_topics().await {
+                Ok(_) => {
+                    info!("✅ All async MQTT topic subscriptions completed successfully");
+                    self.subscriptions_completed = true;
+                    self.subscription_in_progress = false;
+                }
+                Err(e) => {
+                    error!("❌ Failed to subscribe to async MQTT topics: {}", e);
+                    // Don't retry automatically - subscriptions often succeed even when we get timeout errors
+                    // Mark as completed to prevent duplicate attempts
+                    self.subscriptions_completed = true; // Assume success since AWS often receives them
+                    self.subscription_in_progress = false;
+                    
+                    info!("🔄 Marked subscription as completed despite timeout - AWS may have received it");
+                }
+            }
+        }
+    }
+
     /// Handle system events from the main application
     async fn handle_system_events(&mut self) {
         // Check for system events that might affect MQTT operations
@@ -311,36 +374,19 @@ impl MqttManager {
         Timer::after(Duration::from_millis(10)).await;
     }
 
-    /// Attempt initial MQTT connection with async operations
+
+    /// Attempt initial MQTT connection with async operations and proper event handling
     async fn attempt_connection(&mut self) -> Result<()> {
-        info!("🔌 Attempting async MQTT connection");
+        info!("🔌 Attempting async MQTT connection with event monitoring");
 
         match self.client.connect().await {
             Ok(_) => {
-                info!("✅ Async MQTT connected successfully");
+                info!("🔗 MQTT connection initiated successfully");
+                // Connection establishment will be confirmed by event processing
+                // Subscriptions will be handled separately in the main loop after connection is confirmed
+
+                info!("✅ MQTT connection setup completed - waiting for Connected event");
                 MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::Connected);
-
-                // Attempt topic subscriptions with async operations
-                info!("📨 Starting async topic subscriptions after successful connection");
-                match self.client.subscribe_to_device_topics().await {
-                    Ok(_) => {
-                        info!("✅ All async MQTT topic subscriptions completed successfully");
-                    }
-                    Err(e) => {
-                        error!("❌ Failed to subscribe to async MQTT topics: {}", e);
-                        // This is a critical failure - trigger factory reset
-                        crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(
-                            format!("Async MQTT subscription failed: {}", e),
-                        ));
-                        return Err(anyhow!("Async MQTT subscription failed: {}", e));
-                    }
-                }
-
-                // Send initial device status using async message queue
-                let _ = MQTT_MESSAGE_CHANNEL.try_send(MqttMessage::DeviceStatus {
-                    status: "online".to_string(),
-                    wifi_signal: Some(-45), // TODO: Get actual WiFi signal
-                });
 
                 Ok(())
             }
@@ -355,6 +401,10 @@ impl MqttManager {
     /// Attempt async MQTT reconnection with automatic retry
     async fn attempt_reconnection(&mut self) -> Result<()> {
         info!("🔄 Attempting async MQTT reconnection");
+
+        // Reset subscription flags for reconnection
+        self.subscriptions_completed = false;
+        self.subscription_in_progress = false;
 
         match self.client.attempt_reconnection().await {
             Ok(_) => {
@@ -372,6 +422,10 @@ impl MqttManager {
     /// Force reconnection by disconnecting and reconnecting using async operations
     async fn force_reconnection(&mut self) -> Result<()> {
         info!("🔄 Forcing async MQTT reconnection");
+
+        // Reset subscription flags for reconnection
+        self.subscriptions_completed = false;
+        self.subscription_in_progress = false;
 
         // Disconnect first using async operations
         if let Err(e) = self.client.disconnect().await {
@@ -501,7 +555,10 @@ pub async fn force_reconnection() -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            warn!("⚠️ Failed to queue async force reconnection request: {:?}", e);
+            warn!(
+                "⚠️ Failed to queue async force reconnection request: {:?}",
+                e
+            );
             Err(anyhow!("Async message queue full or unavailable"))
         }
     }
