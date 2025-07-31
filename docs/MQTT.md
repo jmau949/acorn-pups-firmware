@@ -1,458 +1,376 @@
-# MQTT Certificate Management and TLS Implementation
+# MQTT Async Architecture Documentation
 
 ## Overview
 
-This Rust application implements secure MQTT communication with AWS IoT Core using X.509 certificate-based mutual TLS authentication. The system provides enterprise-grade security through certificate storage, validation, and encrypted communication channels.
+This document explains the async MQTT implementation using Embassy runtime for ESP32 firmware. The system provides event-driven, non-blocking MQTT communication with AWS IoT Core through a carefully orchestrated async architecture that prevents deadlocks and ensures continuous event processing.
 
 ## Table of Contents
 
-1. [Certificate Storage Architecture](#certificate-storage-architecture)
-2. [X.509 Certificate Handling](#x509-certificate-handling)
-3. [TLS Mutual Authentication](#tls-mutual-authentication)
-4. [MQTT Client Implementation](#mqtt-client-implementation)
-5. [AWS IoT Core Integration](#aws-iot-core-integration)
-6. [Security Implementation](#security-implementation)
-7. [Memory Optimization](#memory-optimization)
-8. [Error Handling and Validation](#error-handling-and-validation)
+1. [Architecture Components](#architecture-components)
+2. [Embassy Async Runtime](#embassy-async-runtime)  
+3. [Event Processing System](#event-processing-system)
+4. [Connection Management](#connection-management)
+5. [Subscription Handling](#subscription-handling)
+6. [Message Flow](#message-flow)
+7. [Blocking vs Non-blocking Operations](#blocking-vs-non-blocking-operations)
+8. [File Structure and Responsibilities](#file-structure-and-responsibilities)
 
-## Certificate Storage Architecture
+## Architecture Components
 
-### NVS Flash Storage
+### Core Components
 
-The application uses ESP-IDF's Non-Volatile Storage (NVS) system to securely store AWS IoT Core certificates in flash memory. This provides persistent storage that survives device reboots and power cycles.
+**MqttManager**
+- Primary orchestrator for MQTT operations
+- Manages Embassy task coordination and message queuing
+- Handles connection lifecycle and health monitoring
+- Coordinates between different async subsystems
 
-#### Storage Structure
+**AwsIotMqttClient** 
+- Low-level MQTT client wrapper around ESP-IDF's `EspAsyncMqttClient`
+- Handles connection establishment and event processing
+- Manages subscription requests and message publishing
+- Provides async interface for MQTT operations
 
+**MqttCertificateStorage**
+- Manages X.509 certificate storage and retrieval
+- Handles certificate validation and lifecycle
+- Provides secure NVS-based certificate persistence
+
+### Data Structures
+
+**Connection State Management**
 ```rust
-// NVS namespace and keys for certificate management
-const NVS_NAMESPACE: &str = "mqtt_certs";
-const DEVICE_CERT_KEY: &str = "device_cert";     // Device certificate (X.509 PEM)
-const PRIVATE_KEY_KEY: &str = "private_key";     // Device private key (RSA PEM)
-const IOT_ENDPOINT_KEY: &str = "iot_endpoint";   // AWS IoT Core endpoint URL
-const CERT_METADATA_KEY: &str = "cert_meta";     // Certificate metadata (JSON)
-const CERT_VALIDATION_KEY: &str = "cert_valid";  // Validation status flag
-```
-
-#### Certificate Metadata
-
-Each certificate set includes comprehensive metadata stored as JSON:
-
-```rust
-pub struct CertificateMetadata {
-    pub stored_at: u64,                    // Unix timestamp when stored
-    pub device_id: String,                 // Associated device ID
-    pub certificate_fingerprint: String,   // SHA256 fingerprint for validation
-    pub iot_endpoint: String,              // AWS IoT endpoint for quick access
-    pub is_valid: bool,                    // Validation status
-    pub last_used: Option<u64>,            // Last usage timestamp
-    pub validation_attempts: u32,          // Number of validation attempts
-}
-```
-
-### Dynamic Memory Optimization
-
-The system implements intelligent buffer sizing to optimize ESP32 memory usage:
-
-#### Standard vs. Optimized Loading
-
-**Standard Loading (Fixed Buffers):**
-```rust
-// Fixed 2KB buffers (wasteful)
-let mut cert_buffer = [0u8; 2048];
-let mut key_buffer = [0u8; 2048]; 
-let mut endpoint_buffer = [0u8; 256];
-// Total: 4352 bytes allocated
-```
-
-**Optimized Loading (Dynamic Buffers):**
-```rust
-// Dynamic sizing based on actual content
-let cert_size = std::cmp::max(self.get_certificate_size(DEVICE_CERT_KEY), 1500);
-let key_size = std::cmp::max(self.get_certificate_size(PRIVATE_KEY_KEY), 1700);
-let endpoint_size = std::cmp::max(self.get_certificate_size(IOT_ENDPOINT_KEY), 256);
-
-let mut cert_buffer = vec![0u8; cert_size + 1];      // ~1500 bytes typical
-let mut key_buffer = vec![0u8; key_size + 1];        // ~1700 bytes typical  
-let mut endpoint_buffer = vec![0u8; endpoint_size + 1]; // ~256 bytes typical
-// Total: ~3456 bytes allocated (600+ bytes saved)
-```
-
-## X.509 Certificate Handling
-
-### Certificate Format Conversion
-
-The application converts PEM-formatted certificates to ESP-IDF's required X.509 format:
-
-```rust
-fn convert_pem_to_x509(pem_cert: &str) -> Result<X509<'static>> {
-    use std::ffi::CString;
-
-    // Convert PEM string to CString (adds null terminator automatically)
-    let c_string = CString::new(pem_cert)
-        .map_err(|e| anyhow!("PEM certificate contains null bytes: {}", e))?;
-
-    // Create static lifetime CStr using Box::leak()
-    let static_cstr: &'static std::ffi::CStr = Box::leak(c_string.into_boxed_c_str());
-
-    // Create X.509 certificate from static CStr
-    Ok(X509::pem(static_cstr))
-}
-```
-
-### Certificate Components
-
-The system handles three certificate components:
-
-1. **Device Certificate**: Unique X.509 certificate identifying the specific ESP32 device
-2. **Private Key**: RSA private key corresponding to the device certificate
-3. **Amazon Root CA 1**: Root certificate for validating AWS IoT Core server certificates
-
-### Validation Process
-
-Comprehensive certificate validation includes:
-
-```rust
-fn validate_certificate_format(&self, certificates: &DeviceCertificates) -> Result<(), CertificateValidation> {
-    // Validate device certificate PEM format
-    if !certificates.device_certificate.starts_with("-----BEGIN CERTIFICATE-----") ||
-       !certificates.device_certificate.ends_with("-----END CERTIFICATE-----") {
-        return Err(CertificateValidation::InvalidFormat);
-    }
-
-    // Validate private key PEM format  
-    if !certificates.private_key.starts_with("-----BEGIN PRIVATE KEY-----") ||
-       !certificates.private_key.ends_with("-----END PRIVATE KEY-----") {
-        return Err(CertificateValidation::InvalidFormat);
-    }
-
-    // Validate IoT endpoint format (AWS hostname structure)
-    if !certificates.iot_endpoint.contains(".iot.") ||
-       !certificates.iot_endpoint.contains(".amazonaws.com") {
-        return Err(CertificateValidation::InvalidContent);
-    }
-
-    // Check minimum size requirements
-    if certificates.device_certificate.len() < 500 || certificates.private_key.len() < 500 {
-        return Err(CertificateValidation::InvalidContent);
-    }
-
-    Ok(())
-}
-```
-
-## TLS Mutual Authentication
-
-### Mutual TLS (mTLS) Configuration
-
-The application implements full mutual TLS authentication where both client and server verify each other's identity:
-
-```rust
-// Convert certificates to X.509 format for ESP-IDF
-let device_cert = Self::convert_pem_to_x509(&certificates.device_certificate)?;
-let private_key = Self::convert_pem_to_x509(&certificates.private_key)?;
-let aws_root_ca = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
-
-// MQTT client configuration with X.509 certificate authentication
-let mqtt_config = MqttClientConfiguration {
-    client_id: Some(&self.client_id),
-    keep_alive_interval: Some(std::time::Duration::from_secs(60)),
-    reconnect_timeout: Some(std::time::Duration::from_secs(30)),
-    network_timeout: std::time::Duration::from_secs(30),
-
-    // X.509 certificate configuration for mutual TLS authentication
-    client_certificate: Some(device_cert),      // Device identity
-    private_key: Some(private_key),             // Device private key
-    server_certificate: Some(aws_root_ca),      // AWS IoT Core validation
-    use_global_ca_store: false,                 // Use specific AWS Root CA
-    skip_cert_common_name_check: false,         // Verify server identity
-
-    ..Default::default()
-};
-```
-
-### TLS Handshake Process
-
-1. **Client Hello**: ESP32 initiates connection to AWS IoT Core (port 8883)
-2. **Server Certificate**: AWS IoT Core presents its certificate
-3. **Certificate Verification**: ESP32 validates server certificate against Amazon Root CA 1
-4. **Client Certificate Request**: AWS IoT Core requests client certificate
-5. **Client Certificate**: ESP32 presents device certificate and private key proof
-6. **Mutual Verification**: Both parties verify certificate validity and authorization
-7. **Secure Channel**: Encrypted TLS 1.2+ tunnel established for MQTT communication
-
-### Security Features
-
-- **TLS 1.2+ Encryption**: All MQTT traffic encrypted using industry-standard protocols
-- **Certificate Pinning**: Server validation against specific Amazon Root CA 1
-- **Client Authentication**: Device identity verified through X.509 certificates
-- **Perfect Forward Secrecy**: Session keys generated for each connection
-- **Certificate Revocation**: Support for certificate lifecycle management
-
-## MQTT Client Implementation
-
-### Connection Management
-
-```rust
-pub async fn connect(&mut self) -> Result<()> {
-    // Validate certificates are available
-    if self.certificates.is_none() {
-        return Err(anyhow!("No X.509 certificates available for MQTT connection"));
-    }
-
-    let certificates = self.certificates.as_ref().unwrap();
-    self.connection_status = ConnectionStatus::Connecting;
-    
-    // Create secure MQTT broker URL
-    let broker_url = format!("mqtts://{}:8883", certificates.iot_endpoint);
-    
-    // Convert certificates and establish connection
-    let device_cert = Self::convert_pem_to_x509(&certificates.device_certificate)?;
-    let private_key = Self::convert_pem_to_x509(&certificates.private_key)?;
-    let aws_root_ca = Self::convert_pem_to_x509(AWS_ROOT_CA_1)?;
-
-    let mqtt_config = MqttClientConfiguration {
-        // ... certificate configuration
-    };
-
-    // Create ESP MQTT client with X.509 certificate-based TLS authentication
-    match EspMqttClient::new(&broker_url, &mqtt_config) {
-        Ok((mut client, _connection)) => {
-            self.subscribe_to_device_topics(&mut client).await?;
-            self.client = Some(client);
-            self.connection_status = ConnectionStatus::Connected;
-            Ok(())
-        }
-        Err(e) => {
-            self.connection_status = ConnectionStatus::Error(error_msg.clone());
-            Err(anyhow!(error_msg))
-        }
-    }
-}
-```
-
-### Topic Structure
-
-The application uses a structured topic hierarchy for AWS IoT Core communication:
-
-```rust
-// MQTT topic patterns following AWS IoT Core conventions
-const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
-const TOPIC_DEVICE_STATUS: &str = "acorn-pups/status";
-const TOPIC_SETTINGS: &str = "acorn-pups/settings";
-const TOPIC_COMMANDS: &str = "acorn-pups/commands";
-```
-
-**Device-Specific Topics:**
-- `acorn-pups/button-press/{device_id}` - Button press events
-- `acorn-pups/status/{device_id}` - Device status updates
-- `acorn-pups/settings/{device_id}` - Configuration updates (subscribed)
-- `acorn-pups/commands/{device_id}` - Remote commands (subscribed)
-
-### Message Formats
-
-All messages use JSON serialization with consistent field naming:
-
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ButtonPressMessage {
-    #[serde(rename = "deviceId")]
-    pub device_id: String,
-    #[serde(rename = "buttonRfId")]
-    pub button_rf_id: String,
-    pub timestamp: String,                    // ISO 8601 format
-    #[serde(rename = "batteryLevel")]
-    pub battery_level: Option<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceStatusMessage {
-    #[serde(rename = "deviceId")]
-    pub device_id: String,
-    pub timestamp: String,
-    pub status: String,                       // "online", "offline", "error"
-    #[serde(rename = "firmwareVersion")]
-    pub firmware_version: String,
-}
-```
-
-## AWS IoT Core Integration
-
-### Device Registration Flow
-
-1. **WiFi Connection**: Device connects to internet via stored WiFi credentials
-2. **HTTP Registration**: Device calls backend API to register and receive certificates
-3. **Certificate Storage**: Certificates stored securely in NVS flash
-4. **MQTT Initialization**: MQTT client loads certificates and establishes secure connection
-5. **Operational Mode**: Device begins publishing sensor data and receiving commands
-
-### AWS IoT Core Configuration
-
-The system connects to AWS IoT Core using:
-
-- **Endpoint**: Device-specific AWS IoT Core endpoint (e.g., `abc123-ats.iot.us-west-2.amazonaws.com`)
-- **Port**: 8883 (MQTT over TLS)
-- **Protocol**: MQTT 3.1.1 with TLS 1.2+ encryption
-- **Authentication**: X.509 client certificates with mutual TLS
-- **QoS**: At Least Once (QoS 1) for reliable message delivery
-
-### Connection Resilience
-
-```rust
-// Connection retry configuration with exponential backoff
-const INITIAL_RETRY_DELAY_MS: u64 = 1000;    // 1 second
-const MAX_RETRY_DELAY_MS: u64 = 60000;       // 60 seconds  
-const MAX_RETRY_ATTEMPTS: u32 = 10;
-
-pub async fn attempt_reconnection(&mut self) -> Result<()> {
-    if self.retry_count >= MAX_RETRY_ATTEMPTS {
-        return Err(anyhow!("Maximum retry attempts exceeded"));
-    }
-
-    // Exponential backoff with maximum delay
-    self.retry_delay_ms = std::cmp::min(self.retry_delay_ms * 2, MAX_RETRY_DELAY_MS);
-    
-    // Wait before retry attempt
-    Timer::after(Duration::from_millis(self.retry_delay_ms)).await;
-    
-    // Attempt reconnection with full X.509 authentication
-    self.connect().await
-}
-```
-
-## Security Implementation
-
-### Certificate Lifecycle
-
-1. **Generation**: AWS IoT Core generates unique device certificates
-2. **Provisioning**: Certificates delivered via secure device registration API
-3. **Storage**: Certificates stored encrypted in ESP32 NVS flash
-4. **Validation**: Comprehensive format and content validation before use
-5. **Usage**: Certificates used for all MQTT connections with AWS IoT Core
-6. **Rotation**: Support for certificate updates through device management
-
-### Security Best Practices
-
-- **Certificate Isolation**: Each device has unique certificates
-- **Private Key Protection**: Private keys never transmitted or logged
-- **Endpoint Validation**: Server certificate validation against Amazon Root CA
-- **Connection Encryption**: All traffic encrypted with TLS 1.2+
-- **Certificate Fingerprinting**: SHA256 fingerprints for certificate integrity
-- **Access Control**: AWS IoT policies restrict device permissions
-
-### Attack Mitigation
-
-- **Man-in-the-Middle**: Prevented by mutual certificate validation
-- **Replay Attacks**: Mitigated by TLS session encryption and nonces
-- **Certificate Theft**: Private keys remain on device, never transmitted
-- **Unauthorized Access**: AWS IoT policies enforce device-specific permissions
-- **Data Tampering**: TLS encryption prevents message modification
-
-## Memory Optimization
-
-### Buffer Size Optimization
-
-The optimized certificate loading provides significant memory savings:
-
-```rust
-// Memory usage comparison
-Traditional Fixed Buffers:
-- Device Certificate: 2048 bytes
-- Private Key: 2048 bytes  
-- IoT Endpoint: 256 bytes
-- Total: 4352 bytes
-
-Optimized Dynamic Buffers:
-- Device Certificate: ~1500 bytes (actual size + 1)
-- Private Key: ~1700 bytes (actual size + 1)
-- IoT Endpoint: ~256 bytes (actual size + 1)  
-- Total: ~3456 bytes
-- Memory Saved: ~896 bytes (20.6% reduction)
-```
-
-### Stack Usage
-
-- **Certificate Loading**: Dynamic allocation on heap (not stack)
-- **X.509 Conversion**: Static lifetime management via `Box::leak()`
-- **MQTT Configuration**: Minimal stack usage with reference passing
-- **Connection State**: Efficient enum-based state management
-
-## Error Handling and Validation
-
-### Certificate Validation Errors
-
-```rust
-pub enum CertificateValidation {
-    Valid,
-    InvalidFormat,      // PEM format validation failed
-    InvalidContent,     // Content validation failed  
-    Expired,           // Certificate past expiration
-    Corrupted,         // Certificate data corrupted
-    Missing,           // Certificate not found
-}
-```
-
-### MQTT Connection Errors
-
-```rust
-pub enum ConnectionStatus {
+pub enum MqttConnectionState {
     Disconnected,
-    Connecting, 
+    Connecting,
     Connected,
-    Error(String),     // Detailed error information
+    Error,
 }
 ```
 
-### Error Recovery
+**Message Queue System**
+```rust
+pub enum MqttMessage {
+    ButtonPress { button_rf_id: String, battery_level: Option<u8> },
+    DeviceStatus { status: String, wifi_signal: Option<i32> },
+    VolumeChange { volume: u8, source: String },
+    Connect,
+    Disconnect,
+    ForceReconnect,
+}
+```
 
-- **Certificate Errors**: Graceful fallback with detailed error reporting
-- **Connection Failures**: Exponential backoff retry with maximum attempts
-- **TLS Handshake Failures**: Certificate validation error reporting
-- **Network Issues**: Automatic reconnection with connection health monitoring
-- **Message Failures**: Queue-based retry mechanism with timeout handling
+**Event Communication**
+```rust
+pub enum MqttManagerEvent {
+    Connected,
+    Disconnected,
+    ConnectionError(String),
+    MessagePublished(String),
+    MessageFailed(String),
+    CertificatesLoaded,
+    CertificatesError(String),
+}
+```
 
-## Monitoring and Diagnostics
+### Embassy Communication Channels
 
-### Connection Health Monitoring
+**MQTT_MESSAGE_CHANNEL**
+- Embassy Channel for queuing outbound MQTT messages
+- Provides backpressure management with configurable queue size
+- Enables non-blocking message submission from other tasks
+
+**MQTT_EVENT_SIGNAL**
+- Embassy Signal for broadcasting MQTT manager events
+- Allows other system components to react to MQTT state changes
+- Single-value signal that overwrites previous values
+
+## Embassy Async Runtime
+
+### Task Orchestration
+
+The Embassy runtime provides cooperative multitasking through Rust's async/await mechanism. Key characteristics:
+
+**Cooperative Scheduling**
+- Tasks voluntarily yield control at `.await` points
+- No preemptive multitasking or context switching overhead
+- Deterministic execution order based on event availability
+
+**Memory Efficiency**
+- Tasks are zero-cost abstractions until awaited
+- No separate thread stacks - futures stored on heap
+- Minimal runtime overhead compared to RTOS threads
+
+**Event-Driven Execution**
+- Tasks suspend until events become available
+- Executor polls futures only when events occur
+- Efficient power management through idle states
+
+### Async Patterns Used
+
+**select! Operations**
+```rust
+match embassy_futures::select::select(
+    MQTT_MESSAGE_CHANNEL.receive(),
+    self.client.process_messages()
+).await {
+    Either::First(message) => { /* Handle queued message */ }
+    Either::Second(result) => { /* Handle MQTT event */ }
+}
+```
+
+**Timer-based Operations**
+```rust
+embassy_time::Timer::after(Duration::from_millis(500)).await;
+```
+
+**Channel Communication**
+```rust
+MQTT_MESSAGE_CHANNEL.send(MqttMessage::Connect).await;
+let message = MQTT_MESSAGE_CHANNEL.receive().await;
+```
+
+## Event Processing System
+
+### Event Loop Architecture
+
+The MQTT manager runs a continuous event loop that handles multiple event sources:
+
+1. **Message Queue Processing** - Handles outbound messages from `MQTT_MESSAGE_CHANNEL`
+2. **MQTT Event Processing** - Processes incoming MQTT protocol events
+3. **Health Monitoring** - Periodic connection health checks
+4. **Subscription Management** - Manages topic subscriptions and confirmations
+
+### Event Flow
+
+**Outbound Message Flow**
+1. Application components send messages to `MQTT_MESSAGE_CHANNEL`
+2. MqttManager receives messages in main event loop
+3. Messages are converted to appropriate MQTT publish operations
+4. ESP-IDF MQTT client sends messages to AWS IoT Core
+5. Publish confirmations are processed through event system
+
+**Inbound Message Flow**
+1. AWS IoT Core sends messages to subscribed topics
+2. ESP-IDF MQTT client receives messages via TLS connection
+3. Messages are queued in ESP-IDF's internal event system
+4. MQTT client's `process_messages()` extracts events asynchronously
+5. Events are routed to appropriate handlers based on topic patterns
+6. Application logic processes the received messages
+
+### Event Processing Methods
+
+**process_messages()**
+- Extracts one MQTT event from ESP-IDF's internal queue
+- Calls both connection event handler and async message handler
+- Returns immediately if no events are available
+- Must be called continuously to maintain connection health
+
+**handle_connection_event()**
+- Processes connection-related events (Connected, Disconnected, Error)
+- Updates internal connection state
+- Handles subscription confirmations and error conditions
+- Synchronous event processing for state management
+
+**handle_mqtt_event_async()**
+- Processes message-related events asynchronously
+- Routes messages to topic-specific handlers
+- Handles message parsing and application logic
+- Asynchronous processing allows for complex operations
+
+## Connection Management
+
+### Connection Lifecycle
+
+**Initialization Phase**
+1. Load X.509 certificates from NVS storage
+2. Create ESP-IDF MQTT client configuration with certificates
+3. Set connection parameters (keep-alive, timeouts, QoS levels)
+
+**Connection Phase**
+1. Initiate TLS handshake with AWS IoT Core
+2. Perform mutual certificate authentication
+3. Establish encrypted MQTT connection
+4. Update connection state to Connected
+
+**Operational Phase**
+1. Begin continuous event processing loop
+2. Start subscription process for device-specific topics
+3. Enable message publishing and receiving
+4. Monitor connection health periodically
+
+**Disconnection Handling**
+1. Detect disconnection through event processing
+2. Update connection state and notify other components
+3. Attempt automatic reconnection with exponential backoff
+4. Re-subscribe to topics after successful reconnection
+
+### Keep-Alive Mechanism
+
+The MQTT protocol requires periodic keep-alive messages to maintain connections:
+
+**Keep-Alive Configuration**
+- Interval set to 60 seconds in MQTT client configuration
+- ESP-IDF automatically sends PINGREQ messages
+- AWS IoT Core responds with PINGRESP messages
+
+**Keep-Alive Processing**
+- Keep-alive messages are processed in the event loop
+- Continuous `process_messages()` calls ensure timely processing
+- Connection timeout occurs if keep-alive messages are not processed
+- Event loop must never block to prevent timeout disconnections
+
+## Subscription Handling
+
+### Subscription Challenge
+
+The original issue was a deadlock caused by blocking subscription operations:
+
+**Problem**: `client.subscribe().await` would block indefinitely waiting for subscription confirmation, but the event loop couldn't process the confirmation because it was blocked on the subscription call.
+
+**Solution**: Use Embassy's `select!` with a short timer to prevent blocking:
+
+### Non-blocking Subscription Pattern
 
 ```rust
-// Regular connection health checks
-const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 30;
-
-async fn check_connection_health(&mut self) {
-    match self.client.get_connection_status() {
-        ConnectionStatus::Connected => {
-            // Process pending messages
-            self.client.process_messages().await;
+embassy_futures::select::select(
+    async {
+        match client.subscribe(&topic, QoS::AtLeastOnce).await {
+            Ok(message_id) => { /* Log success */ }
+            Err(e) => { /* Log error */ }
         }
-        ConnectionStatus::Disconnected => {
-            // Attempt automatic reconnection
-            self.attempt_reconnection().await;
-        }
-        ConnectionStatus::Error(ref error) => {
-            // Log error and attempt recovery
-            self.force_reconnection().await;
-        }
-    }
-}
+    },
+    embassy_time::Timer::after(Duration::from_millis(10))
+).await;
 ```
 
-### Logging and Diagnostics
+**How It Works**
+1. `select!` races the subscription call against a 10ms timer
+2. Timer typically wins, allowing event loop to continue
+3. Subscription completes asynchronously through event system
+4. `Subscribed` event is processed in the next event loop iteration
+5. Connection remains healthy with continuous event processing
 
-- **Certificate Loading**: Detailed logs for storage and validation steps
-- **TLS Handshake**: Progress logging for connection establishment  
-- **MQTT Operations**: Message publishing and subscription logging
-- **Error Tracking**: Comprehensive error logging with context
-- **Performance Metrics**: Memory usage and connection timing statistics
+### Subscription Confirmation Flow
+
+1. **Request Sent** - Subscription request sent to AWS IoT Core
+2. **Event Processing Continues** - Event loop is not blocked
+3. **Confirmation Received** - AWS IoT Core sends subscription confirmation
+4. **Event Processed** - `Subscribed` event is processed in event loop
+5. **Ready for Messages** - Topic is now active for receiving messages
+
+## Message Flow
+
+### Publishing Messages
+
+**Async Publishing Process**
+1. Application code calls `MQTT_MESSAGE_CHANNEL.send(message).await`
+2. MqttManager receives message in main event loop
+3. Message is converted to JSON and sent via `client.publish().await`
+4. Publish acknowledgment is received through event processing
+5. Success/failure is communicated via `MQTT_EVENT_SIGNAL`
+
+### Receiving Messages
+
+**Async Receiving Process**
+1. AWS IoT Core publishes message to subscribed topic
+2. ESP-IDF MQTT client receives message via TLS connection
+3. Message is queued in ESP-IDF's internal event system
+4. Next `process_messages()` call extracts the message event
+5. Message is routed to appropriate handler based on topic
+6. Application logic processes the message content
+
+
+## File Structure and Responsibilities
+
+### mqtt_client.rs
+
+**Primary Responsibilities**
+- Low-level MQTT protocol handling
+- ESP-IDF `EspAsyncMqttClient` wrapper
+- Connection state management
+- Event processing coordination
+
+**Key Components**
+- `AwsIotMqttClient` struct with connection state
+- `process_messages()` for continuous event processing
+- `subscribe_to_device_topics()` for non-blocking subscriptions
+- Event handlers for connection and message events
+
+**Async Patterns**
+- Embassy-compatible async methods
+- Non-blocking subscription with `select!` pattern
+- Continuous event processing loop
+- Timer-based yielding for responsiveness
+
+### mqtt_manager.rs
+
+**Primary Responsibilities**
+- High-level MQTT orchestration
+- Embassy task coordination
+- Message queue management
+- Connection lifecycle management
+
+**Key Components**
+- `MqttManager` struct with client coordination
+- Main event loop with `select!` for multiple event sources
+- Message routing and processing
+- Health monitoring and reconnection logic
+
+**Async Patterns**
+- Embassy channels for inter-task communication
+- Embassy signals for event broadcasting
+- Continuous async event loop
+- Structured concurrency with `select!`
+
+### mqtt_certificates.rs
+
+**Primary Responsibilities**
+- X.509 certificate storage and retrieval
+- Certificate validation and lifecycle management
+- NVS-based persistent storage
+- Security and compliance enforcement
+
+**Key Components**
+- `MqttCertificateStorage` for certificate operations
+- Dynamic buffer allocation for memory efficiency
+- Certificate format validation
+- Secure storage patterns
+
+**Async Patterns**
+- Async certificate loading operations
+- Non-blocking NVS storage access
+- Error handling with Result types
+- Memory-efficient operations
+
+### Integration Points
+
+**Manager-Client Relationship**
+- Manager owns and coordinates client lifecycle
+- Manager handles high-level operations, client handles protocol
+- Event communication through Embassy channels and signals
+- Clean separation of concerns between orchestration and implementation
+
+**Certificate-Client Integration**
+- Client loads certificates through certificate storage
+- Certificate validation occurs before connection attempts
+- Certificate errors are propagated through async error handling
+- Dynamic certificate updates supported through async reloading
+
+**Embassy Runtime Integration** 
+- All components use Embassy async primitives
+- Cooperative scheduling ensures efficient resource usage
+- Event-driven architecture prevents polling and busy waiting
+- Structured concurrency patterns manage complex async operations
 
 ## Conclusion
 
-This implementation provides enterprise-grade security for IoT device communication through:
+The async MQTT architecture leverages Embassy's cooperative runtime to provide efficient, responsive MQTT communication. Key design principles include:
 
-- **Robust Certificate Management**: Secure storage and validation of X.509 certificates
-- **Mutual TLS Authentication**: Full bidirectional certificate validation
-- **AWS IoT Core Integration**: Native support for AWS IoT Core services
-- **Memory Optimization**: Efficient memory usage for resource-constrained devices
-- **Error Resilience**: Comprehensive error handling and automatic recovery
-- **Security Best Practices**: Industry-standard security implementations
+- **Non-blocking Operations**: All operations use timeouts or yield control regularly
+- **Event-driven Processing**: Continuous event loops handle protocol requirements
+- **Structured Concurrency**: Embassy patterns manage complex async coordination
+- **Resource Efficiency**: Cooperative scheduling minimizes overhead
+- **Connection Reliability**: Continuous event processing maintains protocol compliance
 
-The system ensures secure, reliable, and efficient MQTT communication while maintaining the strict security requirements for IoT device deployments. 
+This architecture ensures reliable MQTT communication while maintaining system responsiveness and preventing the deadlocks that can occur with blocking async operations.
