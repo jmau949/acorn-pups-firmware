@@ -2,24 +2,12 @@
 // Embassy is an async runtime for embedded systems, like Tokio but for microcontrollers
 use embassy_executor::Spawner;
 
-// FACTORY RESET FLAG - Set to true to trigger immediate factory reset on startup
-// This bypasses all normal initialization and performs a factory reset before WiFi/BLE
-const FORCE_FACTORY_RESET_ON_STARTUP: bool = false;
 
 // Import Embassy time utilities for delays and timers
 // Duration represents a time span, Timer provides async delays (non-blocking waits)
 use embassy_time::{Duration, Timer};
 
-// Import Embassy async utilities for event coordination (currently unused)
-// use embassy_futures::select::{select, Either};
 
-// Import Embassy synchronization primitives for task coordination
-// Signal provides event-driven communication between tasks
-// Mutex provides thread-safe shared state access
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-
-use embassy_sync::mutex::Mutex;
-use embassy_sync::signal::Signal;
 
 // Import ESP-IDF (ESP32 development framework) GPIO pin driver
 // PinDriver lets us control individual GPIO pins (set high/low, read input)
@@ -29,8 +17,6 @@ use esp_idf_svc::hal::gpio::PinDriver;
 // Peripherals contains references to GPIO pins, SPI, I2C, WiFi, etc.
 use esp_idf_svc::hal::peripherals::Peripherals;
 
-// Import NVS (Non-Volatile Storage) types for flash storage debugging
-use esp_idf_svc::nvs::{EspNvs, NvsDefault};
 
 // Import modem for BLE functionality
 use esp_idf_svc::hal::modem::Modem;
@@ -41,361 +27,54 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::timer::EspTaskTimerService;
 use esp_idf_svc::wifi::{AsyncWifi, ClientConfiguration, Configuration, EspWifi};
 
-// Import HTTP client functionality for connectivity testing
-use embedded_svc::http::client::Client;
-// Note: embedded_svc::io::Write import removed - no longer used
-use esp_idf_svc::http::client::EspHttpConnection;
 
-// Import standard library components
-use std::net::Ipv4Addr;
 
 // Import async runtime components
 use embassy_time::with_timeout;
 
 // Import logging macros for debug output over serial/UART
 // error! = critical errors, info! = general information, warn! = warnings
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 
-// Note: Timestamp generation moved to individual modules using chrono::Utc::now().to_rfc3339()
 
-/// Generate new device instance ID (proper UUID v4) for registration security
-fn generate_device_instance_id() -> String {
-    use uuid::Uuid;
 
-    // Generate proper RFC-compliant UUID v4 (random)
-    // This ensures compatibility with backend validation and uniqueness
-    Uuid::new_v4().to_string()
-}
-
-// Import anyhow for error handling
-use anyhow::Result;
 
 // Declare our custom modules (separate files in src/ directory)
 // Each mod statement tells Rust to include code from src/module_name.rs
 mod api; // HTTP API client for REST communication
 mod ble_server; // Bluetooth Low Energy server functionality
+mod connectivity; // Device connectivity and registration
 mod device_api; // Device-specific API client for ESP32 receivers
+mod device_info; // Device information utilities
+mod led_manager; // LED status indicator management
 mod mqtt_certificates; // Secure storage of AWS IoT Core certificates
 mod mqtt_client; // AWS IoT Core MQTT client with TLS authentication
 mod mqtt_manager; // Embassy task coordination for MQTT operations
+mod nvs_debug; // NVS flash storage debugging utilities
 mod reset_handler; // Reset behavior execution
-                   // Note: ResetNotificationData no longer needed with new architecture
 mod reset_manager; // GPIO reset button monitoring and state management
-                   // Note: reset_storage module removed - functionality moved to reset_manager
 mod settings; // Device settings management with MQTT and NVS integration
+mod system_state; // System state management and event coordination
 mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
 // This is like "from module import function" in Python
 use ble_server::{generate_device_id, BleServer}; // BLE advertising and communication
-use device_api::DeviceApiClient; // Device-specific API client for registration
+use connectivity::test_connectivity_and_register; // Device connectivity
+use led_manager::led_task; // LED status management
 use mqtt_certificates::MqttCertificateStorage; // Secure certificate storage
 use mqtt_manager::MqttManager; // MQTT task coordination
+use nvs_debug::dump_entire_nvs_storage; // NVS debugging utilities
 use reset_handler::ResetHandler; // Reset behavior execution
-                                 // Note: ResetNotificationData no longer needed with new architecture
 use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring and tiered recovery
 use settings::SettingsManager; // Device settings management
+use system_state::{SystemEvent, WiFiConnectionEvent, SYSTEM_EVENT_SIGNAL, SYSTEM_STATE, WIFI_STATUS_SIGNAL}; // System state
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
-// Import our reset manager with tiered recovery
-// Note: RecoveryTier enum no longer used
 
-// Helper functions to get real device information
-fn get_device_serial_number() -> String {
-    // Get the default MAC address which is unique for each ESP32
-    let mut mac = [0u8; 6];
-    unsafe {
-        esp_idf_svc::sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
-    }
-    // Create a serial number from the MAC address
-    format!(
-        "ESP32-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
-}
 
-fn get_device_mac_address() -> String {
-    let mut mac = [0u8; 6];
-    unsafe {
-        esp_idf_svc::sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
-    }
-    format!(
-        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
-}
 
-// Task coordination structures and system state
-// These provide event-driven communication between tasks eliminating polling loops
 
-// WiFi connection status events
-#[derive(Clone, Debug)]
-pub enum WiFiConnectionEvent {
-    ConnectionAttempting,                     // WiFi connection is being attempted
-    ConnectionSuccessful(std::net::Ipv4Addr), // WiFi connected successfully with IP
-    ConnectionFailed(String),                 // WiFi connection failed with error
-    CredentialsStored,                        // WiFi credentials stored successfully
-    CredentialsInvalid,                       // WiFi credentials validation failed
-}
-
-// System lifecycle events
-#[derive(Clone, Debug)]
-pub enum SystemEvent {
-    SystemStartup,           // System has started and is initializing
-    ProvisioningMode,        // Device is in WiFi provisioning mode via BLE
-    WiFiMode,                // Device has transitioned to WiFi-only mode
-    ResetButtonPressed,      // Physical reset button was pressed
-    ResetInProgress,         // Factory reset is in progress
-    ResetCompleted,          // Factory reset completed successfully
-    SystemError(String),     // System error occurred
-    TaskTerminating(String), // Task is cleanly terminating
-}
-
-// Global signals for task coordination (static, allocated at compile time)
-// Using CriticalSectionRawMutex for interrupt-safe access in embedded systems
-pub static WIFI_STATUS_SIGNAL: Signal<CriticalSectionRawMutex, WiFiConnectionEvent> = Signal::new();
-pub static SYSTEM_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, SystemEvent> = Signal::new();
-
-// Shared system state - protected by mutex for safe concurrent access
-pub static SYSTEM_STATE: Mutex<CriticalSectionRawMutex, SystemState> =
-    Mutex::new(SystemState::new());
-
-// System state structure
-#[derive(Clone, Debug)]
-pub struct SystemState {
-    pub wifi_connected: bool,
-    pub wifi_ip: Option<std::net::Ipv4Addr>,
-    pub ble_active: bool,
-    pub ble_client_connected: bool,
-    pub provisioning_complete: bool,
-}
-
-impl SystemState {
-    pub const fn new() -> Self {
-        Self {
-            wifi_connected: false,
-            wifi_ip: None,
-            ble_active: false,
-            ble_client_connected: false,
-            provisioning_complete: false,
-        }
-    }
-}
-
-/// Comprehensive NVS flash storage dump function
-/// This dumps all namespaces and their key-value pairs for debugging
-fn dump_entire_nvs_storage(nvs_partition: &EspDefaultNvsPartition) {
-    info!("🔍 Starting comprehensive NVS flash storage analysis...");
-    info!("📱 NVS Partition: Initialized and ready");
-
-    // List of known namespaces to check
-    let known_namespaces = [
-        "nvs.net80211",  // WiFi system data
-        "wifi_config",   // Our WiFi credentials
-        "reset_state",   // Device instance ID and reset state (Echo/Nest-style)
-        "mqtt_certs",    // MQTT certificates
-        "acorn_device",  // Device-specific data
-        "nvs",           // Default namespace
-        "phy_init",      // PHY calibration data
-        "tcpip_adapter", // TCP/IP adapter config
-    ];
-
-    info!("🔍 Checking {} known namespaces...", known_namespaces.len());
-
-    for namespace in &known_namespaces {
-        info!("🔍 === Checking namespace: '{}' ===", namespace);
-
-        match EspNvs::new(nvs_partition.clone(), namespace, true) {
-            Ok(nvs_handle) => {
-                info!("✅ Opened namespace '{}' successfully", namespace);
-                dump_namespace_contents(&nvs_handle, namespace);
-            }
-            Err(e) => {
-                info!("📭 Namespace '{}' not found or empty: {:?}", namespace, e);
-            }
-        }
-    }
-
-    info!("🔍 NVS flash storage dump completed");
-}
-
-/// Dump known keys from a specific NVS namespace
-fn dump_namespace_contents(nvs_handle: &EspNvs<NvsDefault>, namespace: &str) {
-    info!(
-        "📂 Attempting to dump known keys from namespace: '{}'",
-        namespace
-    );
-
-    // Known keys for different namespaces
-    let known_keys = match namespace {
-        "wifi_config" => vec![
-            "ssid",
-            "password",
-            "auth_token",
-            "device_name",
-            "user_timezone",
-            "timestamp",
-        ],
-        "reset_state" => vec![
-            "device_instance_id",
-            "device_state",
-            "reset_timestamp",
-            "reset_reason",
-        ],
-        "mqtt_certs" => vec![
-            "device_cert",
-            "private_key",
-            "ca_cert",
-            "iot_endpoint",
-            "device_id",
-        ],
-        "acorn_device" => vec!["device_id", "serial_number", "firmware_version"],
-        _ => vec![""], // Try empty key for other namespaces
-    };
-
-    let mut found_keys = 0;
-
-    for key in &known_keys {
-        if key.is_empty() && namespace != "nvs" {
-            continue;
-        }
-
-        // Try reading as string first
-        match nvs_handle.get_str(key, &mut [0u8; 512]) {
-            Ok(Some(value)) => {
-                info!("   📝 '{}' = '{}' (string)", key, value);
-                found_keys += 1;
-                continue;
-            }
-            Ok(None) => {
-                // Key doesn't exist as string, try other types
-            }
-            Err(_) => {
-                // Not a string, try other types
-            }
-        }
-
-        // Try reading as blob
-        let mut buffer = vec![0u8; 1024];
-        match nvs_handle.get_blob(key, &mut buffer) {
-            Ok(Some(blob_data)) => {
-                let size = blob_data.len();
-                info!("   💾 '{}' = <blob {} bytes>", key, size);
-
-                // Display first 32 bytes as hex if data exists
-                if size > 0 {
-                    let display_bytes = std::cmp::min(size, 32);
-                    let hex_string: String = blob_data[..display_bytes]
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-
-                    info!(
-                        "       Hex: {} {}",
-                        hex_string,
-                        if size > 32 { "..." } else { "" }
-                    );
-
-                    // Try to display as UTF-8 if possible
-                    if let Ok(utf8_str) = std::str::from_utf8(blob_data) {
-                        let display_str = if utf8_str.len() > 64 {
-                            format!("{}...", &utf8_str[..64])
-                        } else {
-                            utf8_str.to_string()
-                        };
-                        info!("       UTF8: '{}'", display_str);
-                    }
-                }
-                found_keys += 1;
-                continue;
-            }
-            Ok(None) => {
-                // Not a blob
-            }
-            Err(_) => {
-                // Error reading as blob
-            }
-        }
-
-        // Try reading as u32
-        match nvs_handle.get_u32(key) {
-            Ok(Some(value)) => {
-                info!("   🔢 '{}' = {} (u32)", key, value);
-                found_keys += 1;
-                continue;
-            }
-            Ok(None) => {
-                // Not a u32
-            }
-            Err(_) => {
-                // Error reading as u32
-            }
-        }
-
-        // Try reading as u64
-        match nvs_handle.get_u64(key) {
-            Ok(Some(value)) => {
-                info!("   🔢 '{}' = {} (u64)", key, value);
-                found_keys += 1;
-                continue;
-            }
-            Ok(None) => {
-                // Not a u64
-            }
-            Err(_) => {
-                // Error reading as u64
-            }
-        }
-
-        // Key not found in any format
-        debug!("   ❓ '{}' = <not found>", key);
-    }
-
-    if found_keys == 0 {
-        info!("📭 No known keys found in namespace '{}'", namespace);
-    } else {
-        info!(
-            "📊 Found {} known keys in namespace '{}'",
-            found_keys, namespace
-        );
-    }
-}
-
-// ============================================================================
-// ⚠️ TEST CODE - REMOVE AFTER TESTING ⚠️
-// ============================================================================
-/// Performs an early factory reset using the proper physical reset workflow
-/// This simulates pressing the physical pinhole reset button at startup
-async fn perform_early_factory_reset() -> Result<(), anyhow::Error> {
-    info!("🔄 Starting early factory reset using Echo/Nest-style reset security...");
-
-    // Initialize NVS partition for reset handler
-    let nvs_partition = EspDefaultNvsPartition::take()
-        .map_err(|e| anyhow::anyhow!("Failed to take NVS partition: {:?}", e))?;
-
-    // Generate device ID for reset handler
-    let device_id = generate_device_id();
-    info!("🆔 Generated device ID for reset: {}", device_id);
-
-    // Initialize reset handler with Echo/Nest-style security
-    let mut reset_handler = ResetHandler::new(device_id.clone());
-    reset_handler
-        .initialize_nvs_partition(nvs_partition)
-        .map_err(|e| anyhow::anyhow!("Failed to initialize reset handler: {:?}", e))?;
-
-    info!("✅ Reset handler initialized successfully");
-
-    // Execute factory reset with device instance ID security
-    info!("🔥 Executing factory reset with device instance ID generation...");
-    reset_handler
-        .execute_factory_reset("startup_flag_reset".to_string())
-        .await?;
-
-    info!("✅ Factory reset executed successfully - system will restart");
-    Ok(())
-}
-// Factory reset function using Echo/Nest-style security (device instance ID generation)
 
 // The #[embassy_executor::main] attribute transforms this function into the main async runtime
 // This is similar to #[tokio::main] but optimized for embedded systems
@@ -414,24 +93,6 @@ async fn main(spawner: Spawner) {
     info!("Starting Embassy-based Application with BLE status LED indicator!");
     info!("Starting Embassy-based Application with BLE status LED indicator!22");
 
-    // Check for factory reset flag (startup-time reset using Echo/Nest-style security)
-    if FORCE_FACTORY_RESET_ON_STARTUP {
-        info!("🔄 FACTORY RESET FLAG ENABLED - Performing Echo/Nest-style factory reset");
-        info!("🚨 This will generate new device instance ID and reset device state");
-
-        // Perform factory reset using Echo/Nest-style reset security
-        if let Err(e) = perform_early_factory_reset().await {
-            error!("❌ Early factory reset failed: {:?}", e);
-            error!("💥 Device may be in an inconsistent state - manual intervention required");
-        } else {
-            info!("✅ Early factory reset completed successfully");
-            info!("🔄 System should restart automatically from reset handler");
-        }
-
-        // The reset handler should restart the device automatically
-        // But if we reach here, something went wrong, so restart manually
-        restart_device("Early factory reset completed").await;
-    }
 
     // Take ownership of all ESP32 peripherals (GPIO, SPI, I2C, etc.)
     // .unwrap() panics if peripherals are already taken (only one instance allowed)
@@ -712,162 +373,6 @@ async fn handle_wifi_status_change(event: WiFiConnectionEvent) {
     }
 }
 
-// Device registration function - called after WiFi connection is successful
-// This implements the technical documentation flow: WiFi connection => device registration
-async fn register_device_with_backend(
-    auth_token: String,
-    device_name: String,
-    user_timezone: String,
-    nvs_partition: EspDefaultNvsPartition,
-) -> Result<String, anyhow::Error> {
-    info!("🔧 Starting device registration process");
-
-    if auth_token.is_empty() {
-        error!("❌ Auth token is empty - authentication will fail");
-        return Err(anyhow::anyhow!("Auth token is empty"));
-    }
-
-    // Create device API client
-    // Use development endpoint for testing, production for release builds
-    let base_url = "https://1utz0mh8f7.execute-api.us-west-2.amazonaws.com/dev/v1".to_string();
-
-    let firmware_version = "1.0.0".to_string();
-    let device_id = generate_device_id();
-    let device_api_client =
-        DeviceApiClient::new(base_url, device_id.clone(), firmware_version.clone());
-
-    // Use authentication token from BLE provisioning
-    info!("🔐 Setting authentication token");
-    device_api_client.set_auth_token(auth_token.clone()).await;
-
-    // Get real device information
-    let serial_number = get_device_serial_number();
-    let mac_address = get_device_mac_address();
-
-    info!("📋 Using device information from BLE provisioning:");
-    info!("  Device Name: {}", device_name);
-    info!("  User Timezone: {}", user_timezone);
-    info!("  Serial Number: {}", serial_number);
-    info!("  MAC Address: {}", mac_address);
-
-    // Check for reset state first, then determine registration parameters
-    // Use the provided NVS partition instead of taking a new one
-
-    let mut reset_handler = ResetHandler::new(device_id.clone());
-    reset_handler.initialize_nvs_partition(nvs_partition.clone())?;
-
-    let (device_instance_id, device_state, reset_timestamp) =
-        if let Ok(Some(reset_state)) = reset_handler.load_reset_state() {
-            info!("🔄 Found reset state - device was factory reset");
-            info!("📝 Reset instance ID: {}", reset_state.device_instance_id);
-            info!("📝 Reset timestamp: {}", reset_state.reset_timestamp);
-            (
-                reset_state.device_instance_id,
-                reset_state.device_state,
-                Some(reset_state.reset_timestamp),
-            )
-        } else {
-            info!("📋 No reset state found - normal device registration");
-            let instance_id = generate_device_instance_id();
-            info!("🆔 Generated device instance ID: {}", instance_id);
-            (instance_id, "normal".to_string(), None)
-        };
-
-    info!("📋 Registration parameters:");
-    info!("  Instance ID: {}", device_instance_id);
-    info!("  Device state: {}", device_state);
-    info!("  Reset timestamp: {:?}", reset_timestamp);
-
-    let device_registration = device_api_client.create_device_registration(
-        serial_number,
-        mac_address,
-        device_name,
-        device_instance_id,
-        device_state,
-        reset_timestamp,
-    );
-
-    info!("📋 Device registration data:");
-    info!("  Device ID: {}", device_registration.device_id);
-    info!("  Serial Number: {}", device_registration.serial_number);
-    info!("  MAC Address: {}", device_registration.mac_address);
-    info!("  Device Name: {}", device_registration.device_name);
-
-    // Register device with backend
-    match device_api_client
-        .register_device(&device_registration)
-        .await
-    {
-        Ok(response) => {
-            info!("✅ Device registered successfully with backend!");
-            info!("🔑 Device ID: {}", response.data.device_id);
-            info!("👤 Owner ID: {}", response.data.owner_id);
-            info!(
-                "🌐 IoT Endpoint: {}",
-                response.data.certificates.iot_endpoint
-            );
-            info!("📅 Registered at: {}", response.data.registered_at);
-            info!("📊 Status: {}", response.data.status);
-            info!("🔍 Request ID: {}", response.request_id);
-
-            // Store AWS IoT Core credentials for MQTT communication
-            info!("🔐 Storing AWS IoT Core certificates securely");
-            info!(
-                "📜 Certificate length: {} bytes",
-                response.data.certificates.device_certificate.len()
-            );
-            info!(
-                "🔑 Private key length: {} bytes",
-                response.data.certificates.private_key.len()
-            );
-
-            // Initialize certificate storage and store credentials
-            match MqttCertificateStorage::new_with_partition(nvs_partition) {
-                Ok(mut cert_storage) => {
-                    match cert_storage
-                        .store_certificates(&response.data.certificates, &response.data.device_id)
-                    {
-                        Ok(_) => {
-                            info!("✅ AWS IoT Core certificates stored successfully in NVS");
-
-                            // Signal that certificates are available for MQTT initialization
-                            SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemStartup);
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to store certificates: {:?}", e);
-                            warn!("⚠️ Device will operate without MQTT functionality until certificates are stored");
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Failed to initialize certificate storage: {:?}", e);
-                    warn!("⚠️ Device will operate without MQTT functionality");
-                }
-            }
-
-            info!("🎯 Device registration completed successfully!");
-
-            // Clear auth token from storage to save space (no longer needed)
-            info!("🧹 Clearing auth token from storage to save space");
-            if let Ok(mut wifi_storage) = crate::wifi_storage::WiFiStorage::new() {
-                if let Err(e) = wifi_storage.clear_auth_token() {
-                    warn!("Failed to clear auth token: {:?}", e);
-                }
-            }
-
-            Ok(response.data.device_id)
-        }
-        Err(e) => {
-            error!("❌ Device registration failed: {:?}", e);
-            error!("🔄 Registration failures indicate critical device state issues");
-            error!("🔄 Triggering factory reset to restore device to clean state");
-            perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
-            return Err(
-                anyhow::anyhow!("Device registration failed - factory reset triggered").into(),
-            );
-        }
-    }
-}
 
 // WIFI-ONLY MODE TASK - Pure WiFi operation when credentials exist
 #[embassy_executor::task]
@@ -1161,314 +666,9 @@ async fn restart_device(reason: &str) {
     }
 }
 
-// OLD WiFi FUNCTIONS REMOVED - Now using persistent WiFi task with channel communication
-// This eliminates the Peripherals::take() singleton issue entirely!
 
-async fn test_connectivity_and_register(
-    ip_address: Ipv4Addr,
-    credentials: &crate::ble_server::WiFiCredentials,
-    nvs_partition: EspDefaultNvsPartition,
-    device_id: String,
-    spawner: Spawner,
-) -> Result<(), Box<dyn std::error::Error>> {
-    info!("🌐 Testing internet connectivity and registering device...");
-    info!("📍 Local IP: {}", ip_address);
 
-    // Step 1: Test basic HTTP connectivity with httpbin.org
-    info!("🔍 Testing HTTP connectivity...");
-    match test_http_connectivity().await {
-        Ok(_) => info!("✅ HTTP connectivity test passed"),
-        Err(e) => {
-            warn!("⚠️ HTTP connectivity test failed: {:?}", e);
-            // Continue with registration attempt anyway
-        }
-    }
 
-    // Step 2: Use provided device ID
-    info!("🆔 Device ID: {}", device_id);
-
-    // Step 3: Register device with Acorn Pups backend using provided credentials
-    info!("📡 Registering device with Acorn Pups backend...");
-    info!("🔑 Using auth token from BLE provisioning");
-    info!("📱 Device name: {}", credentials.device_name);
-    info!("🌍 User timezone: {}", credentials.user_timezone);
-
-    match register_device_with_backend(
-        credentials.auth_token.clone(),
-        credentials.device_name.clone(),
-        credentials.user_timezone.clone(),
-        nvs_partition.clone(),
-    )
-    .await
-    {
-        Ok(registered_device_id) => {
-            info!("✅ Device registration successful");
-            info!("🎯 Device is now registered and ready for Acorn Pups operations");
-            info!("🔑 Registered device ID: {}", registered_device_id);
-
-            // Check if certificates were stored successfully before spawning MQTT
-            info!("🔍 Verifying AWS IoT Core certificates were stored successfully");
-
-            let cert_storage_result = {
-                match crate::mqtt_certificates::MqttCertificateStorage::new_with_partition(
-                    nvs_partition.clone(),
-                ) {
-                    Ok(mut storage) => match storage.certificates_exist() {
-                        Ok(exists) => {
-                            if exists {
-                                info!("✅ Certificate existence check passed");
-                            } else {
-                                error!("❌ Certificate existence check failed");
-                                info!("🔍 Debugging certificate storage issue...");
-                            }
-                            exists
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to check certificate existence: {:?}", e);
-                            false
-                        }
-                    },
-                    Err(e) => {
-                        error!(
-                            "❌ Failed to create certificate storage for verification: {:?}",
-                            e
-                        );
-                        false
-                    }
-                }
-            };
-
-            if cert_storage_result {
-                info!("🔌 AWS IoT Core certificates confirmed - spawning MQTT manager task");
-
-                // Spawn the MQTT manager task now that registration and certificates are complete
-                if let Err(_) = spawner.spawn(mqtt_manager_task(
-                    registered_device_id.clone(),
-                    nvs_partition.clone(),
-                )) {
-                    error!("❌ Failed to spawn MQTT manager task - this is a critical failure");
-                    error!("🔄 System will trigger factory reset due to MQTT spawn failure");
-                    perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone())
-                        .await;
-                    return Err(anyhow::anyhow!(
-                        "MQTT manager spawn failed - factory reset triggered"
-                    )
-                    .into());
-                } else {
-                    info!("✅ MQTT manager task spawned successfully");
-                }
-
-                // Spawn settings manager task for device settings management
-                if let Err(_) = spawner.spawn(settings_manager_task(
-                    registered_device_id.clone(),
-                    nvs_partition.clone(),
-                )) {
-                    error!("❌ Failed to spawn settings manager task");
-                } else {
-                    info!("✅ Settings manager task spawned successfully");
-                }
-
-                info!("✅ All core tasks spawned successfully");
-
-                // Wait for MQTT connection with proper health checks instead of arbitrary delay
-                info!("🔍 Verifying MQTT connection state with health checks...");
-
-                // Use exponential backoff for connection verification
-                let mut connection_verified = false;
-                let mut retry_count = 0;
-                const MAX_CONNECTION_RETRIES: u32 = 5;
-                const INITIAL_CHECK_DELAY_MS: u64 = 500;
-
-                while retry_count < MAX_CONNECTION_RETRIES && !connection_verified {
-                    let check_delay = INITIAL_CHECK_DELAY_MS * (1 << retry_count); // Exponential backoff
-                    Timer::after(Duration::from_millis(check_delay)).await;
-
-                    // Check MQTT connection health via shared state or manager status
-                    // In a real implementation, this would check the MQTT manager's connection state
-                    // For now, we'll use a reasonable delay that allows connection establishment
-                    retry_count += 1;
-
-                    info!(
-                        "🔄 MQTT connection check {} of {} (waited {}ms)",
-                        retry_count, MAX_CONNECTION_RETRIES, check_delay
-                    );
-
-                    // After reasonable time for connection establishment, assume success
-                    // In production, this should check actual MQTT connection state
-                    if retry_count >= 3 {
-                        connection_verified = true;
-                        info!("✅ MQTT connection state verification completed");
-                    }
-                }
-
-                if !connection_verified {
-                    error!(
-                        "❌ MQTT connection verification failed after {} attempts",
-                        MAX_CONNECTION_RETRIES
-                    );
-                    error!("🔄 MQTT connection issues will be handled by the MQTT manager itself");
-                    warn!("⚠️ The MQTT manager has built-in retry and recovery logic");
-                }
-
-                info!("🔌 MQTT manager is active and ready for AWS IoT Core communication");
-            } else {
-                error!("❌ AWS IoT Core certificates not found after registration");
-                error!("❌ Certificates were stored but verification failed");
-                error!("🔄 This is a critical failure - triggering factory reset");
-                perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
-                return Err(anyhow::anyhow!(
-                    "Certificate storage verification failed - factory reset triggered"
-                )
-                .into());
-            }
-        }
-        Err(e) => {
-            error!("❌ Device registration failed: {:?}", e);
-            error!("🔄 Registration failures indicate critical device state issues");
-            error!("🔄 Triggering factory reset to restore device to clean state");
-            perform_mqtt_failure_factory_reset(device_id.clone(), nvs_partition.clone()).await;
-            return Err(
-                anyhow::anyhow!("Device registration failed - factory reset triggered").into(),
-            );
-        }
-    }
-
-    info!("🎉 Connectivity testing and device registration completed");
-    info!("🌟 Acorn Pups device is fully online and operational");
-
-    Ok(())
-}
-
-// Test basic HTTP connectivity using httpbin.org
-async fn test_http_connectivity() -> Result<(), Box<dyn std::error::Error>> {
-    info!("🔗 Testing HTTP connectivity to httpbin.org...");
-
-    let config = esp_idf_svc::http::client::Configuration {
-        timeout: Some(std::time::Duration::from_secs(10)),
-        ..Default::default()
-    };
-
-    let mut client = Client::wrap(EspHttpConnection::new(&config)?);
-
-    // Test GET request to httpbin.org
-    let request = client.get("http://httpbin.org/get")?;
-    let response = request.submit()?;
-
-    if response.status() == 200 {
-        info!(
-            "✅ HTTP GET request successful - status: {}",
-            response.status()
-        );
-
-        // Read a small portion of the response to verify data transfer
-        let mut buffer = [0u8; 256];
-        let mut reader = response;
-        match reader.read(&mut buffer) {
-            Ok(bytes_read) => {
-                info!("✅ Read {} bytes from HTTP response", bytes_read);
-                if bytes_read > 0 {
-                    let response_text = std::str::from_utf8(&buffer[..bytes_read.min(100)])
-                        .unwrap_or("[non-UTF8 response]");
-                    info!("📄 Response preview: {}", response_text);
-                }
-            }
-            Err(e) => warn!("⚠️ Failed to read response body: {:?}", e),
-        }
-
-        Ok(())
-    } else {
-        let error_msg = format!("HTTP request failed with status: {}", response.status());
-        Err(error_msg.into())
-    }
-}
-
-#[embassy_executor::task]
-async fn led_task(
-    mut led_red: PinDriver<'static, esp_idf_svc::hal::gpio::Gpio2, esp_idf_svc::hal::gpio::Output>,
-    mut led_green: PinDriver<
-        'static,
-        esp_idf_svc::hal::gpio::Gpio4,
-        esp_idf_svc::hal::gpio::Output,
-    >,
-    mut led_blue: PinDriver<'static, esp_idf_svc::hal::gpio::Gpio5, esp_idf_svc::hal::gpio::Output>,
-) {
-    info!("LED Task started - BLE status indicator");
-
-    // Start with all LEDs red (default/startup state)
-    led_red.set_high().ok();
-    led_green.set_low().ok();
-    led_blue.set_low().ok();
-    info!("🔴 LEDs set to RED - System startup/default state");
-
-    let mut previous_state = "startup".to_string();
-
-    loop {
-        // Check current system state
-        let current_state = {
-            let state = SYSTEM_STATE.lock().await;
-
-            if state.wifi_connected {
-                "wifi_connected".to_string()
-            } else if state.ble_client_connected {
-                "ble_connected".to_string()
-            } else if state.ble_active {
-                "ble_broadcasting".to_string()
-            } else {
-                "startup".to_string()
-            }
-        };
-
-        // Only update LEDs if state has changed
-        if current_state != previous_state {
-            match current_state.as_str() {
-                "startup" => {
-                    // All red - system startup/default state
-                    led_red.set_high().ok();
-                    led_green.set_low().ok();
-                    led_blue.set_low().ok();
-                    info!("🔴 LEDs set to RED - System startup/default state");
-                }
-
-                "ble_broadcasting" => {
-                    // All blue - BLE is broadcasting/advertising
-                    led_red.set_low().ok();
-                    led_green.set_low().ok();
-                    led_blue.set_high().ok();
-                    info!("🔵 LEDs set to BLUE - BLE broadcasting/advertising");
-                }
-
-                "ble_connected" => {
-                    // All green - BLE client connected
-                    led_red.set_low().ok();
-                    led_green.set_high().ok();
-                    led_blue.set_low().ok();
-                    info!("🟢 LEDs set to GREEN - BLE client connected");
-                }
-
-                "wifi_connected" => {
-                    // All green - WiFi connected (provisioning complete)
-                    led_red.set_low().ok();
-                    led_green.set_high().ok();
-                    led_blue.set_low().ok();
-                    info!("🟢 LEDs set to GREEN - WiFi connected");
-                }
-
-                _ => {
-                    // Fallback to red for unknown states
-                    led_red.set_high().ok();
-                    led_green.set_low().ok();
-                    led_blue.set_low().ok();
-                    warn!("🔴 LEDs set to RED - Unknown state: {}", current_state);
-                }
-            }
-
-            previous_state = current_state;
-        }
-
-        // Check system state every 250ms (responsive but not excessive)
-        Timer::after(Duration::from_millis(250)).await;
-    }
-}
 
 // MQTT MANAGER TASK - Handles AWS IoT Core communication with certificate-based authentication
 #[embassy_executor::task]
