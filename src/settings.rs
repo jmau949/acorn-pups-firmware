@@ -22,8 +22,8 @@ use anyhow::{anyhow, Result};
 // Import serde for JSON message parsing
 use serde::{Deserialize, Serialize};
 
-// Import standard library components
-use std::str::FromStr;
+// Import standard library components (currently unused)
+// use std::str::FromStr;
 
 // Settings configuration constants
 const NVS_NAMESPACE: &str = "device_settings"; // Namespace for device settings
