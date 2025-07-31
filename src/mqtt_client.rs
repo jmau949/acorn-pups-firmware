@@ -510,46 +510,31 @@ impl AwsIotMqttClient {
         Ok(())
     }
 
-    /// Process incoming MQTT messages asynchronously
-    /// This replaces the callback-based approach with async message processing
+    /// Process incoming MQTT messages asynchronously - truly event-driven
     pub async fn process_messages(&mut self) -> Result<()> {
         if self.connection.is_none() {
-            debug!("📭 MQTT not connected, no messages to process");
             return Ok(());
         }
 
-        // Debug: Log that we're attempting to process messages
-        debug!("🔍 Attempting to process MQTT messages...");
-
-        // Temporarily take ownership of the connection to avoid borrow checker issues.
+        // Temporarily take ownership of the connection
         let mut connection = self.connection.take().unwrap();
 
-        // Use a longer timeout to ensure we catch connection events
-        debug!("🔍 Calling connection.next() with 200ms timeout...");
-        match with_timeout(Duration::from_millis(200), connection.next()).await {
-            Ok(Ok(evt)) => {
-                info!("📡 RECEIVED MQTT EVENT: {:?}", evt.payload());
-
-                // Process connection events first to update state
+        // Get one event asynchronously (this will await until an event is available)
+        match connection.next().await {
+            Ok(evt) => {
+                debug!("📡 MQTT EVENT: {:?}", evt.payload());
                 self.handle_connection_event(&evt);
-
-                // Then process the event for message routing
                 if let Err(e) = self.handle_mqtt_event_async(&evt).await {
-                    warn!("⚠️ Error while handling MQTT event: {}", e);
+                    warn!("⚠️ Error handling MQTT event: {}", e);
                 }
             }
-            Ok(Err(e)) => {
-                warn!("📡 MQTT event error: {:?}", e);
-            }
-            Err(_) => {
-                // Timeout - no events within timeout period, this is normal
-                debug!("📡 No MQTT events received within 200ms timeout - this is normal");
+            Err(e) => {
+                debug!("📡 No MQTT events available: {:?}", e);
             }
         }
 
-        // Put the connection back.
+        // Put the connection back
         self.connection = Some(connection);
-
         Ok(())
     }
 

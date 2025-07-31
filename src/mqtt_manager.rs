@@ -1,32 +1,17 @@
-// MQTT Manager Module
-// Embassy task coordination layer for MQTT operations with channel-based communication
-// Integrates with existing signal system for seamless MQTT management
+// Event-driven MQTT Manager using Embassy async runtime
 
-// Import Embassy synchronization primitives for task coordination
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-
-// Import Embassy time utilities for periodic operations and timeouts
 use embassy_time::{Duration, Timer};
-
-// Import logging macros for debug output with consistent emoji prefixes
 use log::{debug, error, info, warn};
-
-// Import anyhow for error handling following existing patterns
 use anyhow::{anyhow, Result};
 
-// Import our MQTT client and certificate management modules
 use crate::mqtt_certificates::MqttCertificateStorage;
 use crate::mqtt_client::{AwsIotMqttClient, MqttConnectionState};
 
-// Import existing system events for integration
-// System events imported where needed
-
-// MQTT manager configuration constants  
-const MQTT_MESSAGE_QUEUE_SIZE: usize = 32; // Channel capacity for message queue
-const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 60; // Check connection health every 60 seconds (increased)
-const MESSAGE_TIMEOUT_SECONDS: u64 = 10; // Timeout for message operations
+const MQTT_MESSAGE_QUEUE_SIZE: usize = 32;
+const CONNECTION_CHECK_INTERVAL_SECONDS: u64 = 60;
 
 // MQTT message types for internal communication
 #[derive(Debug, Clone)]
@@ -60,15 +45,7 @@ pub enum MqttManagerEvent {
     CertificatesError(String),
 }
 
-// Global MQTT message channel for task communication
-// Using CriticalSectionRawMutex for interrupt-safe access
-pub static MQTT_MESSAGE_CHANNEL: Channel<
-    CriticalSectionRawMutex,
-    MqttMessage,
-    MQTT_MESSAGE_QUEUE_SIZE,
-> = Channel::new();
-
-// Global MQTT manager event signal for external coordination
+pub static MQTT_MESSAGE_CHANNEL: Channel<CriticalSectionRawMutex, MqttMessage, MQTT_MESSAGE_QUEUE_SIZE> = Channel::new();
 pub static MQTT_EVENT_SIGNAL: Signal<CriticalSectionRawMutex, MqttManagerEvent> = Signal::new();
 
 /// MQTT Manager - handles Embassy task coordination and message queuing
@@ -77,7 +54,6 @@ pub struct MqttManager {
     client: AwsIotMqttClient,
     cert_storage: Option<MqttCertificateStorage>,
     is_initialized: bool,
-    last_connection_check: Option<embassy_time::Instant>,
     subscriptions_completed: bool,
     subscription_in_progress: bool,
 }
@@ -94,7 +70,6 @@ impl MqttManager {
             client,
             cert_storage: None,
             is_initialized: false,
-            last_connection_check: None,
             subscriptions_completed: false,
             subscription_in_progress: false,
         }
@@ -139,91 +114,76 @@ impl MqttManager {
         self.is_initialized && self.cert_storage.is_some()
     }
 
-    /// Main MQTT management loop - processes messages and handles connection health
+    /// Main MQTT management loop - fully event-driven using Embassy
     pub async fn run(&mut self) -> Result<()> {
         if !self.is_ready() {
             return Err(anyhow!("MQTT manager not initialized"));
         }
 
-        info!("🚀 Starting MQTT manager main loop");
+        info!("🚀 Starting event-driven MQTT manager");
 
-        // Attempt initial async connection with detailed error handling
-        match self.attempt_connection().await {
-            Ok(_) => {
-                info!("✅ Initial async MQTT connection successful - entering main loop");
-            }
-            Err(e) => {
-                error!("❌ Initial async MQTT connection failed: {}", e);
-                error!("💥 Async MQTT connection is critical - triggering factory reset");
-                error!("🔄 Device will reset to BLE provisioning mode");
-
-                // Signal MQTT failure to trigger factory reset
-                crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(format!(
-                    "Async MQTT connection failed: {}",
-                    e
-                )));
-
-                // Give time for the signal to be processed
-                Timer::after(Duration::from_secs(2)).await;
-
-                return Err(anyhow!(
-                    "Async MQTT connection failed - factory reset triggered"
-                ));
-            }
+        // Attempt initial connection
+        if let Err(e) = self.attempt_connection().await {
+            error!("❌ Initial MQTT connection failed: {}", e);
+            crate::SYSTEM_EVENT_SIGNAL.signal(crate::SystemEvent::SystemError(format!(
+                "MQTT connection failed: {}", e
+            )));
+            return Err(anyhow!("MQTT connection failed"));
         }
 
+        // Event-driven loop - process one event at a time
+        let mut last_health_check = embassy_time::Instant::now();
+        
         loop {
-            // Process each task in sequence with proper async coordination
-            // This avoids multiple mutable borrow issues with select!
-            self.process_message_queue().await;
-            self.process_mqtt_events().await; // Single place for MQTT event processing
-            self.handle_subscriptions().await; // Handle subscriptions after connection is confirmed
-            self.check_connection_health().await;
-            self.handle_system_events().await;
-            
-            // Dynamic delay based on connection state
-            let delay_ms = if matches!(self.client.get_connection_status(), MqttConnectionState::Connecting) {
-                50 // Faster processing during connection to catch Connected event
-            } else {
-                200 // Normal delay when connected or disconnected
-            };
-            Timer::after(Duration::from_millis(delay_ms)).await;
-        }
-    }
-
-    /// Process incoming messages from the queue
-    async fn process_message_queue(&mut self) {
-        // Non-blocking message processing to avoid deadlocks
-        match MQTT_MESSAGE_CHANNEL.try_receive() {
-            Ok(message) => {
-                self.handle_mqtt_message(message).await;
+            // Use select to handle different event sources
+            match embassy_futures::select::select(
+                MQTT_MESSAGE_CHANNEL.receive(),
+                self.client.process_messages()
+            ).await {
+                embassy_futures::select::Either::First(message) => {
+                    // Handle queued message
+                    self.handle_mqtt_message(message).await;
+                }
+                embassy_futures::select::Either::Second(result) => {
+                    // Handle MQTT event
+                    if let Err(e) = result {
+                        warn!("⚠️ Error processing MQTT events: {}", e);
+                    }
+                }
             }
-            Err(_) => {
-                // No messages available, yield to other tasks
-                Timer::after(Duration::from_millis(10)).await;
+            
+            // Periodic health check
+            let now = embassy_time::Instant::now();
+            if now.duration_since(last_health_check) >= Duration::from_secs(CONNECTION_CHECK_INTERVAL_SECONDS) {
+                self.check_health().await;
+                last_health_check = now;
             }
         }
     }
 
-    /// Process MQTT events - SINGLE SOURCE OF TRUTH for event consumption
-    async fn process_mqtt_events(&mut self) {
-        // Very aggressive processing during connection to catch Connected events that ESP-IDF posts
-        let processing_count = if matches!(self.client.get_connection_status(), MqttConnectionState::Connecting) {
-            10 // Many attempts during connection to catch ESP-IDF Connected event
-        } else {
-            2 // More processing when connected to handle incoming messages
-        };
 
-        for i in 0..processing_count {
-            if let Err(e) = self.client.process_messages().await {
-                warn!("⚠️ Error processing MQTT events: {}", e);
-                break;
+    /// Periodic health check
+    async fn check_health(&mut self) {
+        // Handle subscriptions if needed
+        if !self.subscriptions_completed && self.client.is_connected() {
+            self.handle_subscriptions().await;
+        }
+        
+        // Check connection health
+        match self.client.get_connection_status() {
+            MqttConnectionState::Disconnected => {
+                info!("🔄 MQTT disconnected, attempting reconnection");
+                if let Err(e) = self.attempt_reconnection().await {
+                    warn!("⚠️ Reconnection failed: {}", e);
+                }
             }
-            
-            // Add small delay between processing iterations
-            if i < processing_count - 1 {
-                Timer::after(Duration::from_millis(10)).await;
+            MqttConnectionState::Error => {
+                warn!("❌ MQTT connection error detected");
+                if let Err(e) = self.force_reconnection().await {
+                    error!("❌ Failed to recover from connection error: {}", e);
+                }
             }
+            _ => {}
         }
     }
 
@@ -285,56 +245,6 @@ impl MqttManager {
         }
     }
 
-    /// Check connection health and attempt reconnection if needed
-    async fn check_connection_health(&mut self) {
-        let now = embassy_time::Instant::now();
-
-        // Check if it's time for a connection health check
-        if let Some(last_check) = self.last_connection_check {
-            if now.duration_since(last_check)
-                < Duration::from_secs(CONNECTION_CHECK_INTERVAL_SECONDS)
-            {
-                // Not time for check yet, yield to avoid busy waiting
-                Timer::after(Duration::from_millis(100)).await;
-                return;
-            }
-        }
-
-        self.last_connection_check = Some(now);
-
-        // Check current connection status
-        let status = self.client.get_connection_status();
-
-        match status {
-            MqttConnectionState::Connected => {
-                debug!("💚 Async MQTT connection healthy");
-                // Connection is established, no additional action needed
-            }
-
-            MqttConnectionState::Disconnected => {
-                info!("🔄 Async MQTT disconnected, attempting reconnection");
-                if let Err(e) = self.attempt_reconnection().await {
-                    warn!("⚠️ Async reconnection failed: {}", e);
-                }
-            }
-
-            MqttConnectionState::Connecting => {
-                debug!("🔄 Async MQTT connection in progress");
-            }
-
-            MqttConnectionState::Error => {
-                warn!("❌ Async MQTT connection error detected");
-                MQTT_EVENT_SIGNAL.signal(MqttManagerEvent::ConnectionError(
-                    "Async MQTT connection error".to_string(),
-                ));
-
-                // Attempt recovery using async operations
-                if let Err(e) = self.force_reconnection().await {
-                    error!("❌ Failed to recover from async connection error: {}", e);
-                }
-            }
-        }
-    }
 
     /// Handle MQTT topic subscriptions after connection is confirmed
     async fn handle_subscriptions(&mut self) {
@@ -365,14 +275,6 @@ impl MqttManager {
         }
     }
 
-    /// Handle system events from the main application
-    async fn handle_system_events(&mut self) {
-        // Check for system events that might affect MQTT operations
-        // This is a non-blocking check to integrate with existing signal system
-
-        // For now, we just yield to allow other tasks to signal events
-        Timer::after(Duration::from_millis(10)).await;
-    }
 
 
     /// Attempt initial MQTT connection with async operations and proper event handling
