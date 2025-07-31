@@ -566,7 +566,7 @@ impl AwsIotMqttClient {
                 data,
                 ..
             } => {
-                debug!(
+                info!(
                     "📋 MQTT Data event received: Topic: {}, Payload size: {} bytes",
                     topic,
                     data.len()
@@ -692,12 +692,15 @@ impl AwsIotMqttClient {
                 debug!("📨 MQTT Message published successfully, ID: {}", msg_id);
             }
             EventPayload::Received { topic, data, .. } => {
-                debug!(
+                info!(
                     "📥 MQTT Message received on topic: {:?}, size: {} bytes",
                     topic,
                     data.len()
                 );
-                // Message processing is handled by the existing process_messages method
+                // Log the payload for debugging
+                if let Ok(payload_str) = std::str::from_utf8(data) {
+                    info!("📥 Message payload: {}", payload_str);
+                }
             }
             EventPayload::Deleted(msg_id) => {
                 debug!("🗑️ MQTT Message deleted, ID: {}", msg_id);

@@ -149,6 +149,12 @@ impl MqttManager {
                     if let Err(e) = result {
                         warn!("⚠️ Error processing MQTT events: {}", e);
                     }
+                    
+                    // Check if we need to subscribe after connection
+                    if !self.subscriptions_completed && self.client.is_connected() {
+                        info!("🔗 MQTT connected - initiating topic subscriptions");
+                        self.handle_subscriptions().await;
+                    }
                 }
             }
             
@@ -164,11 +170,6 @@ impl MqttManager {
 
     /// Periodic health check
     async fn check_health(&mut self) {
-        // Handle subscriptions if needed
-        if !self.subscriptions_completed && self.client.is_connected() {
-            self.handle_subscriptions().await;
-        }
-        
         // Check connection health
         match self.client.get_connection_status() {
             MqttConnectionState::Disconnected => {
