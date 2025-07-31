@@ -259,18 +259,14 @@ impl MqttManager {
             
             match self.client.subscribe_to_device_topics().await {
                 Ok(_) => {
-                    info!("✅ All async MQTT topic subscriptions completed successfully");
+                    info!("✅ MQTT subscriptions initiated");
                     self.subscriptions_completed = true;
                     self.subscription_in_progress = false;
                 }
                 Err(e) => {
-                    error!("❌ Failed to subscribe to async MQTT topics: {}", e);
-                    // Don't retry automatically - subscriptions often succeed even when we get timeout errors
-                    // Mark as completed to prevent duplicate attempts
-                    self.subscriptions_completed = true; // Assume success since AWS often receives them
+                    error!("❌ Failed to initiate MQTT subscriptions: {}", e);
+                    self.subscriptions_completed = true; // Prevent retries
                     self.subscription_in_progress = false;
-                    
-                    info!("🔄 Marked subscription as completed despite timeout - AWS may have received it");
                 }
             }
         }

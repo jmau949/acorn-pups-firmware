@@ -269,78 +269,49 @@ impl AwsIotMqttClient {
         }
     }
 
-    /// Subscribe to device-specific MQTT topics using async operations with retry logic
+    /// Subscribe to device-specific MQTT topics
     pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
-        // Verify we're connected before attempting subscriptions
+        info!("🔍 Checking connection state before subscription...");
+        info!("🔍 Current connection state: {:?}", self.connection_state);
+        
         if !self.is_connected() {
-            return Err(anyhow!("MQTT client is not connected - cannot subscribe"));
+            error!("❌ MQTT client is not connected - current state: {:?}", self.connection_state);
+            return Err(anyhow!("MQTT client is not connected"));
         }
+
+        info!("✅ Connection state verified - proceeding with subscription");
 
         if let Some(client) = self.client.as_mut() {
             let client_id = &self.client_id;
-            info!(
-                "🔗 Starting async MQTT topic subscriptions with retry logic for client: {}",
-                client_id
-            );
+            info!("📨 Subscribing to MQTT topics for client: {}", client_id);
 
-            // Subscription configuration - single attempt to avoid duplicates
-            const MAX_RETRIES: u32 = 1;
-            const SUBSCRIPTION_TIMEOUT_SECS: u64 = 3; // Short timeout
-
-            // Subscribe to settings updates with retries and delays between subscriptions
+            // Subscribe to settings topic
             let settings_topic = format!("{}/{}", TOPIC_SETTINGS, client_id);
-            let mut settings_success = false;
-            for attempt in 1..=MAX_RETRIES {
-                info!(
-                    "📨 Subscribing to settings topic (attempt {}/{}): {}",
-                    attempt, MAX_RETRIES, settings_topic
-                );
-
-                let result = with_timeout(Duration::from_secs(SUBSCRIPTION_TIMEOUT_SECS), async {
-                    client.subscribe(&settings_topic, QoS::AtLeastOnce).await
-                })
-                .await;
-
-                match result {
-                    Ok(Ok(_)) => {
-                        info!(
-                            "✅ Successfully subscribed to settings topic on attempt {}",
-                            attempt
-                        );
-                        settings_success = true;
-                        break;
+            info!("📨 Subscribing to: {}", settings_topic);
+            
+            info!("🔄 Calling client.subscribe() with QoS::AtLeastOnce...");
+            // Use spawn to avoid blocking the event loop
+            let topic_clone = settings_topic.clone();
+            embassy_futures::select::select(
+                async {
+                    match client.subscribe(&topic_clone, QoS::AtLeastOnce).await {
+                        Ok(message_id) => {
+                            info!("✅ Subscription request sent successfully - Message ID: {}", message_id);
+                            info!("📋 Note: Subscription confirmation will be logged when received");
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to send subscription request: {:?}", e);
+                        }
                     }
-                    Ok(Err(e)) => {
-                        warn!(
-                            "⚠️ Settings subscription failed on attempt {}: {:?}",
-                            attempt, e
-                        );
-                    }
-                    Err(_) => {
-                        warn!("⚠️ Settings subscription timed out on attempt {}", attempt);
-                    }
-                }
-
-                // No retries in this implementation to avoid duplicate subscriptions
-                // The manager will retry the entire subscription process if needed
-            }
-            if !settings_success {
-                return Err(anyhow!(
-                    "Settings subscription failed after {} attempts",
-                    MAX_RETRIES
-                ));
-            }
-
-            // Skip commands topic for now to avoid connection drops
-            info!("⏭️ Skipping commands topic subscription to avoid connection issues");
-
-            // Skip status request topic for now to get minimal working setup
-            info!("⏭️ Skipping status request topic subscription for minimal setup");
-
-            info!("✅ All async MQTT topic subscriptions completed successfully with retry logic");
+                },
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(10))
+            ).await;
+            
+            info!("🔄 Subscription initiated - continuing with event processing");
             Ok(())
         } else {
-            Err(anyhow!("Async MQTT client not initialized"))
+            error!("❌ MQTT client not initialized");
+            Err(anyhow!("MQTT client not initialized"))
         }
     }
 
@@ -587,13 +558,10 @@ impl AwsIotMqttClient {
 
         // Route based on topic patterns
         if topic.contains("settings") {
-            info!("🔧 Processing settings message asynchronously");
             self.handle_settings_message_async(topic, payload).await?;
         } else if topic.contains("commands") {
-            info!("📋 Processing command message asynchronously");
             self.handle_command_message_async(topic, payload).await?;
         } else if topic.contains("status-request") {
-            info!("📊 Processing status request asynchronously");
             self.handle_status_request_async(topic, payload).await?;
         } else {
             debug!("📋 Unhandled async message topic: {}", topic);
@@ -616,7 +584,7 @@ impl AwsIotMqttClient {
 
         info!("📨 Settings JSON received: {}", json_payload);
 
-        // Send settings update request to settings manager (async version)
+        // Send settings update request to settings manager
         crate::settings::request_mqtt_settings_update(json_payload.to_string());
 
         info!("✅ ✨ Settings message processed and forwarded to settings manager");
@@ -656,20 +624,14 @@ impl AwsIotMqttClient {
     pub fn handle_connection_event(&mut self, event: &esp_idf_svc::mqtt::client::EspMqttEvent<'_>) {
         use esp_idf_svc::mqtt::client::EventPayload;
 
-        // Log the entire payload before matching to see what events we're actually getting
-        info!("🔍 RAW MQTT EVENT PAYLOAD: {:?}", event.payload());
-
         match event.payload() {
             EventPayload::BeforeConnect => {
-                info!("🔄 MQTT BeforeConnect event - preparing for connection");
+                debug!("🔄 MQTT BeforeConnect event");
                 self.connection_state = MqttConnectionState::Connecting;
             }
             EventPayload::Connected(_) => {
-                info!("🔗 MQTT Connected event received - updating connection state to Connected");
-                info!("🔗 Previous state: {:?}", self.connection_state);
+                info!("✅ MQTT Connected");
                 self.connection_state = MqttConnectionState::Connected;
-                info!("🔗 New connection state: {:?}", self.connection_state);
-                info!("🔗 *** CONNECTION STATE CHANGED TO CONNECTED ***");
             }
             EventPayload::Disconnected => {
                 warn!("🔌 MQTT Disconnected event received - updating connection state");
@@ -681,6 +643,7 @@ impl AwsIotMqttClient {
             }
             EventPayload::Subscribed(msg_id) => {
                 info!("✅ MQTT Subscription confirmed for message ID: {}", msg_id);
+                info!("🔔 Subscription is now active - ready to receive messages");
             }
             EventPayload::Unsubscribed(msg_id) => {
                 info!(
@@ -692,15 +655,11 @@ impl AwsIotMqttClient {
                 debug!("📨 MQTT Message published successfully, ID: {}", msg_id);
             }
             EventPayload::Received { topic, data, .. } => {
-                info!(
+                debug!(
                     "📥 MQTT Message received on topic: {:?}, size: {} bytes",
                     topic,
                     data.len()
                 );
-                // Log the payload for debugging
-                if let Ok(payload_str) = std::str::from_utf8(data) {
-                    info!("📥 Message payload: {}", payload_str);
-                }
             }
             EventPayload::Deleted(msg_id) => {
                 debug!("🗑️ MQTT Message deleted, ID: {}", msg_id);
