@@ -26,6 +26,7 @@ pub enum MqttMessage {
     },
     VolumeChange {
         volume: u8,
+        previous_volume: u8,
         source: String,
     },
     Connect,
@@ -214,8 +215,8 @@ impl MqttManager {
                     .await
             }
 
-            MqttMessage::VolumeChange { volume, source } => {
-                self.client.publish_volume_change(volume, &source).await
+            MqttMessage::VolumeChange { volume, previous_volume, source } => {
+                self.client.publish_volume_change(volume, previous_volume, &source).await
             }
 
             MqttMessage::Connect => self.attempt_connection().await,
@@ -349,7 +350,7 @@ impl MqttManager {
                 format!("acorn-pups/status-response/{}", client_id)
             }
             MqttMessage::VolumeChange { .. } => {
-                format!("acorn-pups/status-response/{}", client_id)
+                format!("acorn-pups/volume-control/{}", client_id)
             }
             _ => "system".to_string(),
         }
@@ -397,8 +398,8 @@ pub async fn send_device_status(status: String, wifi_signal: Option<i32>) -> Res
 }
 
 /// Send volume change notification to async MQTT manager
-pub async fn send_volume_change(volume: u8, source: String) -> Result<()> {
-    let message = MqttMessage::VolumeChange { volume, source };
+pub async fn send_volume_change(volume: u8, previous_volume: u8, source: String) -> Result<()> {
+    let message = MqttMessage::VolumeChange { volume, previous_volume, source };
 
     match MQTT_MESSAGE_CHANNEL.try_send(message) {
         Ok(_) => {

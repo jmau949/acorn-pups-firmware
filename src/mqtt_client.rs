@@ -27,6 +27,7 @@ pub const TOPIC_SETTINGS: &str = "acorn-pups/settings";
 pub const TOPIC_COMMANDS: &str = "acorn-pups/commands";
 pub const TOPIC_BUTTON_PRESS: &str = "acorn-pups/button-press";
 pub const TOPIC_STATUS_RESPONSE: &str = "acorn-pups/status-response";
+pub const TOPIC_VOLUME_CONTROL: &str = "acorn-pups/volume-control";
 
 // Message structures following technical documentation
 // Using JSON for compatibility with backend and monitoring systems
@@ -487,20 +488,22 @@ impl AwsIotMqttClient {
     }
 
     /// Publish volume change notification using async operations
-    pub async fn publish_volume_change(&mut self, volume: u8, source: &str) -> Result<()> {
+    pub async fn publish_volume_change(&mut self, volume: u8, previous_volume: u8, source: &str) -> Result<()> {
         // Get values before borrowing client mutably
         let client_id = self.client_id.clone();
         let device_id = self.device_id.clone();
-        let timestamp = self.get_current_timestamp_u64();
+        let timestamp = self.get_iso8601_timestamp();
 
         if let Some(client) = self.client.as_mut() {
-            let topic = format!("{}/{}", TOPIC_STATUS_RESPONSE, client_id);
+            let topic = format!("{}/{}", TOPIC_VOLUME_CONTROL, client_id);
 
             let message = serde_json::json!({
+                "clientId": client_id.clone(),
                 "deviceId": device_id,
-                "timestamp": timestamp,
-                "volume": volume,
-                "source": source
+                "action": if source == "volume_up" { "volume_up" } else { "volume_down" },
+                "newVolume": volume,
+                "previousVolume": previous_volume,
+                "timestamp": timestamp
             });
 
             let json_payload = serde_json::to_string(&message)

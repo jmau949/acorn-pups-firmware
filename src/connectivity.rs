@@ -277,6 +277,7 @@ pub async fn test_connectivity_and_register(
                     info!("✅ Volume control manager task spawned successfully");
                 }
 
+
                 info!("✅ All core tasks spawned successfully");
 
                 // Wait for MQTT connection with proper health checks

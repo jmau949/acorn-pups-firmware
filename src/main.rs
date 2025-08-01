@@ -782,7 +782,7 @@ async fn settings_manager_task(device_id: String, nvs_partition: EspDefaultNvsPa
 #[embassy_executor::task]
 async fn volume_control_manager_task(
     device_id: String,
-    nvs_partition: EspDefaultNvsPartition,
+    _nvs_partition: EspDefaultNvsPartition,
     volume_up_gpio: esp_idf_svc::hal::gpio::Gpio12,
     volume_down_gpio: esp_idf_svc::hal::gpio::Gpio13,
 ) {
@@ -846,6 +846,7 @@ async fn volume_control_manager_task(
         }
     }
 }
+
 
 // RESET MANAGER TASK - Handles physical reset button monitoring and factory reset operations
 #[embassy_executor::task]

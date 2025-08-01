@@ -145,19 +145,34 @@ impl VolumeManager {
 
     /// Adjust volume in specified direction
     pub async fn adjust_volume(&mut self, direction: VolumeDirection) -> Result<VolumeChangeEvent> {
-        let previous_volume = self.current_volume;
         let new_volume = match direction {
             VolumeDirection::Up => {
                 if self.current_volume >= VOLUME_MAX {
-                    debug!("🔊 Volume already at maximum: {}", VOLUME_MAX);
-                    return Err(anyhow!(VolumeError::InvalidLevel(self.current_volume + 1)));
+                    debug!("🔊 Volume already at maximum: {} - ignoring volume up request", VOLUME_MAX);
+                    // Return a successful "no-change" event instead of an error
+                    return Ok(VolumeChangeEvent {
+                        client_id: format!("acorn-receiver-{}", self.device_id),
+                        device_id: self.device_id.clone(),
+                        action: VolumeAction::VolumeUp,
+                        new_volume: self.current_volume,
+                        previous_volume: self.current_volume,
+                        timestamp: self.get_iso_timestamp(),
+                    });
                 }
                 self.current_volume + 1
             }
             VolumeDirection::Down => {
                 if self.current_volume <= VOLUME_MIN {
-                    debug!("🔊 Volume already at minimum: {}", VOLUME_MIN);
-                    return Err(anyhow!(VolumeError::InvalidLevel(self.current_volume - 1)));
+                    debug!("🔊 Volume already at minimum: {} - ignoring volume down request", VOLUME_MIN);
+                    // Return a successful "no-change" event instead of an error
+                    return Ok(VolumeChangeEvent {
+                        client_id: format!("acorn-receiver-{}", self.device_id),
+                        device_id: self.device_id.clone(),
+                        action: VolumeAction::VolumeDown,
+                        new_volume: self.current_volume,
+                        previous_volume: self.current_volume,
+                        timestamp: self.get_iso_timestamp(),
+                    });
                 }
                 self.current_volume - 1
             }
@@ -232,9 +247,14 @@ impl VolumeManager {
         let settings_event = SETTINGS_EVENT_SIGNAL.wait().await;
         
         if let SettingsEvent::SettingsUpdated(mut current_settings) = settings_event {
-            current_settings.sound_volume = volume;
-            request_settings_save(current_settings);
-            debug!("✅ Settings save requested with new volume: {}", volume);
+            // Only update if volume actually changed
+            if current_settings.sound_volume != volume {
+                current_settings.sound_volume = volume;
+                request_settings_save(current_settings);
+                debug!("✅ Settings save requested with new volume: {}", volume);
+            } else {
+                debug!("🔊 Volume unchanged in settings ({}) - skipping NVS update", volume);
+            }
             Ok(())
         } else {
             Err(anyhow!("Failed to get current settings for volume update"))
@@ -243,11 +263,32 @@ impl VolumeManager {
 
     /// Publish volume event to MQTT
     async fn publish_volume_event(&self, event: &VolumeChangeEvent) -> Result<()> {
+        // Skip MQTT publishing if volume didn't actually change (boundary condition)
+        if event.new_volume == event.previous_volume {
+            debug!("🔊 Volume unchanged ({}) - skipping MQTT publish", event.new_volume);
+            return Ok(());
+        }
+        
         debug!("🔊 Publishing volume event to MQTT");
+        
+        // Only publish volume_up and volume_down actions to match Lambda expectations
+        let source = match event.action {
+            VolumeAction::VolumeUp => "volume_up",
+            VolumeAction::VolumeDown => "volume_down",
+            VolumeAction::SetVolume => {
+                // SetVolume is an internal action - determine direction based on volume change
+                if event.new_volume > event.previous_volume {
+                    "volume_up"
+                } else {
+                    "volume_down"
+                }
+            }
+        };
         
         let mqtt_message = MqttMessage::VolumeChange {
             volume: event.new_volume,
-            source: "physical_button".to_string(),
+            previous_volume: event.previous_volume,
+            source: source.to_string(),
         };
 
         if let Err(_) = MQTT_MESSAGE_CHANNEL.try_send(mqtt_message) {
