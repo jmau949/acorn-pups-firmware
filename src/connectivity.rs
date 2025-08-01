@@ -12,7 +12,7 @@ use crate::mqtt_certificates::MqttCertificateStorage;
 use crate::reset_handler::ResetHandler;
 use crate::system_state::SYSTEM_EVENT_SIGNAL;
 use crate::system_state::SystemEvent;
-use crate::{mqtt_manager_task, perform_mqtt_failure_factory_reset, settings_manager_task};
+use crate::{mqtt_manager_task, perform_mqtt_failure_factory_reset, settings_manager_task, volume_control_manager_task};
 
 /// Register device with backend after WiFi connection is successful
 pub async fn register_device_with_backend(
@@ -175,6 +175,8 @@ pub async fn test_connectivity_and_register(
     nvs_partition: EspDefaultNvsPartition,
     device_id: String,
     spawner: Spawner,
+    volume_up_gpio: esp_idf_svc::hal::gpio::Gpio12,
+    volume_down_gpio: esp_idf_svc::hal::gpio::Gpio13,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("🌐 Testing internet connectivity and registering device...");
     info!("📍 Local IP: {}", ip_address);
@@ -261,6 +263,18 @@ pub async fn test_connectivity_and_register(
                     error!("❌ Failed to spawn settings manager task");
                 } else {
                     info!("✅ Settings manager task spawned successfully");
+                }
+
+                // Spawn volume control manager task for physical button handling
+                if let Err(_) = spawner.spawn(volume_control_manager_task(
+                    registered_device_id.clone(),
+                    nvs_partition.clone(),
+                    volume_up_gpio,
+                    volume_down_gpio,
+                )) {
+                    error!("❌ Failed to spawn volume control manager task");
+                } else {
+                    info!("✅ Volume control manager task spawned successfully");
                 }
 
                 info!("✅ All core tasks spawned successfully");

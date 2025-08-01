@@ -55,6 +55,7 @@ mod reset_handler; // Reset behavior execution
 mod reset_manager; // GPIO reset button monitoring and state management
 mod settings; // Device settings management with MQTT and NVS integration
 mod system_state; // System state management and event coordination
+mod volume_control; // Volume control with GPIO buttons and MQTT integration
 mod wifi_storage; // Persistent storage of WiFi credentials
 
 // Import specific items from our modules to use in this file
@@ -69,6 +70,7 @@ use reset_handler::ResetHandler; // Reset behavior execution
 use reset_manager::{ResetManager, ResetManagerEvent}; // Reset button monitoring and tiered recovery
 use settings::SettingsManager; // Device settings management
 use system_state::{SystemEvent, WiFiConnectionEvent, SYSTEM_EVENT_SIGNAL, SYSTEM_STATE, WIFI_STATUS_SIGNAL}; // System state
+use volume_control::{VolumeManager, VolumeButtonHandler}; // Volume control with GPIO buttons
 use wifi_storage::WiFiStorage; // NVS flash storage for WiFi creds
 
 
@@ -129,6 +131,11 @@ async fn main(spawner: Spawner) {
 
     info!("LEDs initialized on GPIO2 (Red), GPIO4 (Green), GPIO5 (Blue)");
 
+    // Initialize volume control GPIO pins (GPIO12 for volume up, GPIO13 for volume down)
+    let volume_up_gpio = peripherals.pins.gpio12;
+    let volume_down_gpio = peripherals.pins.gpio13;
+    info!("Volume control GPIOs allocated: GPIO12 (Volume Up), GPIO13 (Volume Down)");
+
     // Signal system startup
     SYSTEM_EVENT_SIGNAL.signal(SystemEvent::SystemStartup);
 
@@ -188,6 +195,8 @@ async fn main(spawner: Spawner) {
             nvs.clone(),
             device_id.clone(),
             spawner.clone(),
+            volume_up_gpio,
+            volume_down_gpio,
         )) {
             error!("Failed to spawn WiFi-only mode task");
             return;
@@ -384,6 +393,8 @@ async fn wifi_only_mode_task(
     nvs_partition: EspDefaultNvsPartition,
     device_id: String,
     spawner: Spawner,
+    volume_up_gpio: esp_idf_svc::hal::gpio::Gpio12,
+    volume_down_gpio: esp_idf_svc::hal::gpio::Gpio13,
 ) {
     info!("📶 WiFi-Only Mode Task started - connecting with stored credentials");
 
@@ -467,6 +478,8 @@ async fn wifi_only_mode_task(
                                 nvs_partition.clone(),
                                 device_id.clone(),
                                 spawner.clone(),
+                                volume_up_gpio,
+                                volume_down_gpio,
                             )
                             .await
                             {
@@ -760,6 +773,75 @@ async fn settings_manager_task(device_id: String, nvs_partition: EspDefaultNvsPa
             loop {
                 Timer::after(Duration::from_secs(60)).await;
                 warn!("⚠️ Settings manager task is inactive due to initialization failure");
+            }
+        }
+    }
+}
+
+// VOLUME CONTROL MANAGER TASK - Handles physical volume buttons and volume management
+#[embassy_executor::task]
+async fn volume_control_manager_task(
+    device_id: String,
+    nvs_partition: EspDefaultNvsPartition,
+    volume_up_gpio: esp_idf_svc::hal::gpio::Gpio12,
+    volume_down_gpio: esp_idf_svc::hal::gpio::Gpio13,
+) {
+    info!("🔊 Volume Control Manager Task started for device: {}", device_id);
+
+    // Get initial volume from settings
+    use crate::settings::{request_current_settings, SETTINGS_EVENT_SIGNAL, SettingsEvent};
+    
+    request_current_settings();
+    let initial_volume = loop {
+        let settings_event = SETTINGS_EVENT_SIGNAL.wait().await;
+        if let SettingsEvent::SettingsUpdated(settings) = settings_event {
+            break settings.sound_volume;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    };
+
+    // Initialize volume manager
+    let mut volume_manager = match VolumeManager::new(device_id.clone(), initial_volume) {
+        Ok(manager) => {
+            info!("✅ Volume manager initialized successfully");
+            manager
+        }
+        Err(e) => {
+            error!("❌ Failed to initialize volume manager: {}", e);
+            return;
+        }
+    };
+
+    // Initialize button handler
+    let mut button_handler = match VolumeButtonHandler::new(volume_up_gpio, volume_down_gpio) {
+        Ok(handler) => {
+            info!("✅ Volume button handler initialized successfully");
+            handler
+        }
+        Err(e) => {
+            error!("❌ Failed to initialize volume button handler: {}", e);
+            return;
+        }
+    };
+
+    // Spawn button monitoring and volume management concurrently
+    use embassy_futures::select::{select, Either};
+
+    loop {
+        match select(
+            button_handler.start_monitoring(),
+            volume_manager.run_volume_task(),
+        ).await {
+            Either::First(button_result) => {
+                if let Err(e) = button_result {
+                    error!("❌ Volume button monitoring failed: {}", e);
+                    Timer::after(Duration::from_secs(5)).await; // Recovery delay
+                }
+            }
+            Either::Second(_) => {
+                // Volume manager task completed (shouldn't normally happen)
+                warn!("⚠️ Volume manager task completed unexpectedly");
+                Timer::after(Duration::from_secs(5)).await;
             }
         }
     }
