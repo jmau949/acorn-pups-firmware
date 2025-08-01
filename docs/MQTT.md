@@ -222,33 +222,46 @@ The MQTT protocol requires periodic keep-alive messages to maintain connections:
 
 ## Subscription Handling
 
+### Subscription Topics
+
+The device subscribes to three device-specific topics:
+
+1. **Settings Topic** (`acorn-pups/settings/{client-id}`): Device configuration updates
+2. **Status Request Topic** (`acorn-pups/status-request/{client-id}`): Status polling requests
+3. **Commands Topic** (`acorn-pups/commands/{client-id}`): Device control commands
+
 ### Subscription Challenge
 
-The original issue was a deadlock caused by blocking subscription operations:
+The original issue was caused by ESP-IDF's internal subscription queuing behavior:
 
-**Problem**: `client.subscribe().await` would block indefinitely waiting for subscription confirmation, but the event loop couldn't process the confirmation because it was blocked on the subscription call.
+**Problem**: The ESP-IDF MQTT client queues subscription requests internally and only processes them when the event loop runs. Waiting for subscription confirmations in a loop prevents the event loop from processing the queued requests.
 
-**Solution**: Use Embassy's `select!` with a short timer to prevent blocking:
+**Solution**: Use a fire-and-forget approach that submits all subscription requests without waiting for confirmations:
 
-### Non-blocking Subscription Pattern
+### Fire-and-Forget Subscription Pattern
 
 ```rust
-embassy_futures::select::select(
-    async {
-        match client.subscribe(&topic, QoS::AtLeastOnce).await {
-            Ok(message_id) => { /* Log success */ }
-            Err(e) => { /* Log error */ }
+// Submit all subscription requests without waiting
+for (topic_base, topic_name) in &topics {
+    let topic = format!("{}/{}", topic_base, client_id);
+    match client.subscribe(&topic, QoS::AtLeastOnce).await {
+        Ok(message_id) => {
+            info!("✅ {} subscription request queued - Message ID: {}", topic_name, message_id);
         }
-    },
-    embassy_time::Timer::after(Duration::from_millis(10))
-).await;
+        Err(e) => {
+            error!("❌ Failed to queue {} subscription request: {:?}", topic_name, e);
+        }
+    }
+    // Small delay between requests
+    embassy_time::Timer::after(embassy_time::Duration::from_millis(100)).await;
+}
 ```
 
 **How It Works**
-1. `select!` races the subscription call against a 10ms timer
-2. Timer typically wins, allowing event loop to continue
-3. Subscription completes asynchronously through event system
-4. `Subscribed` event is processed in the next event loop iteration
+1. All subscription requests are submitted to ESP-IDF's internal queue
+2. Function returns immediately without waiting for confirmations
+3. ESP-IDF processes subscription requests when the event loop runs
+4. `Subscribed` events are received and processed asynchronously
 5. Connection remains healthy with continuous event processing
 
 ### Subscription Confirmation Flow

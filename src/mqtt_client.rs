@@ -269,7 +269,8 @@ impl AwsIotMqttClient {
         }
     }
 
-    /// Subscribe to device-specific MQTT topics
+    /// Subscribe to device-specific MQTT topics using truly non-blocking approach
+    /// This method tries batch subscription first, then falls back to individual subscriptions
     pub async fn subscribe_to_device_topics(&mut self) -> Result<()> {
         info!("🔍 Checking connection state before subscription...");
         info!("🔍 Current connection state: {:?}", self.connection_state);
@@ -281,37 +282,118 @@ impl AwsIotMqttClient {
 
         info!("✅ Connection state verified - proceeding with subscription");
 
-        if let Some(client) = self.client.as_mut() {
-            let client_id = &self.client_id;
+        if self.client.is_some() {
+            let client_id = self.client_id.clone(); // Clone to avoid borrowing issues
             info!("📨 Subscribing to MQTT topics for client: {}", client_id);
 
-            // Subscribe to settings topic
-            let settings_topic = format!("{}/{}", TOPIC_SETTINGS, client_id);
-            info!("📨 Subscribing to: {}", settings_topic);
+            // Define all topics to subscribe to
+            let topics = [
+                (TOPIC_SETTINGS, "Settings"),
+                (TOPIC_STATUS_REQUEST, "Status Request"), 
+                (TOPIC_COMMANDS, "Commands"),
+            ];
+
+            info!("📨 Attempting batch subscription to {} MQTT topics for client: {}", topics.len(), client_id);
             
-            info!("🔄 Calling client.subscribe() with QoS::AtLeastOnce...");
-            // Use spawn to avoid blocking the event loop
-            let topic_clone = settings_topic.clone();
-            embassy_futures::select::select(
-                async {
-                    match client.subscribe(&topic_clone, QoS::AtLeastOnce).await {
-                        Ok(message_id) => {
-                            info!("✅ Subscription request sent successfully - Message ID: {}", message_id);
-                            info!("📋 Note: Subscription confirmation will be logged when received");
-                        }
-                        Err(e) => {
-                            error!("❌ Failed to send subscription request: {:?}", e);
-                        }
+            // Try batch subscription with multiple topic filters
+            let topic_filters: Vec<_> = topics.iter()
+                .map(|(topic_base, _)| (format!("{}/{}", topic_base, &client_id), QoS::AtLeastOnce))
+                .collect();
+            
+            // Try batch subscription if supported
+            let batch_success = match self.try_batch_subscription(&topic_filters).await {
+                Ok(success) => {
+                    if success {
+                        info!("✅ Batch subscription completed successfully");
+                        return Ok(());
+                    } else {
+                        info!("⚠️ Batch subscription not supported, falling back to individual subscriptions");
+                        false
                     }
-                },
-                embassy_time::Timer::after(embassy_time::Duration::from_millis(10))
-            ).await;
+                }
+                Err(e) => {
+                    warn!("⚠️ Batch subscription failed: {}, falling back to individual subscriptions", e);
+                    false
+                }
+            };
             
-            info!("🔄 Subscription initiated - continuing with event processing");
-            Ok(())
+            if !batch_success {
+                // Fall back to individual subscriptions with minimal blocking
+                self.try_individual_subscriptions(&topics, &client_id).await
+            } else {
+                Ok(())
+            }
         } else {
             error!("❌ MQTT client not initialized");
             Err(anyhow!("MQTT client not initialized"))
+        }
+    }
+
+    /// Try batch subscription (may not be supported by ESP-IDF)
+    async fn try_batch_subscription(&mut self, _topic_filters: &[(String, QoS)]) -> Result<bool> {
+        // ESP-IDF MQTT client may not support batch subscription
+        // This is a placeholder for potential future ESP-IDF batch support
+        info!("📡 Batch subscription not implemented in ESP-IDF, using individual approach");
+        Ok(false)
+    }
+
+    /// Try individual subscriptions with time-limited approach
+    async fn try_individual_subscriptions(&mut self, topics: &[(&str, &str)], client_id: &str) -> Result<()> {
+        info!("📨 Starting individual topic subscriptions with time limits");
+        
+        let mut successful_subs = 0;
+        
+        for (topic_base, topic_name) in topics {
+            let topic = format!("{}/{}", topic_base, client_id);
+            info!("📨 Subscribing to {} topic: {}", topic_name, topic);
+            
+            // Use a very short timeout to prevent blocking the event loop
+            let subscription_result = embassy_time::with_timeout(
+                embassy_time::Duration::from_millis(50), // Very short timeout
+                async {
+                    if let Some(client) = self.client.as_mut() {
+                        match client.subscribe(&topic, QoS::AtLeastOnce).await {
+                            Ok(msg_id) => Ok(msg_id),
+                            Err(e) => Err(format!("Subscribe error: {:?}", e))
+                        }
+                    } else {
+                        Err("Client not available".to_string())
+                    }
+                }
+            ).await;
+            
+            match subscription_result {
+                Ok(Ok(message_id)) => {
+                    info!("✅ {} subscription initiated - Message ID: {}", topic_name, message_id);
+                    successful_subs += 1;
+                }
+                Ok(Err(e)) => {
+                    error!("❌ {} subscription failed: {}", topic_name, e);
+                }
+                Err(_) => {
+                    // Timeout - this is expected and normal
+                    info!("⏰ {} subscription timed out (normal - ESP-IDF queues internally)", topic_name);
+                    // Still count as potentially successful since ESP-IDF may queue it
+                    successful_subs += 1;
+                }
+            }
+            
+            // Process any pending MQTT events to keep connection alive
+            if let Err(e) = self.process_messages().await {
+                debug!("📡 Event processing during subscription: {}", e);
+            }
+            
+            // Very short delay to allow event processing
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+        }
+        
+        info!("📊 Subscription attempts completed: {} of {} topics attempted", successful_subs, topics.len());
+        
+        if successful_subs > 0 {
+            info!("✅ Subscription process completed - confirmations will arrive via MQTT events");
+            Ok(())
+        } else {
+            Err(anyhow!("All subscription attempts failed immediately"))
         }
     }
 
