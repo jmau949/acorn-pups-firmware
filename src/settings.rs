@@ -34,10 +34,10 @@ const SETTINGS_APPLY_TIMEOUT_SECONDS: u64 = 5; // Timeout for applying settings
 const SOUND_ENABLED_KEY: &str = "sound_enabled";
 const SOUND_VOLUME_KEY: &str = "sound_volume";
 const LED_BRIGHTNESS_KEY: &str = "led_brightness";
-const NOTIFICATION_COOLDOWN_KEY: &str = "notification_cooldown";
-const QUIET_HOURS_ENABLED_KEY: &str = "quiet_hours_enabled";
-const QUIET_HOURS_START_KEY: &str = "quiet_hours_start";
-const QUIET_HOURS_END_KEY: &str = "quiet_hours_end";
+const NOTIFICATION_COOLDOWN_KEY: &str = "notif_cooldown";
+const QUIET_HOURS_ENABLED_KEY: &str = "quiet_enabled";
+const QUIET_HOURS_START_KEY: &str = "quiet_start";
+const QUIET_HOURS_END_KEY: &str = "quiet_end";
 
 /// Device settings structure based on technical documentation
 #[derive(Debug, Clone, Serialize, Deserialize)]
